@@ -17,3 +17,6 @@ text
 run_xess.bat 视频.mp4 [倍率] [--quality Q] [--frames N] [--out-dir D]
 
 run_xess.bat MiniMax_H3_seedvr2_720p_00001_.mp4 → AA 修画面（倍率默认 1.0）run_xess.bat in.mp4 2 → 2 倍放大，输出 原名_xess_2x_2592x1440.mp4，自动带原音轨倍率任意（1.5 / 2 / 2.5 / 3…），quality 缺省按倍率自动选档；中间文件用完自动清理
+
+
+注意 所有显卡都可以跑！不要太老就行！
