@@ -1,0 +1,29 @@
+便携包
+
+xess-tools\dist\xess-portable\（约 300MB，另有 zip 压缩版 165MB：dist\xess-portable.zip），拷到任何 Windows 电脑直接用：
+
+text
+
+xess-portable\
+├── run_xess.bat          ← 一键入口
+├── run_xess.py           ← 调度脚本（自动完成全部步骤）
+├── flow.py               ← DIS 光流
+├── xess-vsr.exe + libxess.dll + vcruntime140*.dll
+├── ffmpeg.exe            ← 内置单文件 ffmpeg
+└── python\               ← 便携 Python（自带 cv2/numpy，位置无关）
+
+用法（目标机上）：
+
+text
+
+run_xess.bat 视频.mp4 [倍率] [--quality Q] [--frames N] [--out-dir D]
+
+run_xess.bat MiniMax_H3_seedvr2_720p_00001_.mp4 → AA 修画面（倍率默认 1.0）run_xess.bat in.mp4 2 → 2 倍放大，输出 原名_xess_2x_2592x1440.mp4，自动带原音轨倍率任意（1.5 / 2 / 2.5 / 3…），quality 缺省按倍率自动选档；中间文件用完自动清理
+
+关键技术点：没沿用 venv（它的 pyvenv.cfg 写死本机绝对路径，跨机必挂），而是打包了一个无 pyvenv.cfg 的完整解释器（exe + stdlib + 从 venv 拷的 cv2/numpy 二进制），Python 靠 exe 自身路径定位库，所以拷到任何目录都能跑。重新打包随时执行 make_portable.bat。
+
+实测
+
+把包拷到 E:\portable_test\（不同路径模拟另一台电脑）跑了完整验证：5 帧冒烟 + 全量 243 帧全通过，输出 2592×1440 / 24fps / 带音频。最终成品已输出到 E:\下载\MiniMax_H3_seedvr2_720p_00001__xess_2x_2592x1440.mp4（覆盖了之前的 5 帧冒烟文件），测试目录已清理。
+
+文档（XeSS命令行使用说明.md）的部署章节也已更新为便携包方案。、
