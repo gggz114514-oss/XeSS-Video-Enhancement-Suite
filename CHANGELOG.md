@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Fixed Balanced/Quality mode reporting zero XPU devices in child processes on
+  some Arc A-series installations.  The node now probes in the same import
+  order as SEA-RAFT, performs a real XPU allocation, preserves the launcher's
+  working environment, and retries with Level Zero selectors when required.
+
 ## 1.1.0 - 2026-08-21
 
 - Split frequently updated source code from fixed Release runtime assets.
