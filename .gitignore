@@ -1,0 +1,17 @@
+.runtime/
+__pycache__/
+*.py[cod]
+*.pyd
+*.log
+*.partial
+*.partial.*
+xess_config.json
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+work/
+*.raw
+*.mp4
+*.avi
+

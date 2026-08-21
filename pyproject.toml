@@ -1,0 +1,15 @@
+[project]
+name = "xess-video-enhancement-suite"
+version = "1.1.0"
+description = "Intel XeSS video super-resolution and frame-generation nodes for ComfyUI"
+requires-python = ">=3.10"
+dependencies = ["numpy", "opencv-python"]
+
+[project.urls]
+Repository = "https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite"
+Documentation = "https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite#readme"
+
+[tool.comfy]
+PublisherId = "gggz114514-oss"
+DisplayName = "XeSS 视频增强工具箱 / XeSS Video Enhancement Suite"
+

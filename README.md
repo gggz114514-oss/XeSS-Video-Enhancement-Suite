@@ -1,460 +1,217 @@
-# XeSS 视频工具箱：SR 1.2 + FG 1.2 + ComfyUI 节点
+# XeSS 视频增强工具箱 / XeSS Video Enhancement Suite
 
-gggz114514有话要说：
-这玩意的本质就是游戏里面那个xess，因为视频帧不包含一些xess需要的信息，所以xess无法直接作用于视频。用光流等方法补齐信息后，xess超分和补帧就可以正常进行。补帧特别注意一下把小飞机和rtss给关了不然会录进去。
-至于效果嘛，这个项目完全尊重原视频（xess就是这样不要指望能补出花来），如果你指望用这个增加细节，修补画面，那这个项目没有用，xess只会在错误画面信息的基础上继续错下去。这种情况建议去用seedvr2和星光模型（ai修补，质量好但超级吃性能会很慢）
-但你原视频质量还算过得去，那可以大大方方丢个10s进来超分加补帧，来试试效果，反正花不了多少时间。（有个思路ai修补一次，丢进来给xess跑一遍，这能省不少时间先生！）
-还有别觉得我就要最好的，建议无脑fast挡位啊，不行再用高挡 fast很快很快，花不了多少时间，要是可用就直接用，高质量档提升比想象中小的多（静态基本看不出，动态差别非常大）！！！！！！
+面向 Windows 与 Intel Arc 的视频超分、抗锯齿和 2× 帧生成工具，同时提供独立命令行入口与中文 ComfyUI 原生 `VIDEO → VIDEO` 节点。
 
+当前版本：源码/节点 `1.1.0`，SR `1.2`，FG `1.2`，固定运行时 `2026.08.21-r1`。
 
+> 这是社区项目，不是 Intel 官方产品。实机验证平台为 Windows 11 与 Intel Arc B580。
 
-                                                        
-这是一个面向 Windows 和 Intel Arc 的视频处理发布包，包含：
+## 本次版本重点：直接拦截 XeFG 交换链
 
-- 独立便携版 XeSS 视频超分：SR 1.2；
-- 独立便携版 XeSS 2× 帧生成：FG 1.2；
-- 一次执行“先超分、后插帧”的联合管线；
-- 中文 ComfyUI 原生 `VIDEO → VIDEO` 节点；
-- 可直接导入的 `xess超分帧生成.json` 工作流；
-- 环境检测、节点安装和配置脚本；
-- C++ 核心源码、Python 管线源码与构建所需的 XeSS/XeLL 头文件和导入库。
-
-> 这是社区工具，不是 Intel 官方产品。当前实机验证平台为 Windows 11 + Intel Arc B580。其他 Arc 型号预计可用，但请自行测试。XeSS FG 使用桌面呈现与抓取路径，运行要求比普通离线编码更严格。
-
-## 下载与解压
-
-从 GitHub Releases 下载 `XeSS-Video-Suite-2026.08.zip`，完整解压后再运行。不要直接在压缩软件里双击脚本，也不要单独移动 `xess-portable-pipeline` 文件夹。
-
-推荐解压到剩余空间充足的位置，例如：
+这一版不再把窗口画面当成帧生成结果。`xess-fg.exe` 在 XeFG 初始化期间包装 DXGI 工厂，记录 XeFG 内部创建的原生交换链；每次代理交换链完成 Present 后，程序直接从最后呈现的 D3D12 后缓冲回读生成帧，再送入流式编码管线。
 
 ```text
-D:\XeSS-Video-Suite-2026.08
+输入帧 + 光流/深度
+        ↓
+XeFG 代理交换链 Present
+        ↓
+DXGI 工厂包装器记录原生交换链
+        ↓
+回读最后呈现的 D3D12 后缓冲
+        ↓
+f0, G1, f1, G2 ... → 2× fps 视频
 ```
 
-没有 D/E 盘也能用。只有 C 盘时，工具会使用流式处理，并在 `%LOCALAPPDATA%\XeSS-Video-Suite\work` 建立受保护的工作目录；系统盘默认保留至少 25 GiB 空间，达不到条件时会在创建大文件前停止。
+因此默认 `direct` 模式具有这些特性：
 
-首次使用建议双击：
+- 拿到的是 XeFG 实际生成帧，而不是帧复制或普通光流合成结果；
+- 不依赖 Windows Graphics Capture，不需要录制桌面或裁剪隐藏窗口；
+- 不受 Windows 高 DPI 坐标缩放、窗口遮挡、最小化和黄色捕获边框影响；
+- RTSS/MSI Afterburner 的桌面 OSD 不会混进输出视频；
+- 独立版和 ComfyUI 节点使用同一套拦截式 FG 执行链路。
+
+旧的 `window` 后端仅保留给开发者诊断，不建议普通用户启用。
+
+## 这次为什么改成 Git + Release
+
+仓库现在按“经常更新的代码”和“很少变化的大资源”拆分：
+
+| 位置 | 内容 | 更新方式 |
+|---|---|---|
+| Git 仓库 | ComfyUI 节点、Python 管线、C++ 源码、工作流、安装器和文档 | 秋叶启动器/ComfyUI Manager/Git pull |
+| GitHub Release | XeSS/XeFG/XeLL 二进制、ffmpeg、便携 Python、OpenVINO 与模型 | 仅在 `runtime_manifest.json` 指向新版本时下载 |
+| `.runtime/` | 本机已安装的固定运行时 | 被 `.gitignore` 忽略，源码更新不会删除或重复下载 |
+
+普通代码更新只拉取几十个小文件。每次运行前会把最新 `pipeline/` 同步到本机运行时，通常不到一秒；只有 exe、DLL、模型或便携 Python 确实变化时，才需要发布并下载新的 Runtime 资产。
+
+## 一、秋叶启动器 / ComfyUI 安装
+
+在秋叶启动器的自定义节点管理中选择“通过 Git URL 安装”，填写：
 
 ```text
-check_environment.bat
+https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite.git
 ```
 
-它只检测，不改文件。会检查便携运行时、显卡、RTSS、可用空间、ComfyUI Python，以及极致画质模式所需的 Intel PyTorch XPU/OpenVINO。
+安装过程会：
 
-## 一、独立便携版
+1. 克隆本仓库到 `ComfyUI/custom_nodes`；
+2. 安装缺失的 NumPy/OpenCV 基础依赖；
+3. 执行 `install.py`；
+4. 从固定 Release 下载一次约 303 MiB 的运行时；
+5. 校验 SHA256 后解压到节点目录的 `.runtime/engine`。
 
-不需要系统 Python、ffmpeg 或 ComfyUI。进入 `xess-portable-pipeline` 文件夹，在地址栏输入 `cmd` 回车，然后使用下面的命令。
+安装完成后重启 ComfyUI，搜索 `XeSS`。以后在秋叶启动器点击“更新”即可，不需要重新安装节点，也不会重复下载未变化的运行时。
 
-### 1. 视频超分
+首次安装需要能够访问 GitHub Release。源码更新和固定 Runtime 是分开的：更新节点通常只下载少量文本文件，只有清单中的 Runtime 版本变化时才会重新下载大文件。
 
-480p 放大 1.5 倍到 720p，快速档：
+### 手动 Git 安装
 
 ```bat
-run_xess.bat "D:\video\input.mp4" 1.5 --preset fast
+cd /d "你的ComfyUI目录\custom_nodes"
+git clone https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite.git
+cd XeSS-Video-Enhancement-Suite
+install_runtime.bat
 ```
 
-极致画质档：
+然后重启 ComfyUI。没有 D/E 盘也能安装；运行时、缓存和输出路径都按仓库实际位置或用户配置计算，不写死盘符。
 
-```bat
-run_xess.bat "D:\video\input.mp4" 1.5 --preset quality --five-frame-fusion --fusion-strength 0.35
-```
+### 从旧整包迁移
 
-输出默认写到输入视频旁边，文件名包含 `xess_sr12`、档位、倍率和分辨率。SR 1.2 默认开启强度 0.75 的竖向边缘振铃保护；它用于抑制脸部鼻梁、下颌、硬阴影旁出现的细竖线。要关闭可加 `--edge-guard-strength 0`。
+旧版 `ComfyUI-XeSS` 是普通复制目录，秋叶启动器无法对它执行 Git 更新。迁移到本仓库只需做一次：
 
-### 2. 2× 帧生成
+1. 关闭 ComfyUI；
+2. 备份旧 `ComfyUI/custom_nodes/ComfyUI-XeSS` 中的 `xess_config.json`；
+3. 将旧目录改名为 `ComfyUI-XeSS.old`；
+4. 用秋叶启动器通过上面的 Git URL 安装；
+5. 通常保持 `engine_path=auto`、`work_dir=auto` 即可；如有特殊工作盘设置，再复制旧配置。
 
-24 fps 输入会生成 48 fps 输出：
+完成这一次迁移后，后续版本只需点“更新”。
 
-```bat
-run_fg.bat "D:\video\input.mp4" --preset fast
-```
+## 二、ComfyUI 节点
 
-极致画质档：
+普通用户主要使用：
 
-```bat
-run_fg.bat "D:\video\input.mp4" --preset quality
-```
+- `XeSS 视频超分（两挡自动）`
+- `XeSS 视频插帧（两挡自动）`
 
-FG 对 N 帧输入输出 `2N-1` 帧，顺序为 `f0, G1, f1, G2...`，并复制原音轨。
-
-### 3. 先超分、后插帧
-
-```bat
-run_pipeline.bat "D:\video\input.mp4" --scale 1.5 --sr-preset fast --fg-preset fast
-```
-
-联合管线不会让 FG 复用 SR 的运动数据；SR 与 FG 分别计算适合自身语义的运动/深度信息，但共用流式传输、空间保护、AI 深度和质量档位体系。
-
-### 档位差异
-
-| 档位 | 光流/深度 | 特点 | 环境要求 |
-|---|---|---|---|
-| `fast` | DIS + AI 深度 | 速度优势最大，适合日常批量处理 | 便携包即可 |
-| `balanced` | 单向 SEA-RAFT + AI 深度 | 遮挡边缘更稳，明显更慢 | Intel XPU PyTorch + OpenVINO |
-| `quality` | 双向 SEA-RAFT + AI 深度 | 最慢，运动和遮挡信息最多 | Intel XPU PyTorch + OpenVINO |
-
-安装 ComfyUI 节点时，脚本会自动检测 ComfyUI 的 Intel XPU Python，并把路径写给独立版。未安装节点时，也可以手动指定：
-
-```bat
-run_xess.bat "D:\video\input.mp4" 1.5 --preset quality --torch-python "D:\ComfyUI\python\python.exe"
-```
-
-### 工作盘与过程文件保护
-
-- `auto/stream/shared` 模式不会落地整段 RGB raw、运动矢量或深度序列；
-- 每个任务使用独立工作目录，成功或失败都会尝试清理；
-- 输出先写 `.partial.mp4`，通过分辨率、帧率和帧数验证后再原子改名；
-- 非系统盘默认至少保留 5 GiB，系统盘至少保留 25 GiB；
-- 要指定工作目录可加 `--work-dir "D:\XeSS-work"`；
-- `--keep` 仅用于调试，可能保留大量过程文件，不建议普通用户使用；
-- `--io-mode file` 会产生大 raw，普通使用不要选择。
-
-查看全部参数：
-
-```bat
-run_xess.bat --help
-run_fg.bat --help
-run_pipeline.bat --help
-```
-
-## 二、ComfyUI 节点版
-
-### 自动安装
-
-1. 完整解压本套件；
-2. 关闭正在运行的 ComfyUI；
-3. 双击根目录的 `install_comfyui.bat`；
-4. 如果没有自动找到 ComfyUI，输入包含 `main.py` 的 `ComfyUI` 文件夹；
-5. 安装完成后重启 ComfyUI，搜索 `XeSS`。
-
-也可以从 PowerShell 明确指定路径：
-
-```powershell
-.\install_comfyui.ps1 -ComfyUIPath "D:\ComfyUI\ComfyUI" -WorkDir "D:\XeSS-Video-Work"
-```
-
-安装脚本会：
-
-- 检测便携引擎是否完整；
-- 检测 Intel Arc、RTSS、磁盘空间和 Python 模块；
-- 把 `ComfyUI-XeSS` 复制到 `ComfyUI/custom_nodes`；
-- 自动写入实际引擎路径和安全工作目录；
-- 把随包工作流复制到 `ComfyUI/user/default/workflows`；
-- 发现旧版节点或同名工作流时先创建时间戳备份；
-- 仅在缺少 NumPy/OpenCV 时尝试安装这两个基础依赖，不会擅自重装 PyTorch。
-
-如果不希望脚本安装 Python 基础依赖：
-
-```powershell
-.\install_comfyui.ps1 -ComfyUIPath "D:\ComfyUI\ComfyUI" -SkipPythonInstall
-```
-
-### 手动安装
-
-1. 把根目录的 `ComfyUI-XeSS` 复制到 `ComfyUI/custom_nodes/ComfyUI-XeSS`；
-2. 把 `workflows/xess超分帧生成.json` 导入 ComfyUI；
-3. 复制 `ComfyUI-XeSS/xess_config.example.json` 为 `xess_config.json`；
-4. 修改其中的 `engine_path` 与 `work_dir` 为本机绝对路径；
-5. 重启 ComfyUI。
-
-### 节点怎么用
-
-普通用户只需两个中文节点：
-
-- `XeSS 视频超分（两挡自动）`；
-- `XeSS 视频插帧（两挡自动）`。
-
-推荐链路：
+两者都接受原生 `VIDEO`，自动读取帧率并保留音频。推荐工作流：
 
 ```text
 Load Video → XeSS 视频超分（两挡自动） → XeSS 视频插帧（两挡自动） → Save Video
 ```
 
-两个节点都使用 ComfyUI 原生 `VIDEO` 类型，会读取源帧率并透传音频；FG 自动将帧率翻倍。每个节点只显示两个主档位：
+主档位只有两套：
 
-- `极速模式（最低挡）`：DIS 路线，适合快速成片；
-- `极致画质（最高挡）`：双向 SEA-RAFT、AI 深度和五帧信息，适合短片或最终输出。
+- `极速模式（最低挡）`：DIS 光流，速度优先；
+- `极致画质（最高挡）`：双向 SEA-RAFT、AI 深度与五帧信息，适合复杂运动。
 
-需要精调时再使用 `XeSS 视频处理/专家` 下的节点。随包的 `xess超分帧生成.json` 已同时放好快速、极致和专家示例。
+需要逐项调节时使用 `XeSS 视频处理/专家` 分类。完整参数方案见 [EXPERT_GUIDE.md](EXPERT_GUIDE.md)，示例工作流位于 [workflows/xess超分帧生成.json](workflows/xess超分帧生成.json)。
 
-注意：ComfyUI 的 `VIDEO` 最终仍会把输出 IMAGE 批次放在内存中。超长视频应分段处理；节点默认在预计输出超过 12 GiB 时提前停止，避免把内存和页面文件挤满。
+## 三、独立版
 
-### 专家模式推荐参数
+克隆仓库后双击一次 `install_runtime.bat`。它只把固定运行时安装到当前仓库的 `.runtime`，不要求系统 Python。
 
-专家节点不是简单地把所有数值拉满。完整的逐项解释、风险范围和十套配置见 [ComfyUI-XeSS/EXPERT_GUIDE.md](ComfyUI-XeSS/EXPERT_GUIDE.md)。这里先给最常用的四套：
+480p 放大到 720p：
 
-| 用途 | 核心配置 | 五帧/MFSR | 锐化与保护 |
-|---|---|---|---|
-| 480p→720p 快速批量 | 快速、Q 自动、DIS、高分辨率 MV、响应 0.80 | 融合 0、MFSR 关 | 固定 0.25、振铃保护 0.75 |
-| 真人脸部 SR | 高质量、Q5、双向 SEA-RAFT、深度 MV、一致性 1.0 | 融合 0.25、MFSR 关 | 自适应 0.20/0.08、保护 0.90 |
-| 真人脸部 FG | 高质量、双向 SEA-RAFT、AI 深度、5 帧、一致性 1.0 | 运动修正 0.55、深度 0.12 | 自适应 0.12/0.04 |
-| 复杂遮挡 FG | 高质量、双向 SEA-RAFT、AI 深度、扩张 2、深度边缘 0.025～0.03 | 运动修正 0.70、深度 0.15 | 关闭或 0.08/0.03 |
+```bat
+run_xess.bat "C:\Videos\input.mp4" 1.5 --preset fast
+```
 
-SR 专家节点已单独暴露 `竖向边缘振铃保护`：默认 0.75，真人脸部推荐 0.90，0 为关闭。MFSR 仅推荐静态风景/建筑使用保守组合：注入 0.8、细节增强 0.45、最大注入 10、锐化 0.16/0.05；真人近景或暗部硬阴影不要开启。
+24fps 插帧到 48fps：
 
-建议每次用相同的 3～5 秒片段 A/B，只改一个参数。出现竖线时按“关闭 MFSR → 降低锐化 → 提高振铃保护”处理；出现拖影时先降低五帧融合/运动修正，再把光流一致性阈值调低。
+```bat
+run_fg.bat "C:\Videos\input.mp4" --preset fast
+```
 
-## FG 特别注意事项
+先超分、再插帧：
 
-1. 运行 FG 前完全退出 RTSS/MSI Afterburner/性能叠加层。只关监控窗口不一定会结束 `RTSS.exe`。
-2. FG 运行时不要锁屏、切换用户或让远程桌面断开。
-3. 不要最小化 XeSS 的捕获桌面会话。
-4. 如果必须保留 RTSS，先给 `xess-fg.exe` 建独立配置并设 `Detection level=None`、关闭 OSD，再在专家节点显式允许；默认节点会安全停止。
+```bat
+run_pipeline.bat "C:\Videos\input.mp4" --scale 1.5 --sr-preset fast --fg-preset fast
+```
 
-## 常见问题
+入口脚本每次启动会先检查 Runtime 清单并同步 Git 中的新管线代码。Runtime 版本没变时不会联网下载。
 
-### 找不到 XeSS pipeline 引擎
+## 四、交换链拦截式帧生成
 
-请保持解压后的目录结构不变并重新运行安装脚本。节点读取 `custom_nodes/ComfyUI-XeSS/xess_config.json`，移动整套文件后需要重新安装一次来刷新路径。
+FG 默认并强制从上层管线选择 `direct` 后端：通过 DXGI 工厂包装器记录 XeFG 创建的原生交换链，等待代理 Present 完成后直接回读实际生成帧。
 
-### 极速档能用，极致档报 torch.xpu/OpenVINO 不可用
+- 不使用 Windows Graphics Capture；
+- 不受高 DPI、窗口遮挡、最小化或黄色捕获边框影响；
+- RTSS/MSI Afterburner 的桌面 OSD 不会进入输出；
+- 命令行仍保留 `--capture-mode window` 作为旧版诊断回退。
 
-极致档的 SEA-RAFT 需要 ComfyUI Python 中的 Intel XPU 版 PyTorch 和 OpenVINO。运行 `check_environment.bat` 查看检测结果。普通 CUDA PyTorch 不能在 Intel Arc 上直接提供这条路径；环境不满足时先使用极速档。
+N 个输入帧严格输出 `2N-1` 帧，顺序为 `f0,G1,f1,G2...`，输出帧率为输入的两倍。
 
-### 鼻子或硬阴影旁出现细竖线
-
-这是 XeSS 高频振铃被多帧残差或锐化放大的典型表现。SR 1.2 默认启用边缘保护，简易节点也默认开启。不要为了“更锐”盲目把 MFSR 注入和锐化同时拉满；专家节点中先关闭 MFSR，再降低锐化。
-
-### 遮挡边缘破碎或重影
-
-快速档的 DIS 光流在复杂遮挡处信息有限。可以改用极致档，AI 深度和双向 SEA-RAFT 会改善遮挡判断，但不能恢复源视频中从未出现的真实细节。
-
-### 系统盘空间不足
-
-工具默认流式处理并保留 25 GiB 系统盘空间。若仍被拒绝，清理空间或用 `-WorkDir`/`--work-dir` 指向其他磁盘。不要使用 `--keep` 或 `--io-mode file`。
-
-### 输出没有生成
-
-查看命令窗口最后的错误；失败任务不会把 `.partial.mp4` 当成成品。FG 问题优先确认 RTSS 已完全退出、桌面会话保持活动、显卡驱动正常。
-
-## 目录说明
+运行时日志出现下面一行，表示正在使用交换链拦截路径：
 
 ```text
-XeSS-Video-Suite-2026.08/
-├─ README.md
-├─ check_environment.bat
-├─ install_comfyui.bat
-├─ install_comfyui.ps1
-├─ xess-portable-pipeline/   独立运行时与命令行工具
-├─ ComfyUI-XeSS/             ComfyUI 自定义节点源码
-├─ workflows/                可直接导入的工作流
-├─ source/                   C++/Python 构建源码与 SDK 开发文件
-├─ licenses/                 许可和第三方声明
-└─ SHA256SUMS.txt            包内关键文件校验
+[capture] mode=direct (native swap-chain readback)
 ```
+
+如日志显示 `window`，说明手动传入了旧诊断参数；删除 `--capture-mode window` 即可恢复默认模式。ComfyUI 普通节点不需要设置该参数。
+
+## 五、过程文件和磁盘保护
+
+- 默认使用流式管道或共享内存，不落地整段 RGB raw、光流或深度序列；
+- 每个任务使用独立工作目录，结束后清理临时数据；
+- 输出先写 `.partial.mp4`，通过分辨率、帧数和帧率验证后再原子改名；
+- 非系统盘默认保留至少 5 GiB，系统盘默认保留至少 25 GiB；
+- `.runtime` 固定资源约 624 MiB，只在 Runtime 版本变化时更新；
+- `--keep` 与 `--io-mode file` 只用于调试，可能产生大量文件。
+
+如需指定工作盘：
+
+```bat
+run_fg.bat "C:\Videos\input.mp4" --work-dir "F:\XeSS-Work"
+```
+
+## 六、Runtime 版本与校验
+
+当前固定资产：
+
+```text
+Tag: runtime-2026.08.21-r1
+Asset: xess-runtime-windows-x64-2026.08.21-r1.zip
+SHA256: 0f69db8f652d4b63d849bd8f27fa6cc8950cd7ef98bfea94461230230e85f78b
+Archive: 303.32 MiB
+Installed: 624.49 MiB
+```
+
+下载地址和逐文件兼容哈希由 [runtime_manifest.json](runtime_manifest.json) 固定。安装器拒绝 SHA256 不匹配、路径穿越或超出清单安全上限的压缩包。
+
+手动检查：
+
+```bat
+.runtime\engine\python\python.exe runtime_manager.py status
+```
+
+强制重新安装：
+
+```bat
+install_runtime.bat -Force
+```
+
+## 七、源码构建
+
+C++ 源码位于 `src/`。固定 Runtime 已包含 Intel XeSS SDK 2.1 的开发头文件和导入库；另外需要 Visual Studio 2022 Build Tools 与 Windows SDK。
+
+安装 Runtime 后直接运行 `build.bat`。如需使用另一套 SDK，可将 `XESS_SDK_ROOT` 指向包含 `inc`、`lib` 和 `bin` 的目录：
+
+```bat
+set "XESS_SDK_ROOT=C:\SDK\XeSS"
+build.bat
+```
+
+构建产物写入本仓库 `build/`，不会写入系统临时盘。
+
+## 八、维护者发布规则
+
+- 只改节点/Python/C++源码/文档：更新 Git 即可，不创建 Runtime Release；
+- 改 exe、DLL、模型、ffmpeg 或便携 Python：构建新 Runtime 资产，发布新 `runtime-*` 标签，并提交更新后的 `runtime_manifest.json`；
+- 不把 `.runtime`、模型、DLL、exe、视频或 raw 提交到 Git；CI 会拒绝超过 10 MiB 的固定资产。
+
+详细流程见 [docs/MAINTAINER_RELEASE.md](docs/MAINTAINER_RELEASE.md)。
 
 ## 许可与声明
 
-- Intel XeSS/XeLL 二进制、头文件和导入库遵循包内 Intel SDK 许可及第三方声明；
-- 其他第三方组件见 `licenses/THIRD_PARTY_NOTICES.md`；
-- 本项目不宣称与 Intel 存在官方隶属或背书关系；
-- 上传 GitHub 时，请把大 ZIP 作为 **GitHub Release 附件**，不要直接提交到普通 Git 历史。
-
-- ComfyUI-XeSS 专家模式参数指南
-
-专家节点不是“参数越高越好”。正确用法是先选一套接近素材的方案，只调整一两个有明确症状的参数。普通视频优先使用原生 VIDEO 节点：
-
-- `XeSS 视频超分（专家）`：自动保留音频和帧率；
-- `XeSS 视频插帧（专家）`：自动读取源 fps、输出 2×fps 并保留音频；
-- IMAGE 专家节点仅用于需要在中间接图像处理节点的工作流。
-
-## SR 推荐方案
-
-下表没有列出的项目保持 `自动`、`跟随处理档位`、`-1` 或节点默认值。
-
-### SR-A：快速稳妥，适合批量 480p → 720p
-
-| 参数 | 数值 |
-|---|---|
-| 处理档位 | 快速（速度优先） |
-| 放大倍率 | 1.5 |
-| XeSS 画质档位 | 自动（会选 Q4） |
-| 光流算法 / 运动矢量 | 跟随档位（DIS / 高分辨率 MV） |
-| 响应遮罩 / 强度 | 开 / 0.80 |
-| 五帧时序融合 | 0 |
-| 五帧多帧超分 MFSR | 关 |
-| 锐化 | 跟随档位（固定约 0.25） |
-| 竖向边缘振铃保护 | 0.75 |
-
-这是两挡自动节点“极速模式”的专家版起点。速度最快，不依赖 ComfyUI 的 SEA-RAFT 环境。
-
-### SR-B：真人脸部稳定、暗部干净
-
-| 参数 | 数值 |
-|---|---|
-| 处理档位 | 高质量（最慢） |
-| XeSS 画质档位 | 5 超高质量+ |
-| 光流算法 | SEA-RAFT 双向 |
-| 运动矢量 | 低分辨率运动矢量+深度 |
-| 响应遮罩 / 强度 | 开 / 0.90 |
-| 深度时序平滑 | 0.20 |
-| 光流一致性阈值 | 1.0 |
-| 运动边缘扩张 | 1 |
-| 深度边缘阈值 | 0.035 |
-| 五帧时序融合 | 0.25 |
-| MFSR | 关 |
-| 锐化 | 运动自适应；静态 0.20，运动 0.08 |
-| 竖向边缘振铃保护 | 0.90 |
-
-重点是脸部稳定和避免鼻梁、下颌旁的竖线，不追求最猛的纹理。若脸仍显得蜡，先把静态锐化升到 0.24，不要先开 MFSR。
-
-### SR-C：通用高质量成片
-
-| 参数 | 数值 |
-|---|---|
-| 处理档位 / 光流 | 高质量 / SEA-RAFT 双向 |
-| XeSS 画质档位 | 自动；480p→720p 可改 Q5 |
-| 运动矢量 | 低分辨率运动矢量+深度 |
-| 响应遮罩 / 强度 | 开 / 0.80 |
-| 深度时序平滑 | 0.25 |
-| 光流一致性阈值 | 1.3 |
-| 运动边缘扩张 / 深度边缘 | 1 / 0.04 |
-| 五帧时序融合 | 0.35 |
-| MFSR | 关 |
-| 锐化 | 运动自适应；静态 0.30，运动 0.12 |
-| 竖向边缘振铃保护 | 0.75 |
-
-这是“比自动极致档稍锐、但仍控制伪影”的通用方案。
-
-### SR-D：静态风景、建筑、织物的保守 MFSR
-
-| 参数 | 数值 |
-|---|---|
-| 基础 | 使用 SR-C |
-| 五帧时序融合 | 0.20～0.25 |
-| 启用五帧多帧超分 | 开 |
-| MFSR 注入强度 | 0.8 |
-| MFSR 细节增强 | 0.45 |
-| MFSR 最大注入 | 10 |
-| 锐化 | 运动自适应；静态 0.16，运动 0.05 |
-| 竖向边缘振铃保护 | 0.75 |
-
-只推荐给移动较慢、真实高频较多的素材。真人近景、暗部硬阴影、细发丝快速运动、压缩噪声重的源不要使用。MFSR 与强锐化一起开，最容易把振铃放大成细竖线。
-
-### SR-E：原尺寸 XeSS AA
-
-| 参数 | 数值 |
-|---|---|
-| 放大倍率 | 1.0 |
-| XeSS 画质档位 | 6 原尺寸抗锯齿 |
-| 处理档位 | 快速或高质量，按速度选择 |
-| 五帧时序融合 / MFSR | 0 / 关 |
-| 锐化 | 运动自适应；静态 0.10，运动 0.04 |
-| 竖向边缘振铃保护 | 0.50～0.75 |
-
-用于超分完成后的轻度 AA 或原分辨率去锯齿。它不能补回 SeedVR2 那种生成式细节。
-
-## SR 参数怎么判断
-
-| 参数 | 推荐范围 | 调高的作用与风险 |
-|---|---:|---|
-| 响应遮罩强度 | 0.70～0.90 | 更积极保护变化区域；过高会减少时序信息利用 |
-| 深度时序平滑 | 0.15～0.35 | 深度更稳定；过高会在快速遮挡和切镜时滞后 |
-| 光流一致性阈值 | 0.8～1.8 | 越低越严格，遮挡伪影少但可用运动信息也少；越高越宽松 |
-| 运动边缘扩张 | 1～2 | 填补前景边缘空洞；大于 2 容易把前景运动泄漏到背景 |
-| 深度边缘阈值 | 0.025～0.05 | 越低越敏感；过低会把纹理误判成物体边界 |
-| 五帧时序融合 | 0.20～0.35 | 降噪、稳细节；超过 0.4 更容易出现拖影和脸部变平 |
-| MFSR 注入强度 | 0.6～1.2 | 增加亚像素高频；过高会放大噪声、振铃和假纹理 |
-| 静态/运动锐化 | 0.15～0.32 / 0.04～0.14 | 静态更锐；运动值过高会产生闪烁和锯齿 |
-| 竖向边缘振铃保护 | 0.65～0.90 | 更强地压制细竖线；接近 1.0 会让竖向硬边略软 |
-
-XeSS 画质档位数字越高，输入采样比例越高、通常越慢。`自动`已经按倍率选择；480p→720p 想换一点速度换清晰度，可从自动 Q4 改为 Q5。Q6 只用于 1.0× AA。
-
-## FG 推荐方案
-
-### FG-A：快速 24 → 48 fps
-
-| 参数 | 数值 |
-|---|---|
-| 处理档位 | 快速（速度优先） |
-| 光流算法 | 跟随档位（DIS） |
-| 深度模式 | AI 深度 |
-| 运动分析窗口 | 2 帧 |
-| 深度时序平滑 | 0.20～0.25 |
-| 光流一致性阈值 | 1.5 |
-| 运动边缘扩张 / 深度边缘 | 1 / 0.04 |
-| 五帧运动修正 / 深度修正 | 0.55 / 0.15 |
-| 锐化 | 固定；静态和运动 0.10～0.12 |
-
-这是速度优先的实用方案。固定深度虽然更快，但人物互相遮挡、手经过脸部、前景掠过背景时更容易出错。
-
-### FG-B：真人脸部和缓慢镜头
-
-| 参数 | 数值 |
-|---|---|
-| 处理档位 / 光流 | 高质量 / SEA-RAFT 双向 |
-| 深度 / 窗口 | AI 深度 / 5 帧 |
-| 深度时序平滑 | 0.18 |
-| 光流一致性阈值 | 1.0 |
-| 运动边缘扩张 / 深度边缘 | 1 / 0.035 |
-| 五帧运动修正 / 深度修正 | 0.55 / 0.12 |
-| 锐化 | 运动自适应；静态 0.12，运动 0.04 |
-
-降低五帧修正强度可以减少表情变化时五官被旧运动趋势“拉住”。如果嘴唇或眼睛仍抖，先把光流一致性降到 0.8，而不是增加锐化。
-
-### FG-C：人物交叉、手臂、头发等复杂遮挡
-
-| 参数 | 数值 |
-|---|---|
-| 处理档位 / 光流 | 高质量 / SEA-RAFT 双向 |
-| 深度 / 窗口 | AI 深度 / 5 帧 |
-| 深度时序平滑 | 0.20～0.22 |
-| 光流一致性阈值 | 0.8 |
-| 运动边缘扩张 | 2 |
-| 深度边缘阈值 | 0.025～0.03 |
-| 五帧运动修正 / 深度修正 | 0.70 / 0.15 |
-| 锐化 | 关闭，或静态 0.08 / 运动 0.03 |
-
-这套会牺牲一些速度和锐利度来保护遮挡边缘。若前景运动污染背景，把运动边缘扩张从 2 改回 1。
-
-### FG-D：快速摇镜、加速运动
-
-| 参数 | 数值 |
-|---|---|
-| 处理档位 / 光流 | 均衡 / SEA-RAFT 单向 |
-| 深度 / 窗口 | AI 深度 / 2 帧 |
-| 深度时序平滑 | 0.12 |
-| 光流一致性阈值 | 1.8 |
-| 运动边缘扩张 / 深度边缘 | 1 / 0.04 |
-| 五帧运动修正 / 深度修正 | 0.40 / 0.08 |
-| 锐化 | 关闭或很低 |
-
-五帧历史在突然加速时可能滞后，因此改用 2 帧窗口和较低修正。它不一定比 FG-C 更“高级”，但更符合这种运动。
-
-### FG-E：字幕、UI、台标
-
-先选择 FG-A～D，再把白色 `MASK` 接到 `字幕 / UI 遮罩`：白色表示需要保护的字幕/UI，黑色表示普通画面。字幕区域建议关闭最终锐化。不要靠提高深度或运动扩张来保护静态 UI。
-
-## FG 参数怎么判断
-
-| 参数 | 推荐范围 | 调高的作用与风险 |
-|---|---:|---|
-| 深度时序平滑 | 0.12～0.25 | 深度不闪；过高会使新出现的遮挡边缘滞后 |
-| 光流一致性阈值 | 0.8～1.8 | 越低越严格，适合遮挡；越高保留更多快速运动 |
-| 五帧运动修正 | 0.40～0.70 | 修复单帧光流离群；过高会抑制真实加速和表情变化 |
-| 五帧深度修正 | 0.08～0.18 | 深度更稳定；过高会把前几帧的轮廓带入当前帧 |
-| 运动边缘扩张 | 1～2 | 修补人物轮廓；过高会污染背景 |
-| 锐化 | 0～0.12 | FG 之后只需轻锐化；高值会让生成帧和原帧锐度交替闪烁 |
-
-## 通用、安全和性能参数
-
-- `数据传输方式=自动`：720p 及以下通常为内存管道，更高分辨率使用共享内存；画质没有区别。
-- `显卡编号=-1`：自动选择 Intel Arc。多显卡误选时再手动填写。
-- `运行前释放模型显存=开`：推荐，尤其是节点前面跑过大模型时。
-- `最大输出内存=12 GiB`：是输出 IMAGE 张量保护，不是临时磁盘限制。长视频请分段，不要简单设成 0。
-- `引擎目录/缓存目录=auto`：安装器已配置，普通用户不要修改。
-- `输出详细日志=关`：排错时再开。
-- `已为 xess-fg 禁用 RTSS OSD=关`：只有确认给 `xess-fg.exe` 单独关闭 RTSS Detection/OSD 后才可开启。默认做法仍是完全退出 RTSS。
-
-## 建议的调参顺序
-
-1. 先用同一段 3～5 秒素材和上面的整套方案；
-2. SR 先定光流/MV，再定五帧融合，最后才调锐化；
-3. FG 先定窗口和一致性阈值，再调五帧修正；
-4. 一次只改一个参数，保留相同编码设置做 A/B；
-5. 观察运动帧和遮挡边缘，不要只看暂停时最清楚的一帧；
-6. 出现竖线时：关 MFSR → 降锐化 → 提高振铃保护；
-7. 出现拖影时：降低融合/五帧修正 → 降低一致性阈值 → 检查深度边缘；
-8. 出现背景被人物带动时：把运动边缘扩张从 2 降到 1。
-
-处理在本机离线完成，不会自动上传用户视频。
+Intel XeSS/XeLL 与其他第三方组件保留各自许可。相关文本见 [licenses/](licenses/) 和 [THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md)。本项目不宣称获得 Intel 官方隶属或背书。
