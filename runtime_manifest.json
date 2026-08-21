@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "runtime_version": "2026.08.21-r1",
+  "release_tag": "runtime-2026.08.21-r1",
+  "asset_name": "xess-runtime-windows-x64-2026.08.21-r1.zip",
+  "download_url": "https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/download/runtime-2026.08.21-r1/xess-runtime-windows-x64-2026.08.21-r1.zip",
+  "sha256": "0f69db8f652d4b63d849bd8f27fa6cc8950cd7ef98bfea94461230230e85f78b",
+  "archive_root": "xess-runtime-windows-x64",
+  "archive_size": 318052502,
+  "installed_size": 654829049,
+  "required_files": [
+    "ffmpeg.exe",
+    "xess-vsr.exe",
+    "xess-fg.exe",
+    "libxess.dll",
+    "libxess_fg.dll",
+    "libxell.dll",
+    "python/python.exe",
+    "models/depth-anything-v2-small/depth_anything_v2_small.xml",
+    "models/depth-anything-v2-small/depth_anything_v2_small.bin",
+    "models/sea-raft/sea_raft_s_full.safetensors"
+  ],
+  "file_hashes": {
+    "ffmpeg.exe": "2ce797a0f88d7f067180338fb227f7b1928ea727bd9a4d7a1d022f7c52af71a3",
+    "xess-vsr.exe": "0d83655cfd259132d24ca0574ee427d174964570714d8c165336ced3630122f3",
+    "xess-fg.exe": "fc4ed32a5a9625053223f1a4b2995ed5b21e410aef19e52506c8ababd3051b66",
+    "libxess.dll": "a49f487f15a815c1242b659182cc9365b6aff2d94051d25d5379316bdb11a2dd",
+    "libxess_fg.dll": "7fa2116e987a6fcc621e7be791461ca49988490ee3a4bc008ebb9796a057e1db",
+    "libxell.dll": "5ce63652eee5720203e0e41cc97eb45ee541c499c8a51d4bdb1e8fe4eaef4890",
+    "python/python.exe": "29d6486dc5fa86c9d19db9d390fdbb62c4830e2b305761723c0b42e6f3596954",
+    "models/depth-anything-v2-small/depth_anything_v2_small.xml": "b1ebff2fd0a01fb5a39ac6e37d82eb0628d71c7b9832fc9660dafcd736849614",
+    "models/depth-anything-v2-small/depth_anything_v2_small.bin": "ea1be49df1be51ddfb1ee65e40a51f634673e960001ec602cd3d9a21eb2ef0dc",
+    "models/sea-raft/sea_raft_s_full.safetensors": "3f243d4c56b7b369b620d8dbf204d8d76c05ee1fab2e9ecb1b92a1107b88053a"
+  }
+}

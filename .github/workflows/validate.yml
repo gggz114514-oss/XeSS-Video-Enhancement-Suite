@@ -1,0 +1,37 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  source:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Reject fixed assets from Git history
+        shell: pwsh
+        run: |
+          $large = Get-ChildItem -Recurse -File | Where-Object {
+            $_.FullName -notmatch '[\\/]\.git[\\/]' -and $_.Length -gt 10MB
+          }
+          if ($large) {
+            $large | ForEach-Object { Write-Error "Large fixed asset belongs in Releases: $($_.FullName)" }
+            exit 1
+          }
+      - name: Compile Python sources
+        run: >-
+          python -m compileall -q
+          __init__.py xess_nodes.py runtime_manager.py install.py self_test.py pipeline tools
+      - name: Validate runtime manifest
+        shell: pwsh
+        run: |
+          $manifest = Get-Content runtime_manifest.json -Raw | ConvertFrom-Json
+          if ($manifest.schema_version -ne 1) { throw "unsupported runtime schema" }
+          if ($manifest.download_url -notmatch '^https://github\.com/.+/releases/download/') {
+            throw "runtime must be pinned to a GitHub Release asset"
+          }
+
