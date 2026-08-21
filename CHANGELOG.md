@@ -8,4 +8,5 @@
 - Added GitHub/ComfyUI Registry metadata and Windows validation workflow.
 - Replaced WGC as the default FG recovery path with direct native swap-chain readback.
 - Documented the DXGI factory interception and native back-buffer recovery path.
+- Fixed the combined SR -> FG entry point to always select the direct capture backend.
 - Kept the legacy `window` capture mode for diagnostics.

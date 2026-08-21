@@ -205,7 +205,7 @@ def main():
         temporal_depth_strength=args.temporal_depth_strength,
         verbose=args.verbose, allow_overlay=args.allow_overlay, video=args.video,
         encoder_preset=args.encoder_preset, crf=args.crf,
-        io_mode=transport,
+        io_mode=transport, capture_mode="direct",
         overlay_mask="",
     )
     sr_settings = sr.resolve_settings(sr_args)

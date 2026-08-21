@@ -159,7 +159,9 @@ def worker_command(args, width, height, fps, frames, *, stream, raw="", mv_dir="
         command.extend(("--device", str(args.device)))
     if args.verbose:
         command.append("--verbose")
-    command.extend(("--capture-mode", args.capture_mode))
+    # Internal callers created before the direct backend was added may not carry
+    # this field. Keep direct readback as the safe/default contract everywhere.
+    command.extend(("--capture-mode", getattr(args, "capture_mode", "direct")))
     if args.allow_overlay:
         command.append("--allow-overlay")
     return command
