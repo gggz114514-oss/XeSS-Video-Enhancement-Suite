@@ -38,7 +38,12 @@ ENGINE_ENV = "COMFYUI_XESS_ENGINE"
 CONFIG_PATH = NODE_DIR / "xess_config.json"
 _ENGINE_LOCK = threading.Lock()
 _MODULE_CACHE: dict[tuple[pathlib.Path, str], object] = {}
-_XPU_PROBE: dict[str, bool] = {}
+_XPU_PROBE: dict[str, str] = {}
+
+_XPU_WORK_KEYS = (
+    "TEMP", "TMP", "XDG_CACHE_HOME", "HF_HOME", "TORCH_HOME",
+    "OPENVINO_CACHE_DIR", "PYTHONIOENCODING",
+)
 
 SR_PRESETS = {
     "fast": {"flow": "dis", "bidirectional": False, "mv_path": "highres",
@@ -280,20 +285,109 @@ def _load_engine_module(engine: pathlib.Path, module_name: str):
     return module
 
 
+def _xpu_probe(python: str, engine: pathlib.Path,
+               env: dict[str, str]) -> tuple[bool, str]:
+    # Match the real prepare process: OpenCV is imported by prepare_common,
+    # then SEA-RAFT initializes torch XPU, and only afterwards does the depth
+    # estimator import OpenVINO.  Importing OpenVINO before torch can select a
+    # different SYCL/Level Zero runtime on some Arc A-series installations.
+    script = (
+        "import cv2\n"
+        "import torch\n"
+        "available = bool(torch.xpu.is_available())\n"
+        "count = int(torch.xpu.device_count()) if available else 0\n"
+        "print('XPU_PROBE', torch.__version__, available, count)\n"
+        "if not available or count < 1: raise SystemExit(2)\n"
+        "probe = torch.zeros(1, device='xpu')\n"
+        "torch.xpu.synchronize()\n"
+        "import openvino\n"
+    )
+    try:
+        probe = subprocess.run(
+            [python, "-c", script], env=env, cwd=engine,
+            capture_output=True, text=True, errors="replace", timeout=45,
+            creationflags=_creation_flags(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"probe could not start: {exc}"
+    stdout = (probe.stdout or "").strip()
+    stderr = (probe.stderr or "").strip()
+    detail = f"rc={probe.returncode} stdout={stdout!r}"
+    if stderr:
+        detail += f" stderr={stderr[-1200:]!r}"
+    return probe.returncode == 0, detail
+
+
+def _inherited_xpu_environment(env: dict[str, str]) -> dict[str, str]:
+    """Restore the launcher's proven XPU environment and retain configured caches."""
+    inherited = os.environ.copy()
+    for key in _XPU_WORK_KEYS:
+        if key in env:
+            inherited[key] = env[key]
+    return inherited
+
+
+def _xpu_environment_candidates(env: dict[str, str]):
+    """Yield conservative XPU environments in recovery order."""
+    yield "node", env.copy()
+
+    inherited = _inherited_xpu_environment(env)
+    yield "inherited-main", inherited
+
+    # ONEAPI_ROOT is installed as a system variable on Windows and does not
+    # prove that setvars.bat completed.  Let the probe decide, then use the
+    # current oneAPI selector only as a fallback.
+    level_zero = inherited.copy()
+    level_zero.pop("SYCL_DEVICE_FILTER", None)
+    level_zero["ONEAPI_DEVICE_SELECTOR"] = "level_zero:*"
+    yield "level-zero", level_zero
+
+    # Older bundled SYCL runtimes may not understand ONEAPI_DEVICE_SELECTOR.
+    legacy = inherited.copy()
+    legacy.pop("ONEAPI_DEVICE_SELECTOR", None)
+    legacy["SYCL_DEVICE_FILTER"] = "level_zero:gpu"
+    yield "legacy-level-zero", legacy
+
+
 def _xpu_python(engine: pathlib.Path, flow: str, env: dict[str, str]) -> str:
     portable = engine / "python" / "python.exe"
     if flow != "sea-raft":
         return os.fspath(portable)
     current = os.path.abspath(sys.executable)
-    if current not in _XPU_PROBE:
-        probe = subprocess.run(
-            [current, "-c", "import cv2,openvino,torch; assert torch.xpu.is_available()"],
-            env=env, cwd=engine, capture_output=True, creationflags=_creation_flags(),
-        )
-        _XPU_PROBE[current] = probe.returncode == 0
-    if not _XPU_PROBE[current]:
-        raise XeSSNodeError("Balanced/Quality 需要当前 ComfyUI Python 提供 torch.xpu、OpenVINO 和 OpenCV")
-    return current
+    candidates = list(_xpu_environment_candidates(env))
+    cached = _XPU_PROBE.get(current)
+    if cached:
+        selected = next((candidate for name, candidate in candidates if name == cached), None)
+        if selected is not None:
+            env.clear()
+            env.update(selected)
+            return current
+
+    attempts: list[str] = []
+    # Compare the complete environment.  Arc launchers can supply critical
+    # Level Zero/SYCL switches without changing PATH or either device selector.
+    # Collapsing candidates on only those three values would silently skip the
+    # inherited environment that already works in ComfyUI's main process.
+    fingerprints: set[tuple[tuple[str, str], ...]] = set()
+    for name, candidate in candidates:
+        fingerprint = tuple(sorted(candidate.items()))
+        if fingerprint in fingerprints:
+            continue
+        fingerprints.add(fingerprint)
+        ok, detail = _xpu_probe(current, engine, candidate)
+        if ok:
+            env.clear()
+            env.update(candidate)
+            _XPU_PROBE[current] = name
+            print(f"[ComfyUI-XeSS] XPU subprocess environment: {name}", flush=True)
+            return current
+        attempts.append(f"{name}: {detail}")
+
+    raise XeSSNodeError(
+        "Balanced/Quality 在当前 ComfyUI Python 的子进程里无法初始化 torch.xpu。\n"
+        "已按真实导入顺序测试原节点环境、启动器原始环境和 Level Zero 回退。\n"
+        f"python={current}\n" + "\n".join(attempts)
+    )
 
 
 def _resolve_flow(preset: dict, override: str) -> tuple[str, bool]:
