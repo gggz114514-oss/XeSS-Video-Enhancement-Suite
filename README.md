@@ -5,6 +5,47 @@
 当前版本：源码/节点 `1.1.0`，SR `1.2`，FG `1.2`，固定运行时 `2026.08.21-r1`。
 
 > 这是社区项目，不是 Intel 官方产品。实机验证平台为 Windows 11 与 Intel Arc B580。
+> ## 实测环境基线
+
+以下是项目当前实际测试环境，不代表唯一支持版本。
+
+| 项目 | 当前实测值 |
+|---|---|
+| 整合包 | ComfyUI-aki-v3-IntelArc_20260722 |
+| ComfyUI 核心 | 0.33.1 |
+| Python | 3.13.11 |
+| PyTorch | 2.13.0+xpu |
+| XPU 状态 | `torch.xpu.is_available() = True` |
+| XPU 设备数 | 1 |
+| OpenVINO | 2025.4.1 |
+| 显卡 | Intel Arc B580 |
+| XeSS 节点提交 | `e20e986` |
+| XeSS Runtime | `2026.08.21-r1` |
+| 操作系统 | Windows 11 |
+
+### 依赖说明
+
+- 极速模式使用 DIS 光流，不需要 SEA-RAFT。
+- 均衡和极致画质模式使用 SEA-RAFT，需要在 ComfyUI 实际使用的 Python 环境中提供：
+  - Intel XPU 版 PyTorch；
+  - `safetensors`；
+  - OpenVINO。
+- `.runtime/engine` 是 XeSS 固定运行时，不是 ComfyUI 的 Python 依赖环境。
+- 不要把普通 CPU/CUDA 版 PyTorch 当作 Intel XPU 版使用。
+
+### 反馈问题时请提供
+
+请同时提供以下信息：
+
+1. ComfyUI 核心版本；
+2. Python 版本；
+3. PyTorch 版本；
+4. `torch.xpu.is_available()` 的结果；
+5. OpenVINO 版本；
+6. XeSS 节点 Git 提交或目录版本；
+7. XeSS Runtime 版本；
+8. 完整的 ComfyUI 控制台日志；
+9. 使用的节点挡位和光流模式。
 
 ## 本次版本重点：直接拦截 XeFG 交换链
 
