@@ -1,0 +1,651 @@
+// Fused SEA-RAFT gather-correlate forward kernel for Intel XPU (oneAPI DPC++).
+//
+// Computes, for every pyramid level l and every tap t = (dy_i, dx_j) with
+// dy outer / dx inner (matching torch.meshgrid(dy, dx) flattening):
+//
+//   centroid = coords[b, :, y, x] / level_scale[l]
+//   sample   = bilinear(fmap2_level[b], centroid + delta[t] * dilation[b, y, x])
+//   corr     = sum_c(fmap1[b, c, y, x] * sample[c]) / sqrt(C)
+//
+// written straight into the final [B, L*(2r+1)^2, H, W] output, so the
+// per-tap grid_sample + multiply + reduce chain and its intermediate
+// [B, C, H, W] tensors never materialise.
+//
+// Two execution paths, chosen per work group AND per pyramid level:
+//
+//  * Staged (default, radius specialised at compile time): the work group
+//    cooperatively loads the fmap2 neighbourhood patch of every pixel group
+//    into shared local memory, once per channel, and all threads serve their
+//    taps from the slab.  This converts 324 random global gathers per pixel
+//    into a coalesced patch load shared across the whole work group, which
+//    mirrors how the reference RAFT CUDA correlation kernel uses shared
+//    memory.  Zero padding is baked into the slab, so the boundary semantics
+//    of grid_sample(align_corners=True, padding_mode="zeros") - each of the
+//    four bilinear neighbours contributes only when inside the image -
+//    survive as pure indexing with no branches.
+//
+//  * Direct fallback: four predicated global gathers per tap, used whenever
+//    the patch does not fit the slab (huge dilation / wild coordinates /
+//    non-finite inputs) or when staging is disabled via XESS_XPU_CORR_SLM=off.
+//
+// Every decision between the two paths is derived exclusively from
+// work-group-uniform values (group reductions over per-lane coordinates), so
+// all lanes of a group always agree.  group_barrier() therefore can never
+// diverge between staged and direct lanes of the same group.
+//
+// Work groups never straddle batch images: each image occupies a padded
+// segment of the linear range, so patch bounds stay inside one fmap2 sample.
+
+#include <torch/types.h>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+
+#include <cfloat>
+#include <cmath>
+#include <cstdlib>
+#include <cstdint>
+#include <vector>
+
+// Kernel name tags must live at namespace scope per the SYCL specification.
+class XessSmokeAddKernel;
+template <int kTile, bool kStaged, bool kStats>
+class XessGatherCorrelateKernel;
+
+at::Tensor& xess_corr_stats_storage();
+
+namespace {
+// Hard cap on pyramid depth; the launcher copies fixed-size arrays by value
+// into the kernel, keeping asynchronous reads off the caller's stack.
+constexpr int kMaxLevels = 8;
+// Shared local memory budget per work group, in floats (32 KiB).
+constexpr int kSlmFloats = 8192;
+// Smallest slab allocation the staged path may plan around; a bilinear patch
+// always needs at least a 2x2 region because of the +1 neighbours.
+constexpr int kSlmMinSpan = 4;
+// The staged path is compiled for SEA-RAFT's actual radius (taps = 81);
+// anything else falls back to the direct path automatically.
+constexpr int kStagedSide = 9;
+constexpr int kStagedTaps = kStagedSide * kStagedSide;
+// Coordinates are clamped to +/-2^23 before the float->int conversions in
+// the direct path.  Any feature map smaller than 16M pixels samples zero
+// contribution beyond this range anyway, so results are bit-identical for
+// every finite input while floor()/static_cast<int>() stay well defined even
+// for absurd magnitudes like 1e30 (and NaN/Inf take an explicit early-out).
+constexpr float kMaxTapCoord = 8388608.0f;  // 2^23
+
+struct TapGeometry {
+    int xy00;      // true plane offset of the (floor y, floor x) neighbour
+    int w;         // plane row stride
+    bool valid_x0;
+    bool valid_x1;
+    bool valid_y0;
+    bool valid_y1;
+    float w_nw;    // (1-v)(1-u)
+    float w_ne;    // (1-v)*u
+    float w_sw;    // v*(1-u)
+    float w_se;    // v*u
+};
+
+inline TapGeometry make_tap_geometry(int h, int w, float gy, float gx) {
+    TapGeometry g;
+    if (!sycl::isfinite(gy) || !sycl::isfinite(gx)) {
+        // grid_sample would propagate NaN here; the fused kernel defines the
+        // result as zero contribution instead of relying on undefined
+        // float->int conversions.  Callers route non-finite work groups to
+        // this path deliberately (see the staged feasibility gate).
+        g.w = w;
+        g.xy00 = 0;
+        g.valid_x0 = g.valid_x1 = g.valid_y0 = g.valid_y1 = false;
+        g.w_nw = g.w_ne = g.w_sw = g.w_se = 0.0f;
+        return g;
+    }
+    gy = sycl::clamp(gy, -kMaxTapCoord, kMaxTapCoord);
+    gx = sycl::clamp(gx, -kMaxTapCoord, kMaxTapCoord);
+    const float fy = sycl::floor(gy);
+    const float fx = sycl::floor(gx);
+    const int y0 = static_cast<int>(fy);
+    const int x0 = static_cast<int>(fx);
+    const float v = gy - fy;
+    const float u = gx - fx;
+
+    g.w = w;
+    g.valid_x0 = (x0 >= 0) & (x0 < w);
+    g.valid_x1 = (x0 + 1 >= 0) & (x0 + 1 < w);
+    g.valid_y0 = (y0 >= 0) & (y0 < h);
+    g.valid_y1 = (y0 + 1 >= 0) & (y0 + 1 < h);
+    // True (possibly out-of-range) base offset; masked lanes never load.
+    g.xy00 = y0 * w + x0;
+
+    g.w_nw = (1.0f - v) * (1.0f - u);
+    g.w_ne = (1.0f - v) * u;
+    g.w_sw = v * (1.0f - u);
+    g.w_se = v * u;
+    return g;
+}
+
+inline float gather_tap(const float* plane, const TapGeometry& g) {
+    float acc = 0.0f;
+    if (g.valid_y0 & g.valid_x0) {
+        acc += g.w_nw * plane[g.xy00];
+    }
+    if (g.valid_y0 & g.valid_x1) {
+        acc += g.w_ne * plane[g.xy00 + 1];
+    }
+    if (g.valid_y1 & g.valid_x0) {
+        acc += g.w_sw * plane[g.xy00 + g.w];
+    }
+    if (g.valid_y1 & g.valid_x1) {
+        acc += g.w_se * plane[g.xy00 + g.w + 1];
+    }
+    return acc;
+}
+
+// Plain-old-data bundle copied by value into the kernel functor.
+struct KernelParams {
+    const float* fmap1;
+    const float* coords;
+    const float* dilation;
+    float* out;
+    const float* level_ptr[kMaxLevels];
+    int level_h[kMaxLevels];
+    int level_w[kMaxLevels];
+    float level_scale[kMaxLevels];
+    int64_t batch;
+    int64_t channels;
+    int64_t height;
+    int64_t width;
+    int num_levels;
+    int side;         // taps per axis (2r+1)
+    int taps;         // side * side
+    int radius;
+    int segment;      // padded pixels per batch image (multiple of wg size)
+    float norm_scale;
+    int slm_budget;   // usable slab floats (kSlmFloats, lowered for tests)
+    int* stats;       // {staged, fallback} counters, nullptr when disabled
+};
+
+// Per-thread state shared by both paths.
+struct PixelContext {
+    bool live;
+    int64_t b;
+    int64_t pix;      // y * W + x
+};
+
+inline PixelContext decode_pixel(sycl::nd_item<1> item, KernelParams p) {
+    PixelContext ctx;
+    const size_t pid = item.get_global_id(0);
+    const int64_t b = static_cast<int64_t>(pid) / p.segment;
+    const int64_t within = static_cast<int64_t>(pid) % p.segment;
+    ctx.b = b;
+    ctx.live = within < p.height * p.width &&
+               b < p.batch;
+    const int64_t rem = within % (p.height * p.width);
+    ctx.pix = (rem / p.width) * p.width + (rem % p.width);
+    return ctx;
+}
+
+// Direct path for a single pyramid level: everything independent of the
+// channel is hoisted into TapGeometry tiles; the channel loop is four
+// predicated gathers plus FMA.
+template <int kTile>
+inline void direct_single_level(sycl::nd_item<1> item, KernelParams p,
+                                const PixelContext& ctx, int l) {
+    if (!ctx.live) {
+        return;
+    }
+    const int64_t H = p.height;
+    const int64_t W = p.width;
+    const float cx0 = p.coords[ctx.b * 2 * H * W + ctx.pix];
+    const float cy0 = p.coords[ctx.b * 2 * H * W + H * W + ctx.pix];
+    const float dil = p.dilation[ctx.b * H * W + ctx.pix];
+
+    const float* level_base = p.level_ptr[l];
+    const int h2 = p.level_h[l];
+    const int w2 = p.level_w[l];
+    const float cx = cx0 / p.level_scale[l];
+    const float cy = cy0 / p.level_scale[l];
+    const int64_t plane_pixels = static_cast<int64_t>(h2) * w2;
+
+    for (int t0 = 0; t0 < p.taps; t0 += kTile) {
+        float acc[kTile] = {};
+        int live[kTile];
+        TapGeometry geom[kTile];
+
+#pragma unroll
+        for (int k = 0; k < kTile; ++k) {
+            const int t = t0 + k;
+            live[k] = t < p.taps;
+            const int ti = live[k] ? t : 0;
+            // meshgrid(dy, dx) flattening: the first ("dy") axis is major
+            // and feeds the x coordinate, the second ("dx") axis feeds y,
+            // exactly how bilinear_sampler splits the stacked delta.
+            const int oi = ti / p.side;
+            const int oj = ti % p.side;
+            const float gx =
+                cx + (static_cast<float>(oi) - p.radius) * dil;
+            const float gy =
+                cy + (static_cast<float>(oj) - p.radius) * dil;
+            geom[k] = make_tap_geometry(h2, w2, gy, gx);
+        }
+
+        const float* fmap1_pix =
+            p.fmap1 + (ctx.b * p.channels * H * W) + ctx.pix;
+        for (int64_t c = 0; c < p.channels; ++c) {
+            const float f1 = fmap1_pix[c * H * W];
+            const float* base = level_base +
+                static_cast<int64_t>(ctx.b) * p.channels * plane_pixels +
+                c * plane_pixels;
+#pragma unroll
+            for (int k = 0; k < kTile; ++k) {
+                if (live[k]) {
+                    acc[k] += f1 * gather_tap(base, geom[k]);
+                }
+            }
+        }
+
+#pragma unroll
+        for (int k = 0; k < kTile; ++k) {
+            const int t = t0 + k;
+            if (t < p.taps) {
+                const int64_t chan =
+                    ctx.b * p.num_levels * p.taps + l * p.taps + t;
+                p.out[chan * H * W + ctx.pix] = acc[k] / p.norm_scale;
+            }
+        }
+    }
+}
+
+// Direct path across every level.
+template <int kTile>
+inline void direct_level_loop(sycl::nd_item<1> item, KernelParams p,
+                              const PixelContext& ctx) {
+    for (int l = 0; l < p.num_levels; ++l) {
+        direct_single_level<kTile>(item, p, ctx, l);
+    }
+}
+
+// Patch bounds cover every bilinear neighbour of every tap of every live
+// pixel in the group, plus one ring of slack.  Returns false whenever the
+// bounds cannot be trusted as plain ints or the patch would not fit the
+// slab; the caller must then use the direct path for that level.  All inputs
+// are work-group-uniform, so the verdict is uniform too.
+inline bool staged_patch_bounds(KernelParams p, float cx0_min,
+                                float cx0_max, float cy0_min, float cy0_max,
+                                float dil_abs_max, int l, int* x_lo,
+                                int* x_hi, int* y_lo, int* y_hi,
+                                int* span_x, int* span_y) {
+    const float scale = p.level_scale[l];
+    const float reach = static_cast<float>(p.radius) * dil_abs_max;
+    const float raw_lo_x = cx0_min / scale - reach;
+    const float raw_hi_x = cx0_max / scale + reach;
+    const float raw_lo_y = cy0_min / scale - reach;
+    const float raw_hi_y = cy0_max / scale + reach;
+    // Overflow to +-inf or past the clamped tap range means the casts below
+    // (and every slab index derived from them) would be meaningless.
+    if (!sycl::isfinite(raw_lo_x) || !sycl::isfinite(raw_hi_x) ||
+        !sycl::isfinite(raw_lo_y) || !sycl::isfinite(raw_hi_y) ||
+        sycl::fabs(raw_lo_x) > kMaxTapCoord ||
+        sycl::fabs(raw_hi_x) > kMaxTapCoord ||
+        sycl::fabs(raw_lo_y) > kMaxTapCoord ||
+        sycl::fabs(raw_hi_y) > kMaxTapCoord) {
+        return false;
+    }
+    *x_lo = static_cast<int>(sycl::floor(raw_lo_x)) - 1;
+    *x_hi = static_cast<int>(sycl::floor(raw_hi_x)) + 1;
+    *y_lo = static_cast<int>(sycl::floor(raw_lo_y)) - 1;
+    *y_hi = static_cast<int>(sycl::floor(raw_hi_y)) + 1;
+    *span_x = *x_hi - *x_lo + 1;
+    *span_y = *y_hi - *y_lo + 1;
+    if (*span_x < 2 || *span_y < 2) {
+        return false;  // bilinear needs the +1 neighbours inside the slab
+    }
+    if (*span_x > p.slm_budget || *span_y > p.slm_budget) {
+        return false;
+    }
+    const int64_t span =
+        static_cast<int64_t>(*span_x) * static_cast<int64_t>(*span_y);
+    return span > 0 && span <= p.slm_budget;
+}
+
+// Staged path: the work group stages the fmap2 neighbourhood of all its
+// pixels into shared local memory per channel and serves the taps from there.
+// Levels whose patch does not fit run the direct path for that level only;
+// both branches of the per-level decision are taken identically by every
+// lane of the group, keeping the group barriers inside them legal.
+// Returns true when every level of this group was served from the slab.
+// Compiled only for kSide == 9 (SEA-RAFT's radius); other radii take the
+// direct path.
+template <int kSide>
+inline bool staged_level_loop(sycl::nd_item<1> item, KernelParams p,
+                              const PixelContext& ctx, float* slm) {
+    constexpr int kTaps = kSide * kSide;
+    const int lane = static_cast<int>(item.get_local_id(0));
+    const int wg_size = static_cast<int>(item.get_local_range(0));
+
+    // Neutral contributions keep tail lanes from poisoning the reductions.
+    const float cx0 = ctx.live ? p.coords[ctx.b * 2 * p.height * p.width +
+                                           ctx.pix] : 0.0f;
+    const float cy0 = ctx.live ? p.coords[ctx.b * 2 * p.height * p.width +
+                                           p.height * p.width + ctx.pix]
+                               : 0.0f;
+    const float dil =
+        ctx.live ? p.dilation[ctx.b * p.height * p.width + ctx.pix] : 0.0f;
+
+    // Gate 1 (work-group-uniform): any non-finite coordinate or dilation
+    // sends the whole group down the direct path, which defines the result
+    // instead of producing undefined integer conversions downstream.
+    const int wild = (!sycl::isfinite(cx0) || !sycl::isfinite(cy0) ||
+                      !sycl::isfinite(dil)) ? 1 : 0;
+    const auto grp = item.get_group();
+    if (sycl::reduce_over_group(grp, wild, sycl::plus<int>{}) > 0) {
+        direct_level_loop<4>(item, p, ctx);
+        return false;
+    }
+
+    const float cx0_min = sycl::reduce_over_group(
+        grp, ctx.live ? cx0 : FLT_MAX, sycl::minimum<float>{});
+    const float cx0_max = sycl::reduce_over_group(
+        grp, ctx.live ? cx0 : -FLT_MAX, sycl::maximum<float>{});
+    const float cy0_min = sycl::reduce_over_group(
+        grp, ctx.live ? cy0 : FLT_MAX, sycl::minimum<float>{});
+    const float cy0_max = sycl::reduce_over_group(
+        grp, ctx.live ? cy0 : -FLT_MAX, sycl::maximum<float>{});
+    // Taps extend symmetrically, so the patch must cover both directions of
+    // the largest magnitude dilation in the group.
+    const float dil_abs_max = sycl::reduce_over_group(
+        grp, sycl::fabs(dil), sycl::maximum<float>{});
+
+    bool any_fallback = false;
+
+    for (int l = 0; l < p.num_levels; ++l) {
+        int x_lo, x_hi, y_lo, y_hi, span_x, span_y;
+        const bool use_staged = staged_patch_bounds(
+            p, cx0_min, cx0_max, cy0_min, cy0_max, dil_abs_max, l,
+            &x_lo, &x_hi, &y_lo, &y_hi, &span_x, &span_y);
+
+        if (!use_staged) {
+            // Patch too large (wild dilation/coordinates): direct gathers
+            // for this level only.
+            any_fallback = true;
+            direct_single_level<4>(item, p, ctx, l);
+            continue;
+        }
+
+        const float* level_base = p.level_ptr[l];
+        const int h2 = p.level_h[l];
+        const int w2 = p.level_w[l];
+        const float scale = p.level_scale[l];
+        const int64_t plane_pixels = static_cast<int64_t>(h2) * w2;
+        const int span = span_x * span_y;
+
+        const float* base_b = level_base +
+            static_cast<int64_t>(ctx.b) * p.channels * plane_pixels;
+        const int64_t fmap1_base =
+            (ctx.b * p.channels * p.height * p.width) + ctx.pix;
+
+        float acc[kTaps] = {};
+
+        for (int64_t c = 0; c < p.channels; ++c) {
+            const float* plane = base_b + c * plane_pixels;
+            // Cooperative zero-padded patch load.
+            for (int idx = lane; idx < span; idx += wg_size) {
+                const int ly = idx / span_x;
+                const int lx = idx % span_x;
+                const int yy = y_lo + ly;
+                const int xx = x_lo + lx;
+                slm[idx] =
+                    (yy >= 0 && yy < h2 && xx >= 0 && xx < w2)
+                        ? plane[static_cast<int64_t>(yy) * w2 + xx]
+                        : 0.0f;
+            }
+            sycl::group_barrier(grp);
+
+            if (ctx.live) {
+                const float f1 = p.fmap1[fmap1_base + c * p.height * p.width];
+#pragma unroll
+                for (int t = 0; t < kTaps; ++t) {
+                    // meshgrid(dy, dx) flattening: major ("dy") axis feeds
+                    // x, minor ("dx") axis feeds y.
+                    const int oi = t / kSide;
+                    const int oj = t % kSide;
+                    const float gx =
+                        cx0 / scale +
+                        (static_cast<float>(oi) - p.radius) * dil;
+                    const float gy =
+                        cy0 / scale +
+                        (static_cast<float>(oj) - p.radius) * dil;
+                    const float fy = sycl::floor(gy);
+                    const float fx = sycl::floor(gx);
+                    const float v = gy - fy;
+                    const float u = gx - fx;
+                    const int bi = (static_cast<int>(fy) - y_lo) *
+                                       span_x +
+                                   (static_cast<int>(fx) - x_lo);
+                    acc[t] +=
+                        f1 * ((1.0f - v) * (1.0f - u) * slm[bi] +
+                              (1.0f - v) * u * slm[bi + 1] +
+                              v * (1.0f - u) * slm[bi + span_x] +
+                              v * u * slm[bi + span_x + 1]);
+                }
+            }
+            sycl::group_barrier(grp);
+        }
+
+        if (ctx.live) {
+#pragma unroll
+            for (int t = 0; t < kTaps; ++t) {
+                const int64_t chan =
+                    ctx.b * p.num_levels * p.taps + l * p.taps + t;
+                p.out[chan * p.height * p.width + ctx.pix] =
+                    acc[t] / p.norm_scale;
+            }
+        }
+    }
+    return !any_fallback;
+}
+
+template <bool kStats>
+inline void count_stats(sycl::nd_item<1> item, KernelParams p, bool staged) {
+    if constexpr (kStats) {
+        if (item.get_local_id(0) == 0 && p.stats != nullptr) {
+            sycl::atomic_ref<
+                int, sycl::memory_order::relaxed,
+                sycl::memory_scope::device,
+                sycl::access::address_space::global_space>
+                ref(p.stats[staged ? 0 : 1]);
+            ref.fetch_add(1);
+        }
+    }
+}
+
+template <int kTile, bool kAllowStaged, bool kStats>
+inline void correlate_pixels(sycl::nd_item<1> item, KernelParams p,
+                             float* slm) {
+    const PixelContext ctx = decode_pixel(item, p);
+
+    if constexpr (kAllowStaged) {
+        if (p.taps != kStagedTaps) {
+            // Radius outside the compiled staging specialisation.
+            direct_level_loop<kTile>(item, p, ctx);
+            count_stats<kStats>(item, p, false);
+            return;
+        }
+        const bool pure_staged = staged_level_loop<kStagedSide>(item, p, ctx,
+                                                                slm);
+        count_stats<kStats>(item, p, pure_staged);
+    } else {
+        direct_level_loop<kTile>(item, p, ctx);
+        count_stats<kStats>(item, p, false);
+    }
+}
+
+}  // namespace
+
+at::Tensor xess_gather_correlate_forward(
+    const at::Tensor& fmap1, const std::vector<at::Tensor>& fmap2_levels,
+    const at::Tensor& coords, const at::Tensor& dilation,
+    const std::vector<int64_t>& level_scales, int64_t radius) {
+    const int64_t B = fmap1.size(0);
+    const int64_t C = fmap1.size(1);
+    const int64_t H = fmap1.size(2);
+    const int64_t W = fmap1.size(3);
+    const int num_levels = static_cast<int>(level_scales.size());
+    const int64_t taps_side = 2 * radius + 1;
+
+    at::Tensor out =
+        at::empty({B, num_levels * taps_side * taps_side, H, W},
+                  fmap1.options());
+    const int64_t total_pixels = B * H * W;
+    if (num_levels == 0 || total_pixels == 0) {
+        return out;
+    }
+
+    KernelParams p;
+    p.fmap1 = fmap1.const_data_ptr<float>();
+    p.coords = coords.const_data_ptr<float>();
+    p.dilation = dilation.const_data_ptr<float>();
+    p.out = out.mutable_data_ptr<float>();
+    for (int l = 0; l < num_levels; ++l) {
+        p.level_ptr[l] = fmap2_levels[l].const_data_ptr<float>();
+        p.level_h[l] = static_cast<int>(fmap2_levels[l].size(2));
+        p.level_w[l] = static_cast<int>(fmap2_levels[l].size(3));
+        p.level_scale[l] = static_cast<float>(level_scales[l]);
+    }
+    p.batch = B;
+    p.channels = C;
+    p.height = H;
+    p.width = W;
+    p.num_levels = num_levels;
+    p.side = static_cast<int>(taps_side);
+    p.taps = static_cast<int>(taps_side * taps_side);
+    p.radius = static_cast<int>(radius);
+    p.norm_scale = std::sqrt(static_cast<float>(C));
+    p.slm_budget = kSlmFloats;
+    p.stats = nullptr;
+
+    // Read per call: negligible next to kernel runtime, and lets benchmarks
+    // sweep configurations in one process by flipping the environment.
+    size_t work_group_size = 256;
+    int tile_size = 4;
+    bool allow_staged = true;
+    bool stats_enabled = false;
+    if (const char* env = std::getenv("XESS_XPU_CORR_WG")) {
+        const long parsed = std::strtol(env, nullptr, 10);
+        if (parsed >= 32 && parsed <= 1024 && (parsed & (parsed - 1)) == 0) {
+            work_group_size = static_cast<size_t>(parsed);
+        }
+    }
+    if (const char* env = std::getenv("XESS_XPU_CORR_TILE")) {
+        const long parsed = std::strtol(env, nullptr, 10);
+        if (parsed == 2 || parsed == 8) {
+            tile_size = static_cast<int>(parsed);
+        }
+    }
+    if (const char* env = std::getenv("XESS_XPU_CORR_SLM")) {
+        allow_staged = std::strtol(env, nullptr, 10) != 0;
+    }
+    if (const char* env = std::getenv("XESS_XPU_CORR_STATS")) {
+        stats_enabled = std::strtol(env, nullptr, 10) != 0;
+    }
+    if (const char* env = std::getenv("XESS_XPU_CORR_SLM_MAX")) {
+        const long parsed = std::strtol(env, nullptr, 10);
+        // Test-only knob: shrink the slab budget to force the staged path to
+        // fall back deterministically.  Never raised above the real capacity.
+        if (parsed >= kSlmMinSpan && parsed <= kSlmFloats) {
+            p.slm_budget = static_cast<int>(parsed);
+        }
+    }
+    if (stats_enabled) {
+        p.stats = xess_corr_stats_storage().mutable_data_ptr<int>();
+    }
+    // Batch-straddling work groups would break the staged patch bounds.
+    const int64_t hw = H * W;
+    const int64_t segment =
+        ((hw + static_cast<int64_t>(work_group_size) - 1) /
+         static_cast<int64_t>(work_group_size)) *
+        static_cast<int64_t>(work_group_size);
+    p.segment = static_cast<int>(segment);
+    const size_t global_size =
+        static_cast<size_t>(segment) * static_cast<size_t>(B);
+
+    // Enqueue on PyTorch's current stream queue; never created or waited on.
+    auto stream = c10::xpu::getCurrentXPUStream();
+    sycl::queue& queue = stream.queue();
+
+#define XESS_SUBMIT_CORRELATE(kTile, kStaged, kStats)                         \
+    queue.submit([&](sycl::handler& cgh) {                                    \
+        sycl::local_accessor<float, 1> slab(                                  \
+            sycl::range<1>{static_cast<size_t>(kSlmFloats)}, cgh);            \
+        cgh.parallel_for<class XessGatherCorrelateKernel<kTile, kStaged,      \
+                                                         kStats>>(            \
+            sycl::nd_range<1>{global_size, work_group_size},                  \
+            [=](sycl::nd_item<1> item) {                                      \
+                correlate_pixels<kTile, kStaged, kStats>(                     \
+                    item, p, slab.get_pointer());                             \
+            });                                                               \
+    })
+    if (allow_staged && p.taps == kStagedTaps) {
+        if (stats_enabled) {
+            XESS_SUBMIT_CORRELATE(4, true, true);
+        } else {
+            XESS_SUBMIT_CORRELATE(4, true, false);
+        }
+    } else if (tile_size == 2) {
+        if (stats_enabled) {
+            XESS_SUBMIT_CORRELATE(2, false, true);
+        } else {
+            XESS_SUBMIT_CORRELATE(2, false, false);
+        }
+    } else if (tile_size == 8) {
+        if (stats_enabled) {
+            XESS_SUBMIT_CORRELATE(8, false, true);
+        } else {
+            XESS_SUBMIT_CORRELATE(8, false, false);
+        }
+    } else {
+        if (stats_enabled) {
+            XESS_SUBMIT_CORRELATE(4, false, true);
+        } else {
+            XESS_SUBMIT_CORRELATE(4, false, false);
+        }
+    }
+#undef XESS_SUBMIT_CORRELATE
+    return out;
+}
+
+at::Tensor& xess_corr_stats_storage() {
+    // Cumulative {pure-staged, any-fallback} work-group decision counts.
+    // Created once per process on the current XPU device and intentionally
+    // leaked (16 bytes) so it never outlives the XPU context at shutdown;
+    // kernels and the reset op share PyTorch's current stream, so zero_()
+    // orders correctly.
+    static at::Tensor* stats = new at::Tensor(
+        at::zeros({2}, at::TensorOptions().dtype(at::kInt).device(at::kXPU)));
+    return *stats;
+}
+
+at::Tensor xess_corr_stats_forward() { return xess_corr_stats_storage(); }
+
+void xess_reset_corr_stats_forward() {
+    xess_corr_stats_storage().zero_();
+}
+
+at::Tensor xess_smoke_add_forward(const at::Tensor& input) {
+    at::Tensor out = at::empty_like(input);
+    const int64_t n = input.numel();
+    if (n == 0) {
+        return out;
+    }
+    const float* src = input.const_data_ptr<float>();
+    float* dst = out.mutable_data_ptr<float>();
+
+    auto stream = c10::xpu::getCurrentXPUStream();
+    sycl::queue& queue = stream.queue();
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<class XessSmokeAddKernel>(
+            sycl::range<1>{static_cast<size_t>(n)},
+            [=](sycl::id<1> i) { dst[i] = src[i] + 1.0f; });
+    });
+    return out;
+}

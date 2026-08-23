@@ -26,7 +26,9 @@
 ### 依赖说明
 
 - 极速模式使用 DIS 光流，不需要 SEA-RAFT。
-- 均衡和极致画质模式使用 SEA-RAFT，需要在 ComfyUI 实际使用的 Python 环境中提供：
+- 均衡和极致画质模式使用 SEA-RAFT；默认在超过 720p 时等比例把短边缩到
+  720 像素分析，再把光流恢复到原尺寸。它需要在 ComfyUI 实际使用的
+  Python 环境中提供：
   - Intel XPU 版 PyTorch；
   - `safetensors`；
   - OpenVINO。
@@ -144,7 +146,11 @@ Load Video → XeSS 视频超分（两挡自动） → XeSS 视频插帧（两�
 主档位只有两套：
 
 - `极速模式（最低挡）`：DIS 光流，速度优先；
-- `极致画质（最高挡）`：双向 SEA-RAFT、AI 深度与五帧信息，适合复杂运动。
+- `极致画质（最高挡）`：双向 SEA-RAFT（自动 720p 分析）、AI 深度与五帧信息，适合复杂运动。
+
+输入短边不超过 720 像素时 SEA-RAFT 使用原生分辨率。专家节点可切换到
+`原生分辨率（实验 / 极慢）`，但高分辨率下会大幅降低速度，当前实测没有
+画质优势，仅建议用于研究和对照。
 
 需要逐项调节时使用 `XeSS 视频处理/专家` 分类。完整参数方案见 [EXPERT_GUIDE.md](EXPERT_GUIDE.md)，示例工作流位于 [workflows/xess超分帧生成.json](workflows/xess超分帧生成.json)。
 
@@ -164,11 +170,16 @@ run_xess.bat "C:\Videos\input.mp4" 1.5 --preset fast
 run_fg.bat "C:\Videos\input.mp4" --preset fast
 ```
 
-先超分、再插帧：
+高质量模式默认自动使用 720p SEA-RAFT 分析：
 
 ```bat
-run_pipeline.bat "C:\Videos\input.mp4" --scale 1.5 --sr-preset fast --fg-preset fast
+run_xess.bat "C:\Videos\input.mp4" 1.5 --preset quality
+run_fg.bat "C:\Videos\input_xess_sr12_quality_1.5x_1296x720.mp4" --preset quality
 ```
+
+如需进行原生高分辨率对照，可额外传入 `--flow-resolution native`。该选项
+速度极慢，不作为推荐生产配置。SR 与 FG 建议顺序运行；同时启动两套
+SEA-RAFT 的联合管线暂不作为支持目标。
 
 入口脚本每次启动会先检查 Runtime 清单并同步 Git 中的新管线代码。Runtime 版本没变时不会联网下载。
 

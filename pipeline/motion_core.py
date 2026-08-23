@@ -7,9 +7,11 @@ per-video geometry caches, so FG always analyses the actual frames it receives.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -19,6 +21,44 @@ import numpy as np
 
 def fail(message: str) -> None:
     raise RuntimeError(message)
+
+
+@contextlib.contextmanager
+def _exclusive_lock(lock_path: str):
+    """Cross-process mutual exclusion around OpenVINO model compilation.
+
+    Concurrent prepares share one CACHE_DIR, and OpenVINO's blob writer is not
+    race-safe: simultaneous compiles of the same model corrupt each other's
+    cache stream."""
+    handle = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            locked = False
+            for _ in range(300):
+                os.lseek(handle, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    time.sleep(0.2)
+            if not locked:
+                raise RuntimeError(f"timed out waiting for lock: {lock_path}")
+            try:
+                yield
+            finally:
+                os.lseek(handle, 0, os.SEEK_SET)
+                msvcrt.locking(handle, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        os.close(handle)
 
 
 def robust_normalize(depth: np.ndarray) -> np.ndarray:
@@ -205,7 +245,11 @@ class DepthEstimator:
             os.makedirs(cache_dir, exist_ok=True)
             config["CACHE_DIR"] = cache_dir
         print(f"[motion] compiling depth model on {device}", file=sys.stderr, flush=True)
-        self.compiled = core.compile_model(model, device, config)
+        if cache_dir:
+            with _exclusive_lock(os.path.join(cache_dir, "compile.lock")):
+                self.compiled = core.compile_model(model, device, config)
+        else:
+            self.compiled = core.compile_model(model, device, config)
         self.input = self.compiled.input(0)
         self.output = self.compiled.output(0)
         shape = list(self.input.shape)
@@ -244,8 +288,59 @@ class DisFlow:
         return backward, forward, None
 
 
+FLOW_MIN_SIZE = 128
+FLOW_AUTO_SHORT_EDGE = 720
+
+
+def automatic_flow_scale(width: int, height: int) -> float:
+    """Keep native flow through 720p, otherwise reduce the short edge to 720."""
+    if width <= 0 or height <= 0:
+        fail("flow dimensions must be positive")
+    return min(1.0, FLOW_AUTO_SHORT_EDGE / min(width, height))
+
+
+def scaled_flow_size(size: int, flow_scale: float) -> int:
+    """SEA-RAFT inference edge length for a source edge at ``flow_scale``.
+
+    Sources at or below FLOW_MIN_SIZE pass through untouched.  This floor is a
+    quality bound for reduced-resolution inference, not a correctness bound;
+    tiny native inputs are kept safe by the sampleable-level guard in
+    sea_raft_core/corr.py."""
+    if size <= FLOW_MIN_SIZE:
+        return size
+    return max(FLOW_MIN_SIZE, int(round(size * flow_scale)))
+
+
+def scaled_flow_dimensions(width: int, height: int,
+                           flow_scale: float) -> tuple[int, int]:
+    """Scale both axes uniformly while retaining a useful minimum short edge."""
+    if width <= 0 or height <= 0 or not 0.0 < flow_scale <= 1.0:
+        fail("invalid flow dimensions or scale")
+    if flow_scale >= 1.0:
+        return width, height
+    minimum_scale = min(1.0, FLOW_MIN_SIZE / min(width, height))
+    actual_scale = max(flow_scale, minimum_scale)
+    return (max(1, int(round(width * actual_scale))),
+            max(1, int(round(height * actual_scale))))
+
+
+def upsample_optical_flow(flow: np.ndarray, out_height: int, out_width: int) -> np.ndarray:
+    """Resize a flow field onto the full grid, restoring true pixel magnitudes.
+
+    Ratios derive from the array shapes because the inference grid is rounded
+    and floored by :func:`scaled_flow_size`, so it need not match the requested
+    ``flow_scale`` exactly."""
+    in_height, in_width = flow.shape[:2]
+    up = cv2.resize(flow.astype(np.float32), (out_width, out_height),
+                    interpolation=cv2.INTER_LINEAR)
+    up[..., 0] *= np.float32(out_width) / np.float32(in_width)
+    up[..., 1] *= np.float32(out_height) / np.float32(in_height)
+    return up.astype(np.float32)
+
+
 class SeaRaftFlow:
-    def __init__(self, root: str, model_dir: str, device_name: str, bidirectional: bool):
+    def __init__(self, root: str, model_dir: str, device_name: str,
+                 bidirectional: bool, *, flow_scale: float = 1.0):
         try:
             import torch
             from safetensors.torch import load_file
@@ -266,12 +361,17 @@ class SeaRaftFlow:
         self.device = torch.device(device_name)
         if self.device.type == "xpu" and not torch.xpu.is_available():
             fail("PyTorch XPU is unavailable")
+        self.flow_scale = float(flow_scale)
+        if not 0.0 < self.flow_scale <= 1.0:
+            fail("flow_scale must be in (0..1]")
         self.model = RAFT(SimpleNamespace(**config))
         self.model.load_state_dict(load_file(model_path), strict=True)
         self.model.to(self.device).eval()
         self.bidirectional_enabled = bidirectional
         print(f"[motion] PyTorch {torch.__version__}, {self.device}, SEA-RAFT S, "
-              f"{'two-way' if bidirectional else 'one-way'}", file=sys.stderr, flush=True)
+              f"{'two-way' if bidirectional else 'one-way'}"
+              f"{f', flow-scale={self.flow_scale:g}' if self.flow_scale < 1.0 else ''}",
+              file=sys.stderr, flush=True)
 
     def _uncertainty(self, info) -> np.ndarray:
         torch = self.torch
@@ -285,9 +385,18 @@ class SeaRaftFlow:
 
     def infer(self, previous_rgb: np.ndarray, current_rgb: np.ndarray):
         torch = self.torch
+        height, width = previous_rgb.shape[:2]
+        prev, cur = previous_rgb, current_rgb
+        downscaled = False
+        if self.flow_scale < 1.0:
+            small_size = scaled_flow_dimensions(width, height, self.flow_scale)
+            downscaled = small_size != (width, height)
+            if downscaled:
+                prev = cv2.resize(prev, small_size, interpolation=cv2.INTER_AREA)
+                cur = cv2.resize(cur, small_size, interpolation=cv2.INTER_AREA)
         with torch.inference_mode():
-            previous = torch.from_numpy(np.ascontiguousarray(previous_rgb)).permute(2, 0, 1)
-            current = torch.from_numpy(np.ascontiguousarray(current_rgb)).permute(2, 0, 1)
+            previous = torch.from_numpy(np.ascontiguousarray(prev)).permute(2, 0, 1)
+            current = torch.from_numpy(np.ascontiguousarray(cur)).permute(2, 0, 1)
             if self.bidirectional_enabled:
                 image1 = torch.stack((current, previous)).to(self.device, dtype=torch.float32)
                 image2 = torch.stack((previous, current)).to(self.device, dtype=torch.float32)
@@ -297,7 +406,16 @@ class SeaRaftFlow:
             output = self.model(image1, image2, test_mode=True)
             flow = output["final"].float().cpu().numpy().transpose(0, 2, 3, 1)
             uncertainty = self._uncertainty(output["info"][-1])
-        return flow[0], (flow[1] if self.bidirectional_enabled else None), uncertainty[0]
+        backward = flow[0]
+        forward = flow[1] if self.bidirectional_enabled else None
+        uncertainty = uncertainty[0]
+        if downscaled:
+            backward = upsample_optical_flow(backward, height, width)
+            if forward is not None:
+                forward = upsample_optical_flow(forward, height, width)
+            uncertainty = cv2.resize(uncertainty, (width, height),
+                                     interpolation=cv2.INTER_LINEAR)
+        return backward, forward, uncertainty
 
 
 @dataclass

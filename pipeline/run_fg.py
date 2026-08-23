@@ -14,6 +14,7 @@ from pathlib import Path
 
 from chunked_media import concat_command, extract_lossless_command, write_concat_list
 from media_validation import MediaValidationError, validate_output
+from motion_core import automatic_flow_scale, scaled_flow_dimensions
 from shm_ring import RingOwner, packet_slot_size
 from workdir_guard import (WorkdirError, create_workspace, estimate_fg_bytes,
                            finalize_output, partial_output_path)
@@ -40,6 +41,14 @@ SEA_RAFT_MODEL = os.path.join(ROOT, "models", "sea-raft")
 def die(message):
     print(f"[run_fg] error: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def flow_scale_for(args, width, height):
+    override = getattr(args, "flow_scale", None)
+    if override is not None:
+        return float(override)
+    resolution = getattr(args, "flow_resolution", "auto720")
+    return 1.0 if resolution == "native" else automatic_flow_scale(width, height)
 
 
 def command_text(command):
@@ -127,6 +136,13 @@ def prep_command(args, settings, runtime_python, width, height, frames, *, strea
         command.append("--bidirectional")
     if settings["flow"] == "sea-raft":
         command.extend(("--model-dir", SEA_RAFT_MODEL, "--device", "xpu"))
+        flow_scale = flow_scale_for(args, width, height)
+        if getattr(args, "flow_scale", None) is not None:
+            command.extend(("--flow-scale", str(flow_scale)))
+        elif flow_scale != 1.0:
+            command.extend(("--flow-scale", str(flow_scale)))
+        elif getattr(args, "flow_resolution", "auto720") == "native":
+            command.extend(("--flow-resolution", "native"))
     if args.depth == "ai":
         command.extend(("--depth-model", args.depth_model, "--depth-device", args.depth_device))
     if args.overlay_mask:
@@ -368,6 +384,11 @@ def main():
     parser.add_argument("--depth-device", default="GPU")
     parser.add_argument("--depth-temporal", type=float, default=0.25)
     parser.add_argument("--flow-consistency", type=float, default=1.5)
+    parser.add_argument("--flow-resolution", choices=("auto720", "native"),
+                        default="auto720",
+                        help="auto720 is recommended; native is experimental and much slower")
+    parser.add_argument("--flow-scale", type=float, default=None,
+                        help="expert numeric override for SEA-RAFT analysis scale")
     parser.add_argument("--mv-dilate", type=int, default=1)
     parser.add_argument("--depth-edge", type=float, default=0.04)
     parser.add_argument("--motion-window", choices=("auto", "2", "5"), default="auto",
@@ -414,6 +435,8 @@ def main():
         die("--final-sharpen must be in 0..1")
     if not 0 <= args.temporal_motion_strength <= 1:
         die("--temporal-motion-strength must be in 0..1")
+    if args.flow_scale is not None and not 0 < args.flow_scale <= 1:
+        die("--flow-scale must be in (0..1]")
     if not 0 <= args.temporal_depth_strength <= 0.5:
         die("--temporal-depth-strength must be in 0..0.5")
     if not 0 <= args.crf <= 51:
@@ -428,6 +451,14 @@ def main():
     if width <= 0 or height <= 0 or fps <= 0 or frames < 2:
         die(f"invalid media metadata: {width}x{height}, {fps}, {frames}")
     settings = resolve_settings(args)
+    if settings["flow"] == "sea-raft":
+        analysis_scale = flow_scale_for(args, width, height)
+        analysis_w, analysis_h = scaled_flow_dimensions(width, height, analysis_scale)
+        print(f"[run_fg] SEA-RAFT analysis: {analysis_w}x{analysis_h} "
+              f"(scale={analysis_scale:g})")
+        if analysis_scale == 1.0 and automatic_flow_scale(width, height) < 1.0:
+            print("[run_fg] warning: native high-resolution SEA-RAFT is experimental, "
+                  "much slower, and has not improved quality in current tests")
     if settings["io_mode"] == "auto":
         settings["io_mode"] = "shared" if height > 720 else "stream"
     runtime_python = find_xpu_python(args.torch_python) if settings["flow"] == "sea-raft" else PY

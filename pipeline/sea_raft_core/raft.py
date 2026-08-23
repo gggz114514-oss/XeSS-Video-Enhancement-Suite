@@ -5,10 +5,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from update import BasicUpdateBlock
-from corr import CorrBlock
+from corr import CorrBlock, StreamingCorrBlock, resolve_highres_block_cls
 from utils.utils import coords_grid, InputPadder
 from extractor import ResNetFPN
 from layer import conv1x1, conv3x3
+
+# Dense all-pairs correlation stores [batch*h*w, h2*w2] per level and grows
+# quadratically with resolution: one 1440p bidirectional frame pair needs
+# ~25 GiB for the first pyramid level alone.  A 720p bidirectional pair keeps
+# the whole ~2.3 GiB pyramid and is the largest case proven stable on 12 GB
+# Arc hardware, so keep the dense block below a 4 GiB budget and switch to the
+# streaming block above it.
+DENSE_CORR_MAX_BYTES = 4 * 1024 ** 3
 
 class RAFT(nn.Module):
     def __init__(self, args):
@@ -39,6 +47,18 @@ class RAFT(nn.Module):
             self.fnet = ResNetFPN(args, input_dim=3, output_dim=self.output_dim, norm_layer=nn.BatchNorm2d, init_weight=True)
             self.update_block = BasicUpdateBlock(args, hdim=args.dim, cdim=args.dim)
     
+    def _make_corr_block(self, fmap1_8x, fmap2_8x):
+        batch, _, h8, w8 = fmap1_8x.shape
+        # Pyramid levels halve fmap2 only, so total storage is ~4/3 of one level.
+        dense_bytes = batch * h8 * w8 * h8 * w8 * 4 * 4 // 3
+        if dense_bytes <= DENSE_CORR_MAX_BYTES:
+            block = CorrBlock
+        else:
+            # High resolution: the fused SYCL kernel when it is usable
+            # (XESS_XPU_CORR=auto/off/required decides), else streaming.
+            block = resolve_highres_block_cls(fmap1_8x)
+        return block(fmap1_8x, fmap2_8x, self.args)
+
     def initialize_flow(self, img):
         """ Flow is represented as difference between two coordinate grids flow = coords2 - coords1"""
         N, C, H, W = img.shape
@@ -102,7 +122,7 @@ class RAFT(nn.Module):
             # run the feature network
             fmap1_8x = self.fnet(image1)
             fmap2_8x = self.fnet(image2)
-            corr_fn = CorrBlock(fmap1_8x, fmap2_8x, self.args)
+            corr_fn = self._make_corr_block(fmap1_8x, fmap2_8x)
 
         for itr in range(iters):
             N, _, H, W = flow_8x.shape

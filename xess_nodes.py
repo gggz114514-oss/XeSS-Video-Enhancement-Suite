@@ -77,6 +77,12 @@ FLOW_VALUES = {
     "跟随处理档位": "preset", "DIS 极速": "dis-fast", "DIS 遮挡增强": "dis-occlusion",
     "SEA-RAFT 单向": "sea-raft-single", "SEA-RAFT 双向": "sea-raft",
 }
+FLOW_RESOLUTION_CHOICES = ("自动 720p（推荐）", "原生分辨率（实验 / 极慢）")
+FLOW_RESOLUTION_VALUES = {
+    "自动 720p（推荐）": "auto720",
+    "原生分辨率（实验 / 极慢）": "native",
+    "auto720": "auto720", "native": "native",
+}
 MV_CHOICES = ("跟随处理档位", "高分辨率运动矢量", "低分辨率运动矢量+深度")
 MV_VALUES = {
     "跟随处理档位": "preset", "高分辨率运动矢量": "highres",
@@ -98,7 +104,8 @@ WINDOW_VALUES = {"跟随处理档位": "preset", "2 帧（更快）": "2", "5 �
 INPUT_LABELS = {
     "images": "图像批次", "video": "视频", "source_fps": "源视频帧率",
     "preset": "处理档位", "scale": "放大倍率", "quality": "XeSS 画质档位",
-    "flow_mode": "光流算法", "mv_path": "运动矢量模式",
+    "flow_mode": "光流算法", "flow_resolution": "SEA-RAFT 分析分辨率",
+    "mv_path": "运动矢量模式",
     "responsive_mask": "启用响应遮罩", "responsive_strength": "响应遮罩强度",
     "depth_temporal": "深度时序平滑", "flow_consistency": "光流一致性阈值",
     "mv_dilate": "运动边缘扩张", "depth_edge": "深度边缘阈值",
@@ -122,6 +129,7 @@ INPUT_TOOLTIPS = {
     "scale": "输出宽高倍率。例如 480p 到 720p 通常填 1.5。",
     "quality": "自动会根据倍率选择 XeSS 档位。倍率 1.0 时可选 6 做原尺寸抗锯齿。",
     "flow_mode": "一般保持“跟随处理档位”。SEA-RAFT 遮挡边缘更稳，但明显更慢。",
+    "flow_resolution": "自动 720p 实测速度更快且画质相同或更好；原生高分辨率仅供对照，速度会大幅降低。",
     "mv_path": "一般保持“跟随处理档位”。高质量预设会自动使用深度辅助路径。",
     "responsive_mask": "减少细线、字幕和快速变化区域的时序拖影。",
     "temporal_fusion": "0 为关闭；建议从 0.20～0.35 开始。会增加少量耗时。",
@@ -140,7 +148,7 @@ INPUT_TOOLTIPS = {
 }
 
 ADVANCED_INPUTS = {
-    "flow_mode", "mv_path", "responsive_strength", "depth_temporal", "flow_consistency",
+    "flow_mode", "flow_resolution", "mv_path", "responsive_strength", "depth_temporal", "flow_consistency",
     "mv_dilate", "depth_edge", "mfsr_strength", "mfsr_detail_boost", "mfsr_max_injection",
     "sharpen_static", "sharpen_motion", "motion_window", "temporal_motion_strength",
     "temporal_depth_strength", "allow_overlay", "transport", "device", "free_vram",
@@ -725,7 +733,11 @@ class XeSSSuperResolution:
             **_common_inputs(),
             "artifact_guard_strength": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
         }
-        return _localized_schema({"required": required})
+        optional = {
+            "flow_resolution": (FLOW_RESOLUTION_CHOICES,
+                                {"default": "自动 720p（推荐）"}),
+        }
+        return _localized_schema({"required": required, "optional": optional})
 
     @classmethod
     def VALIDATE_INPUTS(cls, preset=None, quality=None, flow_mode=None, mv_path=None,
@@ -739,10 +751,12 @@ class XeSSSuperResolution:
                 mfsr_enabled, mfsr_strength, mfsr_detail_boost,
                 mfsr_max_injection, sharpen_mode, sharpen_static,
                 sharpen_motion, transport, device, free_vram, max_output_gb,
-                engine_path, work_dir, verbose, artifact_guard_strength=0.0):
+                engine_path, work_dir, verbose, artifact_guard_strength=0.0,
+                flow_resolution="auto720"):
         preset = _canonical(preset, PRESET_VALUES)
         quality = _canonical(quality, QUALITY_VALUES)
         flow_mode = _canonical(flow_mode, FLOW_VALUES)
+        flow_resolution = _canonical(flow_resolution, FLOW_RESOLUTION_VALUES)
         mv_path = _canonical(mv_path, MV_VALUES)
         sharpen_mode = _canonical(sharpen_mode, SHARPEN_VALUES)
         transport = _canonical(transport, TRANSPORT_VALUES)
@@ -778,7 +792,10 @@ class XeSSSuperResolution:
             prepare.append("--bidirectional")
         if flow == "sea-raft":
             prepare.extend(("--model-dir", os.fspath(engine / "models" / "sea-raft"),
-                            "--device", "xpu"))
+                            "--device", "xpu", "--flow-resolution", flow_resolution))
+            if flow_resolution == "native" and min(width, height) > 720:
+                print("[ComfyUI-XeSS] warning: 原生高分辨率 SEA-RAFT 为实验模式，"
+                      "速度会大幅降低，当前实测没有画质优势", flush=True)
         if depth_needed:
             prepare.extend(("--depth-model", os.fspath(engine / "models" / "depth-anything-v2-small" /
                                                        "depth_anything_v2_small.xml"),
@@ -840,7 +857,8 @@ class XeSSSuperResolution:
         _suppress_vertical_ringing(source, output, float(artifact_guard_strength))
         if original_frames == 1:
             output = output[:1]
-        info = (f"SR1.2 {preset}/{flow} Q{resolved_quality} | {width}x{height} -> "
+        flow_info = flow_resolution if flow == "sea-raft" else "n/a"
+        info = (f"SR1.2 {preset}/{flow} flow-res={flow_info} Q{resolved_quality} | {width}x{height} -> "
                 f"{out_width}x{out_height} | {original_frames} frames | {resolved_transport}"
                 f" | fusion={temporal_fusion:g} mfsr={bool(mfsr_enabled)}")
         return (_to_tensor(output), out_width, out_height, info)
@@ -874,7 +892,12 @@ class XeSSFrameGeneration:
             "allow_overlay": ("BOOLEAN", {"default": False}),
             **_common_inputs(),
         }
-        return _localized_schema({"required": required, "optional": {"ui_mask": ("MASK",)}})
+        optional = {
+            "ui_mask": ("MASK",),
+            "flow_resolution": (FLOW_RESOLUTION_CHOICES,
+                                {"default": "自动 720p（推荐）"}),
+        }
+        return _localized_schema({"required": required, "optional": optional})
 
     @classmethod
     def VALIDATE_INPUTS(cls, preset=None, flow_mode=None, depth_mode=None,
@@ -887,9 +910,10 @@ class XeSSFrameGeneration:
                     depth_edge, temporal_motion_strength, temporal_depth_strength,
                     sharpen_mode, sharpen_static, sharpen_motion, allow_overlay,
                     transport, device, free_vram, max_output_gb, engine_path,
-                    work_dir, verbose, ui_mask=None):
+                    work_dir, verbose, ui_mask=None, flow_resolution="auto720"):
         preset = _canonical(preset, PRESET_VALUES)
         flow_mode = _canonical(flow_mode, FLOW_VALUES)
+        flow_resolution = _canonical(flow_resolution, FLOW_RESOLUTION_VALUES)
         depth_mode = _canonical(depth_mode, DEPTH_VALUES)
         motion_window = _canonical(motion_window, WINDOW_VALUES)
         sharpen_mode = _canonical(sharpen_mode, SHARPEN_VALUES)
@@ -932,7 +956,10 @@ class XeSSFrameGeneration:
                 prepare.append("--bidirectional")
             if flow == "sea-raft":
                 prepare.extend(("--model-dir", os.fspath(engine / "models" / "sea-raft"),
-                                "--device", "xpu"))
+                                "--device", "xpu", "--flow-resolution", flow_resolution))
+                if flow_resolution == "native" and min(width, height) > 720:
+                    print("[ComfyUI-XeSS] warning: 原生高分辨率 SEA-RAFT 为实验模式，"
+                          "速度会大幅降低，当前实测没有画质优势", flush=True)
             if depth_mode == "ai":
                 prepare.extend(("--depth-model", os.fspath(engine / "models" / "depth-anything-v2-small" /
                                                            "depth_anything_v2_small.xml"),
@@ -968,7 +995,8 @@ class XeSSFrameGeneration:
                 )
             _sharpen(output, mode, static, motion)
             output_fps = float(source_fps) * 2.0
-            info = (f"FG1.2 {preset}/{flow} depth={depth_mode} window={window} | "
+            flow_info = flow_resolution if flow == "sea-raft" else "n/a"
+            info = (f"FG1.2 {preset}/{flow} flow-res={flow_info} depth={depth_mode} window={window} | "
                     f"{width}x{height} | {frame_count}->{output_count} frames | "
                     f"{source_fps:g}->{output_fps:g} fps | {resolved_transport}")
             return (_to_tensor(output), output_fps, output_count, info)
@@ -1008,7 +1036,10 @@ class XeSSVideoSuperResolutionExpert(XeSSSuperResolution):
         required = {"video": ("VIDEO", {"display_name": "输入视频", "tooltip": "连接 ComfyUI 原生 Load Video。"})}
         required.update((name, spec) for name, spec in parent["required"].items()
                         if name != "images")
-        return {"required": required}
+        result = {"required": required}
+        if "optional" in parent:
+            result["optional"] = dict(parent["optional"])
+        return result
 
     def upscale_video(self, video, **kwargs):
         components = video.get_components()
@@ -1070,7 +1101,7 @@ class XeSSVideoSuperResolution:
             "video": ("VIDEO", {"display_name": "输入视频", "tooltip": "连接 ComfyUI 原生 Load Video。"}),
             "mode": (SIMPLE_MODE_CHOICES, {
                 "default": "极速模式（最低挡）", "display_name": "质量挡位",
-                "tooltip": "极速：DIS+边缘振铃保护；极致：双向 SEA-RAFT+AI 深度+五帧融合+边缘振铃保护。",
+                "tooltip": "极速：DIS；极致：双向 SEA-RAFT 自动限制到 720p 分析，再恢复到原尺寸。",
             }),
             "scale": ("FLOAT", {
                 "default": 1.5, "min": 1.0, "max": 4.0, "step": 0.05,
@@ -1116,9 +1147,10 @@ class XeSSVideoSuperResolution:
             work_dir="auto",
             verbose=False,
             artifact_guard_strength=0.75,
+            flow_resolution="auto720",
         )
         video_out, width, height, info = output
-        label = "极致画质：双向 SEA-RAFT + AI 深度 + 五帧融合 + 自适应锐化 + 边缘振铃保护" if high else (
+        label = "极致画质：双向 SEA-RAFT（自动 720p）+ AI 深度 + 五帧融合 + 自适应锐化 + 边缘振铃保护" if high else (
             "极速模式：DIS 光流 + 响应遮罩 + 固定锐化 + 边缘振铃保护"
         )
         return video_out, width, height, f"{label} | {info}"
@@ -1138,7 +1170,7 @@ class XeSSVideoFrameGeneration:
                 "video": ("VIDEO", {"display_name": "输入视频", "tooltip": "自动读取帧率并保留音频。"}),
                 "mode": (SIMPLE_MODE_CHOICES, {
                     "default": "极速模式（最低挡）", "display_name": "质量挡位",
-                    "tooltip": "极速：DIS+2帧窗口；极致：双向 SEA-RAFT+AI 深度+5帧窗口。",
+                    "tooltip": "极速：DIS；极致：双向 SEA-RAFT 自动限制到 720p 分析，再恢复到原尺寸。",
                 }),
             },
             "optional": {
@@ -1178,10 +1210,11 @@ class XeSSVideoFrameGeneration:
             engine_path="auto",
             work_dir="auto",
             verbose=False,
+            flow_resolution="auto720",
             ui_mask=ui_mask,
         )
         video_out, output_fps, output_count, info = output
-        label = "极致画质：双向 SEA-RAFT + AI 深度 + 5帧窗口 + 自适应锐化" if high else (
+        label = "极致画质：双向 SEA-RAFT（自动 720p）+ AI 深度 + 5帧窗口 + 自适应锐化" if high else (
             "极速模式：DIS 光流 + AI 深度 + 2帧窗口 + 固定锐化"
         )
         return video_out, output_fps, output_count, f"{label} | {info}"

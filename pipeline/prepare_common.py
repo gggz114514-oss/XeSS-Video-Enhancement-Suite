@@ -15,7 +15,8 @@ from pathlib import Path
 import numpy as np
 import cv2
 
-from motion_core import DepthEstimator, DisFlow, FrameAnalyzer, SeaRaftFlow, write_debug
+from motion_core import (DepthEstimator, DisFlow, FrameAnalyzer, SeaRaftFlow,
+                         automatic_flow_scale, write_debug)
 from shm_ring import RingWriter
 from stream_protocol import Flags, FramePacket, eos, write_packet
 
@@ -40,6 +41,11 @@ def add_common_arguments(parser: argparse.ArgumentParser, *, kind: str) -> None:
     parser.add_argument("--depth-device", default="GPU")
     parser.add_argument("--temporal", type=float, default=0.25)
     parser.add_argument("--consistency", type=float, default=1.5)
+    parser.add_argument("--flow-resolution", choices=("auto720", "native"),
+                        default="auto720",
+                        help="cap SEA-RAFT analysis at 720p or use native resolution")
+    parser.add_argument("--flow-scale", type=float, default=None,
+                        help="expert numeric override for SEA-RAFT analysis scale")
     parser.add_argument("--dilate", type=int, default=1)
     parser.add_argument("--depth-edge", type=float, default=0.04)
     parser.add_argument("--motion-window", type=int, choices=(2, 5), default=2)
@@ -67,6 +73,8 @@ def validate(args: argparse.Namespace) -> None:
         raise SystemExit("[prepare] --temporal must be in 0..0.8")
     if args.consistency <= 0 or not 0 <= args.dilate <= 4:
         raise SystemExit("[prepare] invalid consistency/dilation settings")
+    if args.flow_scale is not None and not 0.0 < args.flow_scale <= 1.0:
+        raise SystemExit("[prepare] --flow-scale must be in (0..1]")
     if not 0.0 <= args.responsive_max <= 1.0:
         raise SystemExit("[prepare] --responsive-max must be in 0..1")
     if not 0.0 <= args.temporal_motion_strength <= 1.0:
@@ -117,7 +125,14 @@ def create_analyzer(args: argparse.Namespace) -> FrameAnalyzer:
     if args.engine == "dis":
         engine = DisFlow(args.bidirectional)
     else:
-        engine = SeaRaftFlow(ROOT, args.model_dir, args.device, args.bidirectional)
+        if args.flow_scale is not None:
+            flow_scale = args.flow_scale
+        elif args.flow_resolution == "native":
+            flow_scale = 1.0
+        else:
+            flow_scale = automatic_flow_scale(args.in_w, args.in_h)
+        engine = SeaRaftFlow(ROOT, args.model_dir, args.device, args.bidirectional,
+                             flow_scale=flow_scale)
     depth = DepthEstimator(args.depth_model, args.depth_device) if args.depth_model else None
     return FrameAnalyzer(engine, depth, temporal=args.temporal,
                          consistency=args.consistency, dilation=args.dilate,
