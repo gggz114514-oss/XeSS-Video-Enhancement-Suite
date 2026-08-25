@@ -11,7 +11,6 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -73,8 +72,8 @@ def single_direction_confidence(backward: np.ndarray, uncertainty: np.ndarray | 
         residual = np.abs(current_smooth.astype(np.float32) - warped.astype(np.float32))
         brightness = np.maximum(current_smooth.astype(np.float32), warped.astype(np.float32))
         photometric = np.exp(-residual / (12.0 + 0.12 * brightness))
-        # SEA-RAFT uncertainty remains the primary signal when present; the
-        # photometric term catches disocclusions that one-way flow cannot see.
+        # The photometric term catches disocclusions that one-way flow cannot see;
+        # an explicit uncertainty map (when a flow engine provides one) stays primary.
         exponent = 0.45 if uncertainty is not None else 0.75
         confidence *= np.power(np.clip(photometric, 0.0, 1.0), exponent)
     reliable = confidence >= 0.42
@@ -242,62 +241,6 @@ class DisFlow:
         if self.forward is not None:
             forward = self.forward.calc(previous_gray, current_gray, None).astype(np.float32)
         return backward, forward, None
-
-
-class SeaRaftFlow:
-    def __init__(self, root: str, model_dir: str, device_name: str, bidirectional: bool):
-        try:
-            import torch
-            from safetensors.torch import load_file
-        except ImportError as exc:
-            raise RuntimeError("PyTorch and safetensors are required for SEA-RAFT") from exc
-        core_dir = os.path.join(root, "sea_raft_core")
-        config_path = os.path.join(model_dir, "config.json")
-        model_path = os.path.join(model_dir, "sea_raft_s_full.safetensors")
-        for path in (core_dir, config_path, model_path):
-            if not os.path.exists(path):
-                fail(f"missing SEA-RAFT component: {path}")
-        if core_dir not in sys.path:
-            sys.path.insert(0, core_dir)
-        from raft import RAFT
-        with open(config_path, "r", encoding="utf-8") as file:
-            config = json.load(file)
-        self.torch = torch
-        self.device = torch.device(device_name)
-        if self.device.type == "xpu" and not torch.xpu.is_available():
-            fail("PyTorch XPU is unavailable")
-        self.model = RAFT(SimpleNamespace(**config))
-        self.model.load_state_dict(load_file(model_path), strict=True)
-        self.model.to(self.device).eval()
-        self.bidirectional_enabled = bidirectional
-        print(f"[motion] PyTorch {torch.__version__}, {self.device}, SEA-RAFT S, "
-              f"{'two-way' if bidirectional else 'one-way'}", file=sys.stderr, flush=True)
-
-    def _uncertainty(self, info) -> np.ndarray:
-        torch = self.torch
-        weight = torch.softmax(info[:, :2], dim=1)
-        raw_b = info[:, 2:]
-        large = torch.exp(torch.clamp(raw_b[:, 0], min=0.0, max=6.0))
-        small = torch.exp(torch.clamp(raw_b[:, 1], min=-6.0, max=0.0))
-        expected = weight[:, 0] * large + weight[:, 1] * small
-        normalized = torch.clamp((expected - 0.15) / 3.0, 0.0, 1.0)
-        return normalized.float().cpu().numpy()
-
-    def infer(self, previous_rgb: np.ndarray, current_rgb: np.ndarray):
-        torch = self.torch
-        with torch.inference_mode():
-            previous = torch.from_numpy(np.ascontiguousarray(previous_rgb)).permute(2, 0, 1)
-            current = torch.from_numpy(np.ascontiguousarray(current_rgb)).permute(2, 0, 1)
-            if self.bidirectional_enabled:
-                image1 = torch.stack((current, previous)).to(self.device, dtype=torch.float32)
-                image2 = torch.stack((previous, current)).to(self.device, dtype=torch.float32)
-            else:
-                image1 = current.unsqueeze(0).to(self.device, dtype=torch.float32)
-                image2 = previous.unsqueeze(0).to(self.device, dtype=torch.float32)
-            output = self.model(image1, image2, test_mode=True)
-            flow = output["final"].float().cpu().numpy().transpose(0, 2, 3, 1)
-            uncertainty = self._uncertainty(output["info"][-1])
-        return flow[0], (flow[1] if self.bidirectional_enabled else None), uncertainty[0]
 
 
 @dataclass

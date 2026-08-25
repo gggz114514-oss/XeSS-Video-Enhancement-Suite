@@ -17,8 +17,7 @@
     "libxell.dll",
     "python/python.exe",
     "models/depth-anything-v2-small/depth_anything_v2_small.xml",
-    "models/depth-anything-v2-small/depth_anything_v2_small.bin",
-    "models/sea-raft/sea_raft_s_full.safetensors"
+    "models/depth-anything-v2-small/depth_anything_v2_small.bin"
   ],
   "file_hashes": {
     "ffmpeg.exe": "2ce797a0f88d7f067180338fb227f7b1928ea727bd9a4d7a1d022f7c52af71a3",
@@ -29,7 +28,6 @@
     "libxell.dll": "5ce63652eee5720203e0e41cc97eb45ee541c499c8a51d4bdb1e8fe4eaef4890",
     "python/python.exe": "29d6486dc5fa86c9d19db9d390fdbb62c4830e2b305761723c0b42e6f3596954",
     "models/depth-anything-v2-small/depth_anything_v2_small.xml": "b1ebff2fd0a01fb5a39ac6e37d82eb0628d71c7b9832fc9660dafcd736849614",
-    "models/depth-anything-v2-small/depth_anything_v2_small.bin": "ea1be49df1be51ddfb1ee65e40a51f634673e960001ec602cd3d9a21eb2ef0dc",
-    "models/sea-raft/sea_raft_s_full.safetensors": "3f243d4c56b7b369b620d8dbf204d8d76c05ee1fab2e9ecb1b92a1107b88053a"
+    "models/depth-anything-v2-small/depth_anything_v2_small.bin": "ea1be49df1be51ddfb1ee65e40a51f634673e960001ec602cd3d9a21eb2ef0dc"
   }
 }

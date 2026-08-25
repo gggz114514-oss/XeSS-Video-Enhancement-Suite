@@ -34,7 +34,27 @@ PREPARE = os.path.join(ROOT, "prepare_fg.py")
 SHARPEN = os.path.join(ROOT, "adaptive_sharpen.py")
 RAW_SLICE = os.path.join(ROOT, "raw_frame_slice.py")
 DEPTH_MODEL = os.path.join(ROOT, "models", "depth-anything-v2-small", "depth_anything_v2_small.xml")
-SEA_RAFT_MODEL = os.path.join(ROOT, "models", "sea-raft")
+
+# Mainline motion estimation is native Fast DIS only.  The retired SEA-RAFT
+# choices stay accepted so old workflows and scripts keep running on DIS.
+FLOW_MODES = {
+    "dis-fast": ("dis", False),
+    "dis-occlusion": ("dis", True),
+    "sea-raft-single": ("dis", False),
+    "sea-raft": ("dis", False),
+}
+LEGACY_FLOW_MODES = ("sea-raft-single", "sea-raft")
+_MIGRATION_PRINTED = False
+
+
+def resolve_flow_mode(flow_mode):
+    """Map a retired SEA-RAFT flow mode onto native Fast DIS once per process."""
+    global _MIGRATION_PRINTED
+    if flow_mode in LEGACY_FLOW_MODES and not _MIGRATION_PRINTED:
+        print(f"[run_fg] SEA-RAFT has been retired from the mainline; "
+              f"flow mode '{flow_mode}' now runs native Fast DIS", flush=True)
+        _MIGRATION_PRINTED = True
+    return "dis-fast" if flow_mode in LEGACY_FLOW_MODES else flow_mode
 
 
 def die(message):
@@ -55,47 +75,19 @@ def run(command, *, environment=None, **kwargs):
     return result
 
 
-def is_xpu_python(path):
-    if not path or not os.path.isfile(path):
-        return False
-    probe = subprocess.run([path, "-c", "import torch; assert torch.xpu.is_available(); print(torch.__version__)"],
-                           capture_output=True, text=True)
-    if probe.returncode == 0:
-        print(f"[run_fg] SEA-RAFT runtime: {path} (PyTorch {probe.stdout.strip()})")
-        return True
-    return False
-
-
-def find_xpu_python(explicit):
-    candidates = [explicit, os.environ.get("XESS_TORCH_PYTHON"), sys.executable]
-    current = ROOT
-    for _ in range(6):
-        candidates.append(os.path.join(current, "ComfyUI-aki-v3-IntelArc", "python", "python.exe"))
-        current = os.path.dirname(current)
-    seen = set()
-    for candidate in candidates:
-        if candidate:
-            candidate = os.path.abspath(candidate)
-            if candidate not in seen and is_xpu_python(candidate):
-                return candidate
-            seen.add(candidate)
-    die("SEA-RAFT needs Intel PyTorch XPU; pass --torch-python PATH")
-
-
 def resolve_settings(args):
     defaults = {
-        "fast": {"flow": "dis", "bidirectional": False, "mode": "fixed",
+        "fast": {"bidirectional": False, "mode": "fixed",
                  "sharpen": 0.12, "static": 0.18, "motion": 0.08, "window": 2},
-        "balanced": {"flow": "sea-raft", "bidirectional": False, "mode": "adaptive",
+        "balanced": {"bidirectional": False, "mode": "adaptive",
                      "sharpen": 0.16, "static": 0.22, "motion": 0.10, "window": 5},
-        "quality": {"flow": "sea-raft", "bidirectional": True, "mode": "adaptive",
+        "quality": {"bidirectional": False, "mode": "adaptive",
                     "sharpen": 0.18, "static": 0.25, "motion": 0.10, "window": 5},
     }[args.preset]
-    flow, bidirectional = defaults["flow"], defaults["bidirectional"]
+    flow = "dis"
+    bidirectional = defaults["bidirectional"]
     if args.flow_mode != "auto":
-        mapping = {"dis-fast": ("dis", False), "dis-occlusion": ("dis", True),
-                   "sea-raft-single": ("sea-raft", False), "sea-raft": ("sea-raft", True)}
-        flow, bidirectional = mapping[args.flow_mode]
+        flow, bidirectional = FLOW_MODES[resolve_flow_mode(args.flow_mode)]
     sharpen = defaults["sharpen"] if args.final_sharpen is None else args.final_sharpen
     mode = defaults["mode"] if args.sharpen_mode == "auto" else args.sharpen_mode
     io_mode = args.io_mode
@@ -107,9 +99,9 @@ def resolve_settings(args):
             "io_mode": io_mode, "motion_window": motion_window}
 
 
-def prep_command(args, settings, runtime_python, width, height, frames, *, stream,
+def prep_command(args, settings, width, height, frames, *, stream,
                  raw="", mv_dir="", depth_dir="", mask_dir="", debug_dir="", ring=None):
-    command = [runtime_python, PREPARE, "--in-w", str(width), "--in-h", str(height),
+    command = [PY, PREPARE, "--in-w", str(width), "--in-h", str(height),
                "--frames", str(frames), "--engine", settings["flow"],
                "--temporal", str(args.depth_temporal), "--consistency", str(args.flow_consistency),
                "--dilate", str(args.mv_dilate), "--depth-edge", str(args.depth_edge),
@@ -125,8 +117,6 @@ def prep_command(args, settings, runtime_python, width, height, frames, *, strea
         command.extend(("--raw", raw, "--mv-out", mv_dir, "--depth-out", depth_dir))
     if settings["bidirectional"]:
         command.append("--bidirectional")
-    if settings["flow"] == "sea-raft":
-        command.extend(("--model-dir", SEA_RAFT_MODEL, "--device", "xpu"))
     if args.depth == "ai":
         command.extend(("--depth-model", args.depth_model, "--depth-device", args.depth_device))
     if args.overlay_mask:
@@ -213,7 +203,7 @@ def chunk_layout(start, count, total_frames, motion_window):
     return actual_start, actual_count, slice_start, slice_count, left, right
 
 
-def run_stream(args, settings, runtime_python, environment, driver_environment,
+def run_stream(args, settings, environment, driver_environment,
                width, height, fps, frames, partial, trim_start=0,
                output_limit=None):
     raw_output_frames = frames * 2 - 1
@@ -228,7 +218,7 @@ def run_stream(args, settings, runtime_python, environment, driver_environment,
     if settings["io_mode"] == "shared":
         ring = RingOwner(slots=4, slot_size=packet_slot_size(
             width, height, depth=True, mask=bool(args.overlay_mask)), prefix="xess-fg")
-    prepare_command = prep_command(args, settings, runtime_python, width, height, frames,
+    prepare_command = prep_command(args, settings, width, height, frames,
                                    stream=True, ring=ring)
     fg_command = worker_command(args, width, height, fps, frames, stream=True, ring=ring)
     for command in (decoder_command, prepare_command, fg_command):
@@ -287,7 +277,7 @@ def run_stream(args, settings, runtime_python, environment, driver_environment,
             ring.close()
 
 
-def run_chunked(args, settings, runtime_python, environment, driver_environment, workspace,
+def run_chunked(args, settings, environment, driver_environment, workspace,
                 width, height, fps, frames, partial):
     workspace.mkdir("segments")
     chunk_source = workspace.path("chunk_source.avi")
@@ -307,7 +297,7 @@ def run_chunked(args, settings, runtime_python, environment, driver_environment,
                                      actual_start, actual_count, fps), environment=environment)
         segment_args = copy.copy(args)
         segment_args.video = os.fspath(chunk_source)
-        run_stream(segment_args, segment_settings, runtime_python, environment,
+        run_stream(segment_args, segment_settings, environment,
                    driver_environment, width, height, fps, actual_count, segment,
                    trim_start=slice_start, output_limit=slice_count)
         segments.append(segment)
@@ -329,7 +319,7 @@ def interleave(source_path, generated_path, output_path, frame_bytes, frame_coun
             output.write(source.read(frame_bytes))
 
 
-def run_file(args, settings, runtime_python, environment, driver_environment,
+def run_file(args, settings, environment, driver_environment,
              workspace, width, height, fps, frames, partial):
     raw = workspace.path("source.rgb")
     mv_dir = workspace.mkdir("mvs")
@@ -341,7 +331,7 @@ def run_file(args, settings, runtime_python, environment, driver_environment,
     run([FFMPEG, "-hide_banner", "-loglevel", "warning", "-y", "-i", args.video,
          "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
          "-vframes", str(frames), raw], environment=environment)
-    run(prep_command(args, settings, runtime_python, width, height, frames, stream=False,
+    run(prep_command(args, settings, width, height, frames, stream=False,
                      raw=os.fspath(raw), mv_dir=os.fspath(mv_dir), depth_dir=os.fspath(depth_dir),
                      mask_dir=os.fspath(mask_dir) if mask_dir else "",
                      debug_dir=os.fspath(debug_dir) if debug_dir else ""),
@@ -374,7 +364,6 @@ def main():
                         help="motion/depth observation window; auto=2 for Fast, 5 otherwise")
     parser.add_argument("--temporal-motion-strength", type=float, default=0.65)
     parser.add_argument("--temporal-depth-strength", type=float, default=0.18)
-    parser.add_argument("--torch-python", default="")
     parser.add_argument("--frames", type=int, default=0)
     parser.add_argument("--out-dir", default="")
     parser.add_argument("--device", type=int, default=-1)
@@ -430,7 +419,6 @@ def main():
     settings = resolve_settings(args)
     if settings["io_mode"] == "auto":
         settings["io_mode"] = "shared" if height > 720 else "stream"
-    runtime_python = find_xpu_python(args.torch_python) if settings["flow"] == "sea-raft" else PY
     output_dir = os.path.abspath(args.out_dir or os.path.dirname(os.path.abspath(args.video)))
     os.makedirs(output_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(args.video))[0]
@@ -459,13 +447,13 @@ def main():
             succeeded = True
             return
         if settings["io_mode"] in ("stream", "shared"):
-            run_stream(args, settings, runtime_python, environment, driver_environment,
+            run_stream(args, settings, environment, driver_environment,
                        width, height, fps, frames, partial)
         elif settings["io_mode"] == "chunked":
-            run_chunked(args, settings, runtime_python, environment, driver_environment,
+            run_chunked(args, settings, environment, driver_environment,
                         workspace, width, height, fps, frames, partial)
         else:
-            run_file(args, settings, runtime_python, environment, driver_environment,
+            run_file(args, settings, environment, driver_environment,
                      workspace, width, height, fps, frames, partial)
         try:
             report = validate_output(

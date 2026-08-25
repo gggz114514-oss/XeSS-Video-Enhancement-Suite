@@ -34,7 +34,6 @@ REQUIRED_FILES = (
     "python/python.exe",
     "models/depth-anything-v2-small/depth_anything_v2_small.xml",
     "models/depth-anything-v2-small/depth_anything_v2_small.bin",
-    "models/sea-raft/sea_raft_s_full.safetensors",
 )
 HASHED_FILES = REQUIRED_FILES
 

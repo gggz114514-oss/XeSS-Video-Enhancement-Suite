@@ -15,12 +15,23 @@ from pathlib import Path
 import numpy as np
 import cv2
 
-from motion_core import DepthEstimator, DisFlow, FrameAnalyzer, SeaRaftFlow, write_debug
+from motion_core import DepthEstimator, DisFlow, FrameAnalyzer, write_debug
 from shm_ring import RingWriter
 from stream_protocol import Flags, FramePacket, eos, write_packet
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+
+_MIGRATION_NOTICE = ("[prepare] SEA-RAFT has been retired from the mainline; "
+                     "this job runs on native Fast DIS instead")
+
+
+def resolve_engine(name: str) -> str:
+    """Map the retired ``sea-raft`` engine choice onto native Fast DIS."""
+    if name == "sea-raft":
+        print(_MIGRATION_NOTICE, file=sys.stderr, flush=True)
+        return "dis"
+    return name
 
 
 def add_common_arguments(parser: argparse.ArgumentParser, *, kind: str) -> None:
@@ -32,10 +43,9 @@ def add_common_arguments(parser: argparse.ArgumentParser, *, kind: str) -> None:
     parser.add_argument("--in-w", type=int, required=True)
     parser.add_argument("--in-h", type=int, required=True)
     parser.add_argument("--frames", type=int, required=True)
-    parser.add_argument("--engine", choices=("dis", "sea-raft"), default="dis")
+    parser.add_argument("--engine", choices=("dis", "sea-raft"), default="dis",
+                        help="'sea-raft' is accepted for old callers and runs DIS")
     parser.add_argument("--bidirectional", action="store_true")
-    parser.add_argument("--model-dir", default=os.path.join(ROOT, "models", "sea-raft"))
-    parser.add_argument("--device", default="xpu")
     parser.add_argument("--depth-model", default="")
     parser.add_argument("--depth-device", default="GPU")
     parser.add_argument("--temporal", type=float, default=0.25)
@@ -114,10 +124,7 @@ def frame_iterator(args: argparse.Namespace):
 
 
 def create_analyzer(args: argparse.Namespace) -> FrameAnalyzer:
-    if args.engine == "dis":
-        engine = DisFlow(args.bidirectional)
-    else:
-        engine = SeaRaftFlow(ROOT, args.model_dir, args.device, args.bidirectional)
+    engine = DisFlow(args.bidirectional)
     depth = DepthEstimator(args.depth_model, args.depth_device) if args.depth_model else None
     return FrameAnalyzer(engine, depth, temporal=args.temporal,
                          consistency=args.consistency, dilation=args.dilate,
@@ -152,6 +159,7 @@ class PendingFrame:
 
 def run_preparer(args: argparse.Namespace) -> None:
     validate(args)
+    args.engine = resolve_engine(args.engine)
     ensure_outputs(args)
     analyzer = create_analyzer(args)
     overlay_mask = None

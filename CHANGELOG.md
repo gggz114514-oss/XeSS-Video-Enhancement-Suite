@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Retired SEA-RAFT from the mainline after B580 benchmarks showed DIS is both
+  faster and at least as stable.  All presets and nodes now run native OpenCV
+  DIS; old workflows that still select `sea-raft`/`sea-raft-single`
+  automatically migrate to native Fast DIS with a one-time log notice.  The
+  PyTorch-XPU subprocess probing, `safetensors` loading, sea-raft model
+  discovery, and the archived experiment core are gone from the source tree
+  (research code stays on the `experiment/sea-raft-xpu` branch).  The runtime
+  manifest no longer requires the bundled SEA-RAFT checkpoint.
 - Fixed Balanced/Quality mode reporting zero XPU devices in child processes on
   some Arc A-series installations.  The node now probes in the same import
   order as SEA-RAFT, performs a real XPU allocation, preserves the launcher's

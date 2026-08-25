@@ -25,13 +25,10 @@
 
 ### 依赖说明
 
-- 极速模式使用 DIS 光流，不需要 SEA-RAFT。
-- 均衡和极致画质模式使用 SEA-RAFT，需要在 ComfyUI 实际使用的 Python 环境中提供：
-  - Intel XPU 版 PyTorch；
-  - `safetensors`；
-  - OpenVINO。
+- 所有模式统一使用 OpenCV DIS 光流，不再依赖 PyTorch XPU 或 `safetensors`；
+  SEA-RAFT 已从主线退役（实验代码归档于 `experiment/sea-raft-xpu` 分支）。
+- 旧工作流中的 SEA-RAFT 选项会自动迁移到原生 Fast DIS，并在日志提示一次。
 - `.runtime/engine` 是 XeSS 固定运行时，不是 ComfyUI 的 Python 依赖环境。
-- 不要把普通 CPU/CUDA 版 PyTorch 当作 Intel XPU 版使用。
 
 ### 反馈问题时请提供
 
@@ -143,8 +140,8 @@ Load Video → XeSS 视频超分（两挡自动） → XeSS 视频插帧（两�
 
 主档位只有两套：
 
-- `极速模式（最低挡）`：DIS 光流，速度优先；
-- `极致画质（最高挡）`：双向 SEA-RAFT、AI 深度与五帧信息，适合复杂运动。
+- `极速模式（最低挡）`：DIS 光流 + 固定锐化，速度优先；
+- `极致画质（最高挡）`：DIS 光流 + 五帧融合与自适应锐化，适合复杂运动。
 
 需要逐项调节时使用 `XeSS 视频处理/专家` 分类。完整参数方案见 [EXPERT_GUIDE.md](EXPERT_GUIDE.md)，示例工作流位于 [workflows/xess超分帧生成.json](workflows/xess超分帧生成.json)。
 
