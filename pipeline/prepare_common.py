@@ -26,14 +26,38 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 
 _MIGRATION_NOTICE = ("[prepare] SEA-RAFT has been retired from the mainline; "
                      "this job runs on native Fast DIS instead")
+_MIGRATION_PRINTED = False
 
 
 def resolve_engine(name: str) -> str:
     """Map the retired ``sea-raft`` engine choice onto native Fast DIS."""
+    global _MIGRATION_PRINTED
     if name == "sea-raft":
-        print(_MIGRATION_NOTICE, file=sys.stderr, flush=True)
+        if not _MIGRATION_PRINTED:
+            print(_MIGRATION_NOTICE, file=sys.stderr, flush=True)
+            _MIGRATION_PRINTED = True
         return "dis"
     return name
+
+
+def normalize_legacy_engine(args) -> None:
+    """Retire ``sea-raft`` engine choices before analysis.
+
+    Old callers used ``--engine sea-raft --bidirectional``; the retired engine
+    must not silently run the expert bidirectional DIS path.  The choice is
+    forced to one-way Fast DIS with a single per-process notice.  Expert
+    ``--engine dis --bidirectional`` keeps its behavior.
+    """
+    if args.engine != "sea-raft":
+        return
+    global _MIGRATION_PRINTED
+    if not _MIGRATION_PRINTED:
+        extra = (" --bidirectional was forced off: the retired engine is "
+                 "one-way Fast DIS" if args.bidirectional else "")
+        print(_MIGRATION_NOTICE + extra, file=sys.stderr, flush=True)
+        _MIGRATION_PRINTED = True
+    args.engine = "dis"
+    args.bidirectional = False
 
 
 def add_common_arguments(parser: argparse.ArgumentParser, *, kind: str) -> None:
@@ -162,7 +186,7 @@ class PendingFrame:
 
 def run_preparer(args: argparse.Namespace) -> None:
     validate(args)
-    args.engine = resolve_engine(args.engine)
+    normalize_legacy_engine(args)
     ensure_outputs(args)
     timer = StageTimer()
     analyzer = create_analyzer(args)
