@@ -33,6 +33,8 @@ static_assert(sizeof(XessSharedSlotHeader) == 8, "shared slot header ABI mismatc
 
 class XessSharedRingReader {
 public:
+    double waitSeconds = 0.0;  // time from entering read() until data was visible
+
     XessSharedRingReader() = default;
     XessSharedRingReader(const XessSharedRingReader&) = delete;
     XessSharedRingReader& operator=(const XessSharedRingReader&) = delete;
@@ -65,6 +67,9 @@ public:
 
     bool read(std::vector<uint8_t>& packet, DWORD timeoutMs = 30000) {
         if (!header_) return false;
+        LARGE_INTEGER freq{}, started{}, ready{};
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&started);
         const ULONGLONG deadline = GetTickCount64() + timeoutMs;
         for (;;) {
             const LONG64 writeSequence =
@@ -72,6 +77,8 @@ public:
             const LONG64 readSequence =
                 InterlockedCompareExchange64(&header_->readSequence, 0, 0);
             if (readSequence < writeSequence) {
+                QueryPerformanceCounter(&ready);
+                waitSeconds += (double)(ready.QuadPart - started.QuadPart) / (double)freq.QuadPart;
                 const uint32_t slot = static_cast<uint32_t>(readSequence % slots_);
                 uint8_t* base = view_ + sizeof(XessSharedRingHeader) +
                     static_cast<size_t>(slot) * (sizeof(XessSharedSlotHeader) + slotSize_);

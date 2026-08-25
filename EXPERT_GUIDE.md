@@ -194,6 +194,28 @@ XeSS 画质档位数字越高，输入采样比例越高、通常越慢。`自�
 - `输出详细日志=关`：排错时再开。
 - `旧版窗口捕获允许覆盖层=关`：仅为旧工作流字段兼容保留；当前节点固定使用 direct 交换链直读，无需开启，RTSS OSD 不会进入输出。
 
+### 分阶段计时（性能诊断用，默认关闭）
+
+命令行运行 `pipeline/run_xess.py` 时加 `--stage-timing`（或设环境变量 `XESS_STAGE_TIMING=1`），
+每个组件结束时会向 stderr 打一行机器可读 JSON：
+
+```
+[timing] component=prepare-sr {"analyze_total_s": .., "decoder_read_s": ..}
+[timing] component=xess-vsr {"xess_execute_gpu_s": .., "gpu_fence_wait_s": ..}
+[timing] component=edge_guard {"encoder_write_wait_s": ..}
+[timing] component=run-xess {"total_s": ..}
+```
+
+- `prepare-sr`：`decoder_read` 等解码出帧、`analyze_total` 光流+遮罩计算、
+  `packet_write` 打包、`worker_read_wait` 等 SR worker 消费。
+- `xess-vsr`：纹理上传/XeSS 执行同时给 CPU 墙钟和 D3D12 GPU timestamp 两套数字，
+  外加 `gpu_fence_wait`、回读和 stdout 写出耗时。
+- `sharpen` / `edge_guard`：各自计算量与上下游等待；`edge_guard` 的
+  `source_decode_s` 直接反映它重复解码源视频的代价。
+- `run-xess`：整条管线端到端总时长。
+
+计时只多输出一行日志，不改任何处理逻辑；不加开关的普通运行零额外开销。
+
 ## 建议的调参顺序
 
 1. 先用同一段 3～5 秒素材和上面的整套方案；

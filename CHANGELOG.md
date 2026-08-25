@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added opt-in per-stage timing for the SR pipeline: `--stage-timing` on
+  `run_xess.py` (or `XESS_STAGE_TIMING=1`) makes every Python component print
+  one machine-readable `[timing] component=<name> {...}` line to stderr, and
+  xess-vsr.exe reports CPU wall clock plus D3D12 GPU timestamp deltas for
+  upload/execute/readback.  Disabled by default; the normal path performs no
+  extra threads, copies, or logging.
 - Retired SEA-RAFT from the mainline after B580 benchmarks showed DIS is both
   faster and at least as stable.  All presets and nodes now run native OpenCV
   DIS; old workflows that still select `sea-raft`/`sea-raft-single`
@@ -10,10 +16,6 @@
   discovery, and the archived experiment core are gone from the source tree
   (research code stays on the `experiment/sea-raft-xpu` branch).  The runtime
   manifest no longer requires the bundled SEA-RAFT checkpoint.
-- Fixed Balanced/Quality mode reporting zero XPU devices in child processes on
-  some Arc A-series installations.  The node now probes in the same import
-  order as SEA-RAFT, performs a real XPU allocation, preserves the launcher's
-  working environment, and retries with Level Zero selectors when required.
 
 ## 1.1.0 - 2026-08-21
 

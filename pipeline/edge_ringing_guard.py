@@ -8,6 +8,8 @@ import sys
 import cv2
 import numpy as np
 
+from stage_timer import StageTimer
+
 
 def read_exact(stream, size: int) -> bytes:
     data = bytearray(size)
@@ -63,14 +65,19 @@ def main() -> None:
     assert decoder.stdout is not None
     input_size = args.in_w * args.in_h * 3
     output_size = args.out_w * args.out_h * 3
+    timer = StageTimer()
     try:
         for _ in range(args.frames):
-            source = np.frombuffer(read_exact(decoder.stdout, input_size), np.uint8)
-            source = source.reshape(args.in_h, args.in_w, 3)
-            output = np.frombuffer(read_exact(sys.stdin.buffer, output_size), np.uint8)
-            output = output.reshape(args.out_h, args.out_w, 3)
-            guarded = suppress_vertical_ringing(source, output, args.strength)
-            sys.stdout.buffer.write(guarded.tobytes())
+            with timer.span("source_decode"):
+                source = np.frombuffer(read_exact(decoder.stdout, input_size), np.uint8)
+                source = source.reshape(args.in_h, args.in_w, 3)
+            with timer.span("upstream_read"):
+                output = np.frombuffer(read_exact(sys.stdin.buffer, output_size), np.uint8)
+                output = output.reshape(args.out_h, args.out_w, 3)
+            with timer.span("edge_guard"):
+                guarded = suppress_vertical_ringing(source, output, args.strength)
+            with timer.span("encoder_write_wait"):
+                sys.stdout.buffer.write(guarded.tobytes())
         sys.stdout.buffer.flush()
         if decoder.wait() != 0:
             raise RuntimeError("source decoder failed")
@@ -81,6 +88,7 @@ def main() -> None:
         raise
     finally:
         decoder.stdout.close()
+    timer.report("edge_guard")
 
 
 if __name__ == "__main__":

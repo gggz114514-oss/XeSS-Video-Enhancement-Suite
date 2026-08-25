@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from collections import deque
 from dataclasses import dataclass
 import json
@@ -17,7 +18,8 @@ import cv2
 
 from motion_core import DepthEstimator, DisFlow, FrameAnalyzer, write_debug
 from shm_ring import RingWriter
-from stream_protocol import Flags, FramePacket, eos, write_packet
+from stage_timer import StageTimer
+from stream_protocol import Flags, FramePacket, eos, encode, write_packet
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -103,15 +105,16 @@ def read_exact(stream, size: int) -> bytes:
     return b"".join(chunks)
 
 
-def frame_iterator(args: argparse.Namespace):
+def frame_iterator(args: argparse.Namespace, timer: StageTimer | None = None):
     frame_bytes = args.in_w * args.in_h * 3
     if args.stream:
         source = sys.stdin.buffer
         for index in range(args.frames):
-            try:
-                data = read_exact(source, frame_bytes)
-            except EOFError as exc:
-                raise RuntimeError(f"decoder ended at frame {index}: {exc}") from exc
+            with (timer.span("decoder_read") if timer else contextlib.nullcontext()):
+                try:
+                    data = read_exact(source, frame_bytes)
+                except EOFError as exc:
+                    raise RuntimeError(f"decoder ended at frame {index}: {exc}") from exc
             yield np.frombuffer(data, np.uint8).reshape(args.in_h, args.in_w, 3).copy()
         return
     available = os.path.getsize(args.raw) // frame_bytes
@@ -161,6 +164,7 @@ def run_preparer(args: argparse.Namespace) -> None:
     validate(args)
     args.engine = resolve_engine(args.engine)
     ensure_outputs(args)
+    timer = StageTimer()
     analyzer = create_analyzer(args)
     overlay_mask = None
     if args.overlay_mask:
@@ -177,48 +181,64 @@ def run_preparer(args: argparse.Namespace) -> None:
     pending: deque[PendingFrame] = deque(maxlen=5)
 
     def emit(entry: PendingFrame, window: list[PendingFrame]) -> None:
-        result = entry.result
-        if args.kind == "fg" and args.motion_window == 5:
-            from five_frame_fg import refine_five_frame
-            result = refine_five_frame(
-                window, entry.index,
-                motion_strength=args.temporal_motion_strength,
-                depth_strength=args.temporal_depth_strength)
-        result.flow[..., 0] = np.clip(result.flow[..., 0], -args.in_w, args.in_w)
-        result.flow[..., 1] = np.clip(result.flow[..., 1], -args.in_h, args.in_h)
-        color_bytes = np.ascontiguousarray(entry.rgb, dtype=np.uint8).tobytes()
-        flow_bytes = np.ascontiguousarray(result.flow, dtype=np.float32).tobytes()
-        output_depth = result.depth
-        if output_depth is None and args.kind == "fg":
-            output_depth = np.full((args.in_h, args.in_w), 0.5, np.float32)
-        depth_bytes = (np.ascontiguousarray(output_depth, dtype=np.float32).tobytes()
-                       if output_depth is not None else b"")
-        if overlay_mask is not None and args.kind == "fg":
-            mask_bytes = np.ascontiguousarray(overlay_mask, dtype=np.uint8).tobytes()
-        else:
-            mask_bytes = (np.clip(result.mask * 255.0, 0, 255).astype(np.uint8).tobytes()
-                          if result.mask is not None else b"")
-        if output is not None:
-            write_packet(output, FramePacket(index=entry.index, width=args.in_w,
-                                              height=args.in_h, flags=entry.flags,
-                                              color=color_bytes, motion=flow_bytes,
-                                              depth=depth_bytes, mask=mask_bytes))
-        else:
-            emit_file(args, entry.index, flow_bytes, depth_bytes, mask_bytes)
-        if args.debug_dir:
-            write_debug(args.debug_dir, entry.index, result)
+        with timer.span("packet_write"):
+            result = entry.result
+            if args.kind == "fg" and args.motion_window == 5:
+                from five_frame_fg import refine_five_frame
+                result = refine_five_frame(
+                    window, entry.index,
+                    motion_strength=args.temporal_motion_strength,
+                    depth_strength=args.temporal_depth_strength)
+            result.flow[..., 0] = np.clip(result.flow[..., 0], -args.in_w, args.in_w)
+            result.flow[..., 1] = np.clip(result.flow[..., 1], -args.in_h, args.in_h)
+            with timer.span("packet_encode"):
+                color_bytes = np.ascontiguousarray(entry.rgb, dtype=np.uint8).tobytes()
+                flow_bytes = np.ascontiguousarray(result.flow, dtype=np.float32).tobytes()
+                output_depth = result.depth
+                if output_depth is None and args.kind == "fg":
+                    output_depth = np.full((args.in_h, args.in_w), 0.5, np.float32)
+                depth_bytes = (np.ascontiguousarray(output_depth, dtype=np.float32).tobytes()
+                               if output_depth is not None else b"")
+                if overlay_mask is not None and args.kind == "fg":
+                    mask_bytes = np.ascontiguousarray(overlay_mask, dtype=np.uint8).tobytes()
+                else:
+                    mask_bytes = (np.clip(result.mask * 255.0, 0, 255).astype(np.uint8).tobytes()
+                                  if result.mask is not None else b"")
+                packet = FramePacket(index=entry.index, width=args.in_w,
+                                     height=args.in_h, flags=entry.flags,
+                                     color=color_bytes, motion=flow_bytes,
+                                     depth=depth_bytes, mask=mask_bytes)
+            if output is not None:
+                # write_packet minus the CRC/encode pass so the blocking
+                # transport portion (worker_read_wait) stays separable.
+                with timer.span("transport_write"):
+                    data = encode(packet)
+                    output.write(data)
+                    output.flush()
+            else:
+                emit_file(args, entry.index, flow_bytes, depth_bytes, mask_bytes)
+            if args.debug_dir:
+                write_debug(args.debug_dir, entry.index, result)
 
-    for index, rgb in enumerate(frame_iterator(args)):
-        if index == 0:
-            result = analyzer.first(rgb, args.responsive_mask)
-            flags = Flags.RESET
-        else:
-            result = analyzer.next(rgb, args.responsive_mask,
-                                   dilate_highres=(args.mv_path == "highres" or args.kind == "fg"))
-            flags = Flags.NONE
-            if result.scene_cut:
-                scene_cuts.append(index)
-                flags |= Flags.RESET | Flags.SCENE_CUT
+    frames_iter = frame_iterator(args, timer)
+    index = -1
+    while True:
+        try:
+            rgb = next(frames_iter)
+        except StopIteration:
+            break
+        index += 1
+        with timer.span("analyze_total"):
+            if index == 0:
+                result = analyzer.first(rgb, args.responsive_mask)
+                flags = Flags.RESET
+            else:
+                result = analyzer.next(rgb, args.responsive_mask,
+                                       dilate_highres=(args.mv_path == "highres" or args.kind == "fg"))
+                flags = Flags.NONE
+                if result.scene_cut:
+                    scene_cuts.append(index)
+                    flags |= Flags.RESET | Flags.SCENE_CUT
         pending.append(PendingFrame(index, rgb.copy(), result, flags))
         if args.kind != "fg" or args.motion_window == 2:
             emit(pending[-1], [pending[-1]])
@@ -253,5 +273,9 @@ def run_preparer(args: argparse.Namespace) -> None:
                     json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         Path(args.mv_out, "reset_frames.txt").write_text(
             "".join(f"{index}\n" for index in scene_cuts), encoding="ascii")
+    if ring is not None:
+        timer.observe("worker_read_wait", ring.wait_seconds)
+    timer.totals["prepare_total"] = time.perf_counter() - started
+    timer.report(f"prepare-{args.kind}")
     print(f"[prepare-{args.kind}] complete: {args.frames} frames",
           file=sys.stderr, flush=True)

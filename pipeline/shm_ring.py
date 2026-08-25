@@ -100,6 +100,7 @@ class RingWriter:
         self.slots = slots
         self.slot_size = slot_size
         self.timeout_ms = max(1, int(timeout_seconds * 1000))
+        self.wait_seconds = 0.0  # time blocked because the consumer lagged
         self._api = _windows_api()
         self.mapping = mmap.mmap(-1, _mapping_size(slots, slot_size), tagname=name,
                                  access=mmap.ACCESS_WRITE)
@@ -137,7 +138,9 @@ class RingWriter:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SharedRingError("timed out waiting for a free shared-memory slot")
+            waited_from = time.perf_counter()
             result = self._api.WaitForSingleObject(self.space_event, min(self.timeout_ms, int(remaining * 1000)))
+            self.wait_seconds += time.perf_counter() - waited_from
             if result not in (WAIT_OBJECT_0, WAIT_TIMEOUT):
                 raise SharedRingError(f"WaitForSingleObject(space) failed: {result}")
 

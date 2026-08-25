@@ -10,11 +10,13 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from chunked_media import concat_command, extract_lossless_command, write_concat_list
 from media_validation import MediaValidationError, validate_output
 from shm_ring import RingOwner, packet_slot_size
+from stage_timer import StageTimer, timing_requested
 from workdir_guard import (WorkdirError, create_workspace, estimate_sr_bytes,
                            finalize_output, partial_output_path)
 
@@ -433,6 +435,9 @@ def main():
     parser.add_argument("--encoder-preset", default="slow")
     parser.add_argument("--crf", type=int, default=16)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--stage-timing", action="store_true",
+                        help="emit one [timing] JSON line per pipeline component "
+                             "(also enabled by XESS_STAGE_TIMING=1)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -509,6 +514,12 @@ def main():
         die(str(exc))
     environment = workspace.child_environment()
     driver_environment = workspace.driver_environment(environment)
+    stage_timing = timing_requested(args.stage_timing, environment=environment)
+    if stage_timing:
+        for child_env in (environment, driver_environment):
+            child_env["XESS_STAGE_TIMING"] = "1"
+        print("[run_xess] stage timing enabled (--stage-timing / XESS_STAGE_TIMING)")
+    timer = StageTimer(stage_timing)
     print(f"[run_xess] {width}x{height} {fps:g}fps {frames} frames -> {out_w}x{out_h}; "
           f"preset={args.preset}, flow={settings['flow']}, mv={settings['mv_path']}, "
           f"mask={settings['responsive']}, io={settings['io_mode']}, sharpen={settings['sharpen_mode']}")
@@ -526,14 +537,22 @@ def main():
             succeeded = True
             return
         if settings["io_mode"] in ("stream", "shared"):
-            run_stream(args, settings, environment, driver_environment, width, height,
-                       out_w, out_h, fps, frames, quality, partial)
+            with timer.span("total"):
+                run_stream(args, settings, environment, driver_environment, width, height,
+                           out_w, out_h, fps, frames, quality, partial)
         elif settings["io_mode"] == "chunked":
-            run_chunked(args, settings, environment, driver_environment, workspace,
-                        width, height, out_w, out_h, fps, frames, quality, partial)
+            with timer.span("total"):
+                run_chunked(args, settings, environment, driver_environment, workspace,
+                            width, height, out_w, out_h, fps, frames, quality, partial)
         else:
-            run_file(args, settings, environment, driver_environment, workspace, width,
-                     height, out_w, out_h, fps, frames, quality, partial)
+            with timer.span("total"):
+                run_file(args, settings, environment, driver_environment, workspace, width,
+                         height, out_w, out_h, fps, frames, quality, partial)
+        if stage_timing:
+            print(f"[timing] component=run-xess {{\"total_s\":"
+                  f"{round(timer.totals.get('total', 0.0), 3)}, \"preset\": \"{args.preset}\", "
+                  f"\"io\": \"{settings['io_mode']}\", \"frames\": {frames}}}",
+                  file=sys.stderr, flush=True)
         try:
             report = validate_output(
                 python=PY, flow_script=FLOW, ffmpeg=FFMPEG, output=os.fspath(partial),

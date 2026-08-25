@@ -113,6 +113,26 @@ const char* xess_err_str(int64_t r) {
 
 static uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
 
+// ---- 可选分阶段计时（--stage-timing / XESS_STAGE_TIMING，默认关闭）----
+// CPU 墙钟 + D3D12 GPU timestamp query；普通路径零额外开销。
+struct StageTiming {
+    bool enabled = false;
+    LARGE_INTEGER freq{};
+    double inputRead = 0, ringWaitData = 0, textureUpload = 0;
+    double xessExecuteCpu = 0, gpuFenceWait = 0, readbackWait = 0, stdoutWrite = 0;
+    double textureUploadGpu = 0, xessExecuteGpu = 0, readbackCopyGpu = 0;
+    uint32_t frames = 0;
+
+    void begin() { QueryPerformanceFrequency(&freq); }
+    double now() const {
+        LARGE_INTEGER c;
+        QueryPerformanceCounter(&c);
+        return (double)c.QuadPart / (double)freq.QuadPart;
+    }
+};
+static StageTiming g_timing;
+
+
 // float32 -> float16（IEEE 754 舍入到最近偶数）
 static uint16_t f32_to_f16(float f) {
     uint32_t x;
@@ -209,6 +229,7 @@ struct CmdArgs {
     const char* shmName = nullptr;
     uint32_t shmSlots = 0;
     uint32_t shmSlotSize = 0;
+    bool stageTiming = false;
 };
 
 static bool parse_args(int argc, char** argv, CmdArgs& a) {
@@ -257,8 +278,8 @@ static bool parse_args(int argc, char** argv, CmdArgs& a) {
             else { fprintf(stderr, "[args] --mv-upsample must be nearest or bilinear\n"); return false; }
         }
         else if (!strcmp(k, "--reset-frames")) { a.resetFrames = next(k); }
-        else if (!strcmp(k, "--dump")) { a.dumpDir = next(k); }
-        else if (!strcmp(k, "--dbg-upload")) { a.dbgUpload = next(k); }
+        else if (!strcmp(k, "--stage-timing")) { a.stageTiming = true; }
+        else if (!strcmp(k, "--dump")) { a.dumpDir = next(k); }        else if (!strcmp(k, "--dbg-upload")) { a.dbgUpload = next(k); }
         else { fprintf(stderr, "[args] 未知参数 %s\n", k); return false; }
         if (!k) return false;
     }
@@ -292,8 +313,14 @@ struct D3D12Ctx {
     uint32_t colorPitch = 0, velPitch = 0, depthPitch = 0, maskPitch = 0, readPitch = 0;
     uint64_t velOffset = 0, depthOffset = 0, maskOffset = 0;
     ID3D12Resource* dbgReadback = nullptr;  // 调试：上传后的颜色纹理回读
+    // GPU timestamp query（仅 --stage-timing 时创建）
+    ID3D12QueryHeap* queryHeap = nullptr;
+    ID3D12Resource* queryResult = nullptr;
+    UINT64 queueFreq = 0;
 
     ~D3D12Ctx() {
+        if (queryResult) queryResult->Release();
+        if (queryHeap) queryHeap->Release();
         if (dbgReadback) dbgReadback->Release();
         if (readbackBuf) readbackBuf->Release();
         if (uploadBuf) uploadBuf->Release();
@@ -312,12 +339,14 @@ struct D3D12Ctx {
     }
 
     bool wait_gpu() {
+        const double t0 = g_timing.enabled ? g_timing.now() : 0.0;
         fenceVal++;
         queue->Signal(fence, fenceVal);
         if (fence->GetCompletedValue() < fenceVal) {
             fence->SetEventOnCompletion(fenceVal, fenceEvent);
             WaitForSingleObject(fenceEvent, INFINITE);
         }
+        if (g_timing.enabled) g_timing.gpuFenceWait += g_timing.now() - t0;
         return true;
     }
 };
@@ -371,7 +400,7 @@ static ID3D12Resource* create_tex(ID3D12Device* dev, UINT w, UINT h,
 }
 
 static bool init_d3d(int wantAdapter, UINT inW, UINT inH, UINT outW, UINT outH,
-                     bool lowResMv, bool responsiveMask, D3D12Ctx& c) {
+                     bool lowResMv, bool responsiveMask, bool timing, D3D12Ctx& c) {
     IDXGIAdapter1* ad = pick_adapter(wantAdapter);
     if (!ad) { fprintf(stderr, "[d3d12] 没有可用适配器\n"); return false; }
     DXGI_ADAPTER_DESC1 desc;
@@ -396,6 +425,29 @@ static bool init_d3d(int wantAdapter, UINT inW, UINT inH, UINT outW, UINT outH,
     c.list->Close();
     if (FAILED(c.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&c.fence)))) return false;
     c.fenceEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+
+    if (timing) {
+        c.queue->GetTimestampFrequency(&c.queueFreq);
+        D3D12_QUERY_HEAP_DESC qhd{};
+        qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qhd.Count = 8;
+        if (FAILED(c.dev->CreateQueryHeap(&qhd, IID_PPV_ARGS(&c.queryHeap)))) return false;
+        D3D12_RESOURCE_DESC qrd{};
+        qrd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        qrd.Alignment = 0;
+        qrd.Width = 4 * sizeof(UINT64);
+        qrd.Height = 1;
+        qrd.DepthOrArraySize = 1;
+        qrd.MipLevels = 1;
+        qrd.SampleDesc = {1, 0};
+        qrd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES rbHp{};
+        rbHp.Type = D3D12_HEAP_TYPE_READBACK;
+        if (FAILED(c.dev->CreateCommittedResource(&rbHp, D3D12_HEAP_FLAG_NONE, &qrd,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST,
+                                                  nullptr, IID_PPV_ARGS(&c.queryResult))))
+            return false;
+    }
 
     c.colorTex = create_tex(c.dev, inW, inH, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
                             D3D12_RESOURCE_STATE_COPY_DEST, "xess_color");
@@ -506,6 +558,8 @@ static bool process_frame(D3D12Ctx& c, const uint8_t* rgb, const float* velLow,
                            xess_context_handle_t xessCtx, const CmdArgs& a, FILE* outFp,
                            int frameIdx, bool resetHistory) {
     ID3D12GraphicsCommandList* L = c.list;
+    const bool timing = g_timing.enabled;
+    const double tUpload = timing ? g_timing.now() : 0.0;
     c.alloc->Reset();
     L->Reset(c.alloc, nullptr);
 
@@ -557,6 +611,7 @@ static bool process_frame(D3D12Ctx& c, const uint8_t* rgb, const float* velLow,
     D3D12_TEXTURE_COPY_LOCATION dstC = { c.colorTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
     D3D12_TEXTURE_COPY_LOCATION srcC = { c.uploadBuf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, 0 };
     srcC.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, (UINT)a.inW, (UINT)a.inH, 1, c.colorPitch };
+    if (timing) L->EndQuery(c.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
     L->CopyTextureRegion(&dstC, 0, 0, 0, &srcC, nullptr);
     D3D12_TEXTURE_COPY_LOCATION dstV = { c.velTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
     D3D12_TEXTURE_COPY_LOCATION srcV = { c.uploadBuf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -577,6 +632,10 @@ static bool process_frame(D3D12Ctx& c, const uint8_t* rgb, const float* velLow,
         srcM.PlacedFootprint.Footprint = { DXGI_FORMAT_R8_UNORM, (UINT)a.inW, (UINT)a.inH, 1, c.maskPitch };
         L->CopyTextureRegion(&dstM, 0, 0, 0, &srcM, nullptr);
     }
+    if (timing) {
+        L->EndQuery(c.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        g_timing.textureUpload += g_timing.now() - tUpload;
+    }
 
     auto bar = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
         D3D12_RESOURCE_BARRIER b{};
@@ -595,6 +654,7 @@ static bool process_frame(D3D12Ctx& c, const uint8_t* rgb, const float* velLow,
         bar(c.maskTex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     bar(c.outTex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
+    const double tExec = timing ? g_timing.now() : 0.0;
     xess_d3d12_execute_params_t exec{};
     exec.inputWidth = (uint32_t)a.inW;
     exec.inputHeight = (uint32_t)a.inH;
@@ -611,16 +671,19 @@ static bool process_frame(D3D12Ctx& c, const uint8_t* rgb, const float* velLow,
     exec.pDescriptorHeap = nullptr;
     exec.descriptorHeapOffset = 0;
     int64_t rc = xessD3D12Execute(xessCtx, L, &exec);
+    if (timing) g_timing.xessExecuteCpu += g_timing.now() - tExec;
     if (rc != XESS_RESULT_SUCCESS) {
         fprintf(stderr, "[xess] Execute 帧 %d 失败: %s\n", frameIdx, xess_err_str(rc));
         return false;
     }
+    if (timing) L->EndQuery(c.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
 
     bar(c.outTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION srcO = { c.outTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
     D3D12_TEXTURE_COPY_LOCATION dstO = { c.readbackBuf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, 0 };
     dstO.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, (UINT)a.outW, (UINT)a.outH, 1, c.readPitch };
     L->CopyTextureRegion(&dstO, 0, 0, 0, &srcO, nullptr);
+    if (timing) L->EndQuery(c.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
     bar(c.colorTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     bar(c.velTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     if (a.lowResMv)
@@ -629,15 +692,33 @@ static bool process_frame(D3D12Ctx& c, const uint8_t* rgb, const float* velLow,
         bar(c.maskTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     bar(c.outTex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 
+    if (timing)
+        L->ResolveQueryData(c.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, c.queryResult, 0);
     L->Close();
     ID3D12CommandList* lists[] = { L };
     c.queue->ExecuteCommandLists(1, lists);
     c.wait_gpu();
 
+    if (timing) {
+        void* qp = nullptr;
+        if (SUCCEEDED(c.queryResult->Map(0, nullptr, &qp))) {
+            UINT64 ts[4];
+            memcpy(ts, qp, sizeof(ts));
+            c.queryResult->Unmap(0, nullptr);
+            const double invFreq = c.queueFreq ? 1.0 / (double)c.queueFreq : 0.0;
+            g_timing.textureUploadGpu += (double)(ts[1] - ts[0]) * invFreq;
+            g_timing.xessExecuteGpu += (double)(ts[2] - ts[1]) * invFreq;
+            g_timing.readbackCopyGpu += (double)(ts[3] - ts[2]) * invFreq;
+        }
+    }
+
+    const double tReadback = timing ? g_timing.now() : 0.0;
     void* rbPtr = nullptr;
     if (FAILED(c.readbackBuf->Map(0, nullptr, &rbPtr))) return false;
+    if (timing) g_timing.readbackWait += g_timing.now() - tReadback;
     const uint8_t* src = (const uint8_t*)rbPtr;
     std::vector<uint8_t> rowBuf((size_t)a.outW * 3);
+    const double tWrite = timing ? g_timing.now() : 0.0;
     for (int y = 0; y < a.outH; y++) {
         const uint8_t* row = src + (size_t)y * c.readPitch;
         for (int x = 0; x < a.outW; x++) {          // RGBA -> RGB，跳过 alpha
@@ -650,6 +731,8 @@ static bool process_frame(D3D12Ctx& c, const uint8_t* rgb, const float* velLow,
             return false;
         }
     }
+    if (timing) g_timing.stdoutWrite += g_timing.now() - tWrite;
+    g_timing.frames++;
     c.readbackBuf->Unmap(0, nullptr);
     return true;
 }
@@ -806,8 +889,18 @@ int main(int argc, char** argv) {
         fprintf(stderr, "usage: xess-vsr.exe [--stream [--shm-name NAME --shm-slots N --shm-slot-size N] "
                         "| --frames in.raw --mv DIR --out out.raw] "
                         "--in-w W --in-h H --out-w OW --out-h OH --frames-count N "
-                        "[--mv-path highres|lowres-depth] [--depth DIR] [--mask DIR]\n");
+                        "[--mv-path highres|lowres-depth] [--depth DIR] [--mask DIR] [--stage-timing]\n");
         return 2;
+    }
+    if (!a.stageTiming) {
+        const char* envTiming = getenv("XESS_STAGE_TIMING");
+        if (envTiming && *envTiming && _stricmp(envTiming, "0") &&
+            _stricmp(envTiming, "false") && _stricmp(envTiming, "off"))
+            a.stageTiming = true;
+    }
+    if (a.stageTiming) {
+        g_timing.begin();
+        g_timing.enabled = true;
     }
 
     if (a.stream) {
@@ -824,7 +917,7 @@ int main(int argc, char** argv) {
 
     D3D12Ctx d3d;
     if (!init_d3d(a.device, a.inW, a.inH, a.outW, a.outH,
-                  a.lowResMv, a.responsiveMask, d3d)) return 1;
+                  a.lowResMv, a.responsiveMask, g_timing.enabled, d3d)) return 1;
 
     if (a.dbgUpload) {
         std::vector<uint8_t> rgb((size_t)a.inW * a.inH * 3);
@@ -946,6 +1039,7 @@ int main(int argc, char** argv) {
     StreamFrame streamFrame;
 
     for (int i = 0; i < a.framesCount; i++) {
+        const double tInput = g_timing.enabled ? g_timing.now() : 0.0;
         bool reset = resetHistory[(size_t)i] != 0;
         if (a.stream) {
             const int streamResult = read_stream_frame(rawIn, sharedRingPtr, a, i, streamFrame);
@@ -999,6 +1093,8 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (g_timing.enabled) g_timing.inputRead += g_timing.now() - tInput;
+
         if (!process_frame(d3d, rgb.data(), velLow.data(),
                            a.lowResMv ? depthLow.data() : nullptr,
                            a.responsiveMask ? maskLow.data() : nullptr,
@@ -1021,6 +1117,22 @@ int main(int argc, char** argv) {
 
     if (!a.stream) { fclose(outFp); fclose(rawIn); }
     xessDestroyContext(ctx);
+    if (g_timing.enabled) {
+        fprintf(stderr,
+                "[timing] component=xess-vsr {\"frames\":%u, "
+                "\"input_read_s\": %.3f, \"ring_wait_data_s\": %.3f, "
+                "\"texture_upload_cpu_s\": %.3f, \"texture_upload_gpu_s\": %.3f, "
+                "\"xess_execute_cpu_s\": %.3f, \"xess_execute_gpu_s\": %.3f, "
+                "\"gpu_fence_wait_s\": %.3f, \"readback_copy_gpu_s\": %.3f, "
+                "\"readback_wait_s\": %.4f, \"stdout_write_s\": %.3f}\n",
+                g_timing.frames,
+                g_timing.inputRead,
+                sharedRingPtr ? sharedRingPtr->waitSeconds : 0.0,
+                g_timing.textureUpload, g_timing.textureUploadGpu,
+                g_timing.xessExecuteCpu, g_timing.xessExecuteGpu,
+                g_timing.gpuFenceWait, g_timing.readbackCopyGpu,
+                g_timing.readbackWait, g_timing.stdoutWrite);
+    }
     fprintf(stderr, "[xess] %s\n", complete ? "complete" : "failed");
     return complete ? 0 : 1;
 }
