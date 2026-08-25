@@ -4,6 +4,8 @@
 
 当前版本：源码/节点 `1.1.0`，SR `1.2`，FG `1.2`，固定运行时 `2026.08.21-r1`。
 
+> **实验分支提示：** 当前分支 `experiment/sea-raft-xpu` 仅用于归档 SEA-RAFT/XPU 融合核实验。该路线已在 B580 的 SR/FG 实测中确认不适合作为主线：速度慢约 2.8–3 倍，画质没有稳定质变，并增加显存和运行时依赖。详见 [`docs/SEA_RAFT_EXPERIMENT_STATUS.md`](docs/SEA_RAFT_EXPERIMENT_STATUS.md)。
+
 > 这是社区项目，不是 Intel 官方产品。实机验证平台为 Windows 11 与 Intel Arc B580。
 > ## 实测环境基线
 
