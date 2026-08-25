@@ -3,9 +3,11 @@
 // 管线：ffmpeg 解码 -> flow.py 算 DIS 光流 -> 本程序逐帧喂给官方 libxess.dll (D3D12)
 // -> 输出放大后的 rgb24 raw -> ffmpeg 编码。
 //
-// 帧处理是 3 槽流水线：帧 N 在 GPU 上执行时，帧 N-1 在做 GPU->CPU 回读拷贝，
-// 帧 N-2 由写线程落盘。每槽有独立的命令分配器/列表和持久映射的上传/回读缓冲，
-// 用 fence + 信号量保证绝不覆写仍在使用的资源；输出帧序与输入严格一致。
+// 帧处理是 3 槽流水线（多帧在途、CPU/GPU 阶段重叠）：帧 N 在 GPU 上执行时，
+// 帧 N-1 在等 fence 并完成 GPU->CPU 回读拷贝，帧 N-2 由主线程转写输出。
+// 每槽有独立的命令分配器/列表和持久映射的上传/回读缓冲，用每槽 fence
+// 保证绝不覆写仍在使用的资源；输出帧序与输入严格一致。
+// 收尾时先排空最后一个已提交 fence 再销毁 XeSS 上下文与 D3D12 资源。
 //
 // XeSS 配置（官方 SDK 2.1.0 ABI，见 sdk/official/inc/xess/）：
 //   - xessD3D12CreateContext(device, &ctx) 只建上下文，init 参数在 xessD3D12Init 传
@@ -48,6 +50,8 @@ static constexpr uint32_t STREAM_FLAG_EOS = 1u << 2;
 
 // 流水线深度：同时驻留在 GPU/写盘路径上的帧数。
 static constexpr int PIPE_DEPTH = 3;
+// 收尾排空在途 GPU 任务的有界等待，避免错误路径永久死等。
+static constexpr DWORD DRAIN_TIMEOUT_MS = 15000;
 
 #pragma pack(push, 1)
 struct StreamHeader {
@@ -304,7 +308,6 @@ struct D3D12Ctx {
     ID3D12CommandQueue* queue = nullptr;
     ID3D12Fence* fence = nullptr;
     HANDLE fenceEvent = nullptr;
-    HANDLE writeDoneSem = nullptr;   // 写线程每落盘一帧释放一次
     uint64_t fenceVal = 0;
 
     ID3D12Resource* colorTex = nullptr;   // RGBA8 输入（inW x inH）
@@ -356,23 +359,35 @@ struct D3D12Ctx {
         if (queue) queue->Release();
         if (fence) fence->Release();
         if (fenceEvent) CloseHandle(fenceEvent);
-        if (writeDoneSem) CloseHandle(writeDoneSem);
         if (dev) dev->Release();
     }
 
-    bool wait_fence(uint64_t value) {
-        if (fence->GetCompletedValue() < value) {
-            fence->SetEventOnCompletion(value, fenceEvent);
-            WaitForSingleObject(fenceEvent, INFINITE);
+    // 等待 fence 到达 value；超时/失败返回 false，绝不无限期卡死在错误路径。
+    bool wait_fence(uint64_t value, DWORD timeoutMs = INFINITE, bool* timedOut = nullptr) {
+        if (timedOut) *timedOut = false;
+        if (fence->GetCompletedValue() >= value) return true;
+        const HRESULT hr = fence->SetEventOnCompletion(value, fenceEvent);
+        if (FAILED(hr)) {
+            fprintf(stderr, "[d3d12] SetEventOnCompletion(%llu) failed: 0x%08lX\n",
+                    (unsigned long long)value, (unsigned long)hr);
+            return false;
         }
-        return true;
+        const DWORD result = WaitForSingleObject(fenceEvent, timeoutMs);
+        if (result == WAIT_OBJECT_0) return true;
+        if (result == WAIT_TIMEOUT && timedOut) *timedOut = true;
+        fprintf(stderr, "[d3d12] wait_fence(%llu) failed: %lu\n",
+                (unsigned long long)value, (unsigned long)result);
+        return false;
     }
 
     bool wait_gpu() {
         const double t0 = g_timing.enabled ? g_timing.now() : 0.0;
         fenceVal++;
-        queue->Signal(fence, fenceVal);
-        wait_fence(fenceVal);
+        if (FAILED(queue->Signal(fence, fenceVal))) {
+            fprintf(stderr, "[d3d12] queue->Signal failed\n");
+            return false;
+        }
+        if (!wait_fence(fenceVal)) return false;
         if (g_timing.enabled) g_timing.gpuFenceWait += g_timing.now() - t0;
         return true;
     }
@@ -737,7 +752,10 @@ static bool record_and_submit(D3D12Ctx& c, D3D12Ctx::Slot& slot,
     ID3D12CommandList* lists[] = { L };
     c.queue->ExecuteCommandLists(1, lists);
     c.fenceVal++;
-    c.queue->Signal(c.fence, c.fenceVal);
+    if (FAILED(c.queue->Signal(c.fence, c.fenceVal))) {
+        fprintf(stderr, "[d3d12] queue->Signal failed at frame %d\n", frameIdx);
+        return false;
+    }
     slot.lastFence = c.fenceVal;
     return true;
 }
@@ -746,7 +764,7 @@ static bool record_and_submit(D3D12Ctx& c, D3D12Ctx::Slot& slot,
 static bool write_frame(D3D12Ctx& c, D3D12Ctx::Slot& slot, FILE* outFp, const CmdArgs& a) {
     const bool timing = g_timing.enabled;
     const double tFence = timing ? g_timing.now() : 0.0;
-    c.wait_fence(slot.lastFence);
+    if (!c.wait_fence(slot.lastFence)) return false;
     if (timing) g_timing.gpuFenceWait += g_timing.now() - tFence;
 
     if (timing && slot.queryResult) {
@@ -1083,28 +1101,24 @@ int main(int argc, char** argv) {
     StreamFrame streamFrame;
     std::vector<uint16_t> velocityScratch;
 
-    d3d.writeDoneSem = CreateSemaphoreA(nullptr, 0, 0x7FFFFFFF, nullptr);
-    if (!d3d.writeDoneSem) {
-        fprintf(stderr, "[sync] CreateSemaphore failed: %lu\n", GetLastError());
-        if (!a.stream) { fclose(outFp); fclose(rawIn); }
-        xessDestroyContext(ctx);
-        return 1;
-    }
-
     // 3 槽流水线主循环：
     //   生产段 —— 取输入 -> CPU 填上传缓冲 -> 录制并提交 GPU（不等完成）
-    //   写出段 —— 等帧 N 的 fence -> RGBA->RGB 落盘 -> 释放槽位信号量
-    // 槽位复用前双重确认：GPU 完成（fence）+ 写线程已消费（信号量）。
+    //   写出段 —— 等帧 N 的 fence -> RGBA->RGB 落盘
+    // 槽位复用只由每槽 fence 保证：提交前等该槽上一帧 GPU 完成；写帧严格按
+    // 提交顺序由同一线程完成，因此槽位不会被未消费的回读数据覆写。
     int submitted = 0;
     int written = 0;
+    uint64_t lastSubmittedFence = 0;
     while (written < a.framesCount && complete) {
         while (complete && submitted < a.framesCount && submitted - written < PIPE_DEPTH) {
             D3D12Ctx::Slot& slot = d3d.slots[submitted % PIPE_DEPTH];
             const double tSlotFence = g_timing.enabled ? g_timing.now() : 0.0;
-            if (slot.lastFence) d3d.wait_fence(slot.lastFence);
+            if (slot.lastFence && !d3d.wait_fence(slot.lastFence)) {
+                fprintf(stderr, "[d3d12] slot fence wait failed before frame %d\n", submitted);
+                complete = false;
+                break;
+            }
             if (g_timing.enabled) g_timing.gpuFenceWait += g_timing.now() - tSlotFence;
-            while (written <= submitted - PIPE_DEPTH)
-                WaitForSingleObject(d3d.writeDoneSem, INFINITE);
 
             const int i = submitted;
             const double tInput = g_timing.enabled ? g_timing.now() : 0.0;
@@ -1170,6 +1184,7 @@ int main(int argc, char** argv) {
                 complete = false;
                 break;
             }
+            lastSubmittedFence = slot.lastFence;
             submitted++;
         }
         if (!complete) break;
@@ -1184,7 +1199,6 @@ int main(int argc, char** argv) {
         if (a.verbose || (i + 1) % 25 == 0)
             fprintf(stderr, "[xess] %d/%d\n", i + 1, a.framesCount);
         written++;
-        ReleaseSemaphore(d3d.writeDoneSem, 1, nullptr);
     }
 
     if (complete && a.stream) {
@@ -1192,8 +1206,26 @@ int main(int argc, char** argv) {
         if (eosResult != 0) {
             fprintf(stderr, "[stream] missing EOS or extra frame\n");
             complete = false;
+        } else if (fflush(outFp) != 0) {
+            fprintf(stderr, "[io] stdout flush failed\n");
+            complete = false;
         }
-        fflush(outFp);
+    }
+
+    // 统一收尾：无论正常还是异常结束，销毁 XeSS 上下文与 D3D12 资源前，
+    // 必须排空仍在 GPU 队列中的在途任务（含回读拷贝）。
+    {
+        bool drainOk = true;
+        const char* drain = "skipped";
+        if (submitted > written && lastSubmittedFence) {
+            bool timedOut = false;
+            drainOk = d3d.wait_fence(lastSubmittedFence, DRAIN_TIMEOUT_MS, &timedOut);
+            drain = drainOk ? "ok" : (timedOut ? "timeout" : "failed");
+        }
+        fprintf(stderr,
+                "[drain] submitted=%d written=%d last_submitted_fence=%llu drain_result=%s\n",
+                submitted, written, (unsigned long long)lastSubmittedFence, drain);
+        if (!drainOk) complete = false;
     }
 
     if (!a.stream) { fclose(outFp); fclose(rawIn); }
