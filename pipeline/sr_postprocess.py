@@ -17,6 +17,7 @@ work releases the GIL and overlaps the upstream wait.
 from __future__ import annotations
 
 import argparse
+import os
 import queue
 import subprocess
 import sys
@@ -26,6 +27,33 @@ import cv2
 import numpy as np
 
 from stage_timer import StageTimer
+
+
+class _StderrTail:
+    """Keeps the last lines of a subprocess stderr for error summaries."""
+
+    def __init__(self, process: subprocess.Popen, max_lines: int = 30):
+        self._lines: list[str] = []
+        self._thread = threading.Thread(
+            target=self._collect, args=(process, max_lines),
+            name="ffmpeg-stderr", daemon=True)
+        self._thread.start()
+
+    def _collect(self, process: subprocess.Popen, max_lines: int) -> None:
+        try:
+            assert process.stderr is not None
+            for raw in process.stderr:
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if not line:
+                    continue
+                self._lines.append(line)
+                if len(self._lines) > max_lines:
+                    del self._lines[: len(self._lines) - max_lines]
+        except Exception:
+            pass
+
+    def summary(self) -> str:
+        return "\n".join(self._lines[-10:])
 
 
 class _SharpenBuffers:
@@ -178,13 +206,22 @@ def main() -> None:
             parser.error("--guard-strength must be in 0..1")
 
     decoder = None
+    decoder_errors = None
     if guard:
-        command = [
-            args.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+        # --ffmpeg 通常是一个可执行文件路径；允许空格分隔的多 token 命令
+        # （如 "<python> <shim>"），便于在不安装 ffmpeg 的测试环境注入假解码器。
+        if " " in args.ffmpeg and not os.path.isfile(args.ffmpeg):
+            ffmpeg = [part for part in args.ffmpeg.split(" ") if part]
+        else:
+            ffmpeg = [args.ffmpeg]
+        command = ffmpeg + [
+            "-hide_banner", "-loglevel", "error", "-nostdin",
             "-i", args.video, "-an", "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{args.in_w}x{args.in_h}", "-vframes", str(args.frames), "-",
         ]
-        decoder = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        decoder = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+        decoder_errors = _StderrTail(decoder)
 
     frame_bytes = args.width * args.height * 3
     source_bytes = args.in_w * args.in_h * 3
@@ -194,27 +231,49 @@ def main() -> None:
 
     guide_pool = queue.Queue()
     guide_ready = queue.Queue(maxsize=2)
+    producer = None
+    stop_event = threading.Event()
     if guard:
         for _ in range(3):
             guide_pool.put(_GuideBuffers(args.height, args.width))
         sourcebuf = bytearray(source_bytes)
 
+        def ready_put(item) -> None:
+            """Bound guide_ready puts so a stopped consumer can never trap us."""
+            while not stop_event.is_set():
+                try:
+                    guide_ready.put(item, timeout=0.25)
+                    return
+                except queue.Full:
+                    continue
+
         def produce_guides() -> None:
             try:
                 for _ in range(args.frames):
-                    gb = guide_pool.get()
+                    gb = None
+                    while gb is None and not stop_event.is_set():
+                        try:
+                            gb = guide_pool.get(timeout=0.25)
+                        except queue.Empty:
+                            continue
+                    if stop_event.is_set():
+                        return
                     if not read_exact(decoder.stdout, source_bytes, sourcebuf):
-                        raise RuntimeError(f"source decoder ended early")
+                        raise RuntimeError("source decoder ended early")
                     source = np.frombuffer(sourcebuf, np.uint8).reshape(
                         args.in_h, args.in_w, 3)
                     compute_blend(gb, source, args.width, args.height,
                                   args.guard_strength)
-                    guide_ready.put(gb)
-                guide_ready.put(None)
+                    ready_put(gb)
+                ready_put(None)
             except BaseException as exc:
-                guide_ready.put(exc)
+                # 传给主线程；队列满说明主线程已停止消费，直接结束。
+                try:
+                    guide_ready.put_nowait(exc)
+                except queue.Full:
+                    pass
 
-        producer = threading.Thread(target=produce_guides, daemon=True)
+        producer = threading.Thread(target=produce_guides, name="guide-producer")
         producer.start()
 
     def next_guide():
@@ -256,14 +315,24 @@ def main() -> None:
                 print(f"[post] {index}/{args.frames}", file=sys.stderr, flush=True)
         sys.stdout.buffer.flush()
         if decoder is not None and decoder.wait() != 0:
-            raise RuntimeError("source decoder failed")
+            detail = f"\nffmpeg decoder stderr:\n{decoder_errors.summary()}" \
+                if decoder_errors is not None else ""
+            raise RuntimeError(f"source decoder failed{detail}")
     except BaseException:
         if decoder is not None and decoder.poll() is None:
             decoder.terminate()
         if decoder is not None:
             decoder.wait()
+        if decoder_errors is not None:
+            tail = decoder_errors.summary()
+            if tail:
+                print(f"[post] ffmpeg decoder stderr:\n{tail}",
+                      file=sys.stderr, flush=True)
         raise
     finally:
+        stop_event.set()
+        if producer is not None:
+            producer.join(timeout=5)
         if decoder is not None:
             decoder.stdout.close()
     timer.report("sr-post")
