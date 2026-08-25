@@ -210,11 +210,15 @@ XeSS 画质档位数字越高，输入采样比例越高、通常越慢。`自�
   `packet_write` 打包、`worker_read_wait` 等 SR worker 消费。
 - `xess-vsr`：纹理上传/XeSS 执行同时给 CPU 墙钟和 D3D12 GPU timestamp 两套数字，
   外加 `gpu_fence_wait`、回读和 stdout 写出耗时。
-- `sharpen` / `edge_guard`：各自计算量与上下游等待；`edge_guard` 的
-  `source_decode_s` 直接反映它重复解码源视频的代价。
+- `sr-post`：锐化与振铃保护合并后的单遍历后处理，含 `sharpen`、
+  `guard_guide`（向导帧分析，后台线程预取）、`guard_blend` 与上游等待。
 - `run-xess`：整条管线端到端总时长。
 
 计时只多输出一行日志，不改任何处理逻辑；不加开关的普通运行零额外开销。
+
+SR 关键路径已做流水化：xess-vsr.exe 内部上传/执行/回读三帧并行，
+锐化与振铃保护合并为单进程单遍历。300 帧 1080p→1440p 基准从 83.0s
+降到 64.0s（B580 实测，A770 待真机验证），输出与旧链逐字节一致。
 
 ## 建议的调参顺序
 

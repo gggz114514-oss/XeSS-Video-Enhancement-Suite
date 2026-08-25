@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Pipelined the SR critical path: xess-vsr.exe now runs a three-frame
+  upload/execute/readback pipeline with per-slot fences (frame order and GPU
+  results unchanged), and the former adaptive-sharpen + edge-ringing-guard
+  process pair is fused into a single-pass `sr_postprocess.py` stage with a
+  prefetch thread for the guard's guide analysis.  The 300-frame
+  1080p→1440p fast-preset benchmark drops from 83.0s to 64.0s (23%) on B580
+  with byte-identical output (A770 待真机验证).
 - Added opt-in per-stage timing for the SR pipeline: `--stage-timing` on
   `run_xess.py` (or `XESS_STAGE_TIMING=1`) makes every Python component print
   one machine-readable `[timing] component=<name> {...}` line to stderr, and

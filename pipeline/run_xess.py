@@ -33,10 +33,9 @@ FFMPEG = first_existing(os.environ.get("XESS_FFMPEG"), os.path.join(ROOT, "ffmpe
 XESS = first_existing(os.environ.get("XESS_VSR"), os.path.join(ROOT, "xess-vsr.exe"), os.path.join(ROOT, "build", "xess-vsr.exe"))
 FLOW = os.path.join(ROOT, "flow.py")
 PREPARE = os.path.join(ROOT, "prepare_sr.py")
-SHARPEN = os.path.join(ROOT, "adaptive_sharpen.py")
+POST = os.path.join(ROOT, "sr_postprocess.py")
 FUSION = os.path.join(ROOT, "five_frame_fusion.py")
 MFSR = os.path.join(ROOT, "five_frame_mfsr.py")
-EDGE_GUARD = os.path.join(ROOT, "edge_ringing_guard.py")
 DEPTH_MODEL = os.path.join(ROOT, "models", "depth-anything-v2-small", "depth_anything_v2_small.xml")
 
 # Mainline motion estimation is native Fast DIS only.  The retired SEA-RAFT
@@ -192,11 +191,32 @@ def encoder_command(args, settings, out_w, out_h, fps, frames, partial):
     return command
 
 
-def edge_guard_command(args, width, height, out_w, out_h, frames):
-    return [PY, EDGE_GUARD, "--video", args.video, "--ffmpeg", FFMPEG,
-            "--in-w", str(width), "--in-h", str(height),
-            "--out-w", str(out_w), "--out-h", str(out_h),
-            "--frames", str(frames), "--strength", str(args.edge_guard_strength)]
+def post_command(args, settings, width, height, out_w, out_h, frames):
+    """Fused final-stage processor: sharpening + vertical ringing guard.
+
+    Returns ``None`` when neither effect needs its own stage -- fixed
+    sharpening without a guard keeps living in the encoder's cas filter.
+    """
+    guard = args.edge_guard_strength > 0
+    sharpen_process = settings["sharpen"] > 0 and (
+        settings["sharpen_mode"] == "adaptive" or guard)
+    if not sharpen_process and not guard:
+        return None
+    command = [PY, POST, "--width", str(out_w), "--height", str(out_h),
+               "--frames", str(frames),
+               "--sharpen-mode", settings["sharpen_mode"] if sharpen_process else "off"]
+    if sharpen_process:
+        if settings["sharpen_mode"] == "adaptive":
+            command.extend(("--static", str(settings["static"]),
+                            "--motion", str(settings["motion"])))
+        else:
+            command.extend(("--static", str(settings["sharpen"]),
+                            "--motion", str(settings["sharpen"])))
+    if guard:
+        command.extend(("--guard-strength", str(args.edge_guard_strength),
+                        "--video", args.video, "--ffmpeg", FFMPEG,
+                        "--in-w", str(width), "--in-h", str(height)))
+    return command
 
 
 def terminate_all(processes):
@@ -265,28 +285,14 @@ def run_stream(args, settings, environment, driver_environment, width, height, o
             video_stream.close()
             video_stream = mfsr.stdout
             processes.append(mfsr)
-        stream_sharpen = (settings["sharpen_mode"] == "adaptive" or
-                          (settings["sharpen_mode"] == "fixed" and args.edge_guard_strength > 0))
-        if stream_sharpen and settings["sharpen"] > 0:
-            static = settings["sharpen"] if settings["sharpen_mode"] == "fixed" else settings["static"]
-            motion = settings["sharpen"] if settings["sharpen_mode"] == "fixed" else settings["motion"]
-            sharpen_command = [PY, SHARPEN, "--width", str(out_w), "--height", str(out_h),
-                               "--frames", str(frames), "--static", str(static),
-                               "--motion", str(motion)]
-            print(f"[run_xess] $ {command_text(sharpen_command)}")
-            sharpener = subprocess.Popen(sharpen_command, stdin=video_stream,
-                                         stdout=subprocess.PIPE, env=environment)
+        post_args = post_command(args, settings, width, height, out_w, out_h, frames)
+        if post_args is not None:
+            print(f"[run_xess] $ {command_text(post_args)}")
+            post = subprocess.Popen(post_args, stdin=video_stream,
+                                    stdout=subprocess.PIPE, env=environment)
             video_stream.close()
-            video_stream = sharpener.stdout
-            processes.append(sharpener)
-        if args.edge_guard_strength > 0:
-            guard_command = edge_guard_command(args, width, height, out_w, out_h, frames)
-            print(f"[run_xess] $ {command_text(guard_command)}")
-            guard = subprocess.Popen(guard_command, stdin=video_stream,
-                                     stdout=subprocess.PIPE, env=environment)
-            video_stream.close()
-            video_stream = guard.stdout
-            processes.append(guard)
+            video_stream = post.stdout
+            processes.append(post)
         encode_command = encoder_command(args, settings, out_w, out_h, fps, frames, partial)
         print(f"[run_xess] $ {command_text(encode_command)}")
         encoder = subprocess.Popen(encode_command, stdin=video_stream, env=environment)
@@ -355,25 +361,11 @@ def run_file(args, settings, environment, driver_environment, workspace, width, 
     try:
         with open(out_raw, "rb") as source:
             video_stream = source
-            stream_sharpen = (settings["sharpen_mode"] == "adaptive" or
-                              (settings["sharpen_mode"] == "fixed" and args.edge_guard_strength > 0))
-            if stream_sharpen and settings["sharpen"] > 0:
-                static = settings["sharpen"] if settings["sharpen_mode"] == "fixed" else settings["static"]
-                motion = settings["sharpen"] if settings["sharpen_mode"] == "fixed" else settings["motion"]
-                command = [PY, SHARPEN, "--width", str(out_w), "--height", str(out_h),
-                           "--frames", str(frames), "--static", str(static), "--motion", str(motion)]
+            command = post_command(args, settings, width, height, out_w, out_h, frames)
+            if command is not None:
                 print(f"[run_xess] $ {command_text(command)}")
                 process = subprocess.Popen(command, stdin=video_stream, stdout=subprocess.PIPE,
                                            env=environment)
-                video_stream = process.stdout
-                processes.append(process)
-            if args.edge_guard_strength > 0:
-                command = edge_guard_command(args, width, height, out_w, out_h, frames)
-                print(f"[run_xess] $ {command_text(command)}")
-                process = subprocess.Popen(command, stdin=video_stream, stdout=subprocess.PIPE,
-                                           env=environment)
-                if video_stream is not source:
-                    video_stream.close()
                 video_stream = process.stdout
                 processes.append(process)
             command = encoder_command(args, settings, out_w, out_h, fps, frames, partial)
@@ -442,7 +434,7 @@ def main():
     args = parser.parse_args()
 
     for path, label in ((PY, "Python"), (FFMPEG, "ffmpeg.exe"), (XESS, "xess-vsr.exe"),
-                        (FLOW, "flow.py"), (PREPARE, "prepare_sr.py")):
+                        (FLOW, "flow.py"), (PREPARE, "prepare_sr.py"), (POST, "sr_postprocess.py")):
         if not path or not os.path.isfile(path):
             die(f"missing {label}: {path}")
     if not os.path.isfile(args.video):
@@ -465,8 +457,6 @@ def main():
         die(f"missing five_frame_fusion.py: {FUSION}")
     if args.five_frame_mfsr and not os.path.isfile(MFSR):
         die(f"missing five_frame_mfsr.py: {MFSR}")
-    if args.edge_guard_strength > 0 and not os.path.isfile(EDGE_GUARD):
-        die(f"missing edge_ringing_guard.py: {EDGE_GUARD}")
     if not 8 <= args.chunk_frames <= 600:
         die("--chunk-frames must be in 8..600")
 

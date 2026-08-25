@@ -324,7 +324,7 @@ def main():
         if trim_start < 0 or output_frames <= 0 or trim_start + output_frames > raw_output_frames:
             die("invalid pipeline raw output slice")
         if fg_settings["sharpen_mode"] == "adaptive" and fg_settings["sharpen"] > 0:
-            sharpen_command = [sr.PY, sr.SHARPEN, "--width", str(out_w), "--height", str(out_h),
+            sharpen_command = [sr.PY, fg.SHARPEN, "--width", str(out_w), "--height", str(out_h),
                                "--frames", str(raw_output_frames), "--static", str(fg_settings["static"]),
                                "--motion", str(fg_settings["motion"])]
             print(f"[pipeline] $ {command_text(sharpen_command)}")
