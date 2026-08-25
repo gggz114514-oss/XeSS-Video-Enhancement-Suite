@@ -202,7 +202,7 @@ XeSS 画质档位数字越高，输入采样比例越高、通常越慢。`自�
 ```
 [timing] component=prepare-sr {"analyze_total_s": .., "decoder_read_s": ..}
 [timing] component=xess-vsr {"xess_execute_gpu_s": .., "gpu_fence_wait_s": ..}
-[timing] component=edge_guard {"encoder_write_wait_s": ..}
+[timing] component=sr-post {"upstream_read_s": .., "sharpen_s": ..}
 [timing] component=run-xess {"total_s": ..}
 ```
 
@@ -210,15 +210,19 @@ XeSS 画质档位数字越高，输入采样比例越高、通常越慢。`自�
   `packet_write` 打包、`worker_read_wait` 等 SR worker 消费。
 - `xess-vsr`：纹理上传/XeSS 执行同时给 CPU 墙钟和 D3D12 GPU timestamp 两套数字，
   外加 `gpu_fence_wait`、回读和 stdout 写出耗时。
-- `sr-post`：锐化与振铃保护合并后的单遍历后处理，含 `sharpen`、
-  `guard_guide`（向导帧分析，后台线程预取）、`guard_blend` 与上游等待。
+- `sr-post`：锐化与振铃保护合并后的最终后处理，含 `upstream_read`、
+  `sharpen`、`guard_blend` 与上游等待/向导帧后台解码（不再输出旧链的
+  `guard_guide_s` 字段）。
 - `run-xess`：整条管线端到端总时长。
 
-计时只多输出一行日志，不改任何处理逻辑；不加开关的普通运行零额外开销。
+计时默认关闭：无额外线程/拷贝/日志，只有极小函数调用开销。
 
-SR 关键路径已做流水化：xess-vsr.exe 内部上传/执行/回读三帧并行，
-锐化与振铃保护合并为单进程单遍历。300 帧 1080p→1440p 基准从 83.0s
-降到 64.0s（B580 实测，A770 待真机验证），输出与旧链逐字节一致。
+SR 关键路径已做流水化：xess-vsr.exe 内部为多帧在途、CPU/GPU 阶段重叠的
+3 槽流水线（上传/执行/回读/写出），后处理与上游解码重叠；锐化与振铃保护
+合并为单进程（内部仍含多个 OpenCV/NumPy pass，消除了中间 raw 往返）。
+同轮日志基准 300 帧 1080p→1440p：78.814s → 63.977s（约 18.8%，B580 实测）。
+更早的 83.0s → 64.0s（约 23%）来自历史基线，非同轮严格 A/B，仅作参考。
+A770 未实测。
 
 ## 建议的调参顺序
 

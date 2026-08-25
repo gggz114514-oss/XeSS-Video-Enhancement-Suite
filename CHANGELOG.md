@@ -2,13 +2,26 @@
 
 ## Unreleased
 
-- Pipelined the SR critical path: xess-vsr.exe now runs a three-frame
-  upload/execute/readback pipeline with per-slot fences (frame order and GPU
-  results unchanged), and the former adaptive-sharpen + edge-ringing-guard
-  process pair is fused into a single-pass `sr_postprocess.py` stage with a
-  prefetch thread for the guard's guide analysis.  The 300-frame
-  1080p→1440p fast-preset benchmark drops from 83.0s to 64.0s (23%) on B580
-  with byte-identical output (A770 待真机验证).
+- Pipelined the SR critical path: xess-vsr.exe now runs a three-slot
+  upload/execute/readback pipeline (multiple frames in flight, CPU/GPU stage
+  overlap) with per-slot fences (frame order and GPU results unchanged), and
+  the former adaptive-sharpen + edge-ringing-guard process pair is fused into
+  a single-process `sr_postprocess.py` stage with a prefetch thread for the
+  guard's guide analysis.  Same-round benchmark on 300 frames 1080p→1440p
+  fast preset: 78.814s → 63.977s (≈18.8%) on B580, byte-identical output.
+  The older 83.0s → 64.0s (≈23%) figures come from an earlier session and are
+  not a same-round A/B (A770 未实测).
+- xess-vsr.exe now drains in-flight GPU work before tearing down: the last
+  submitted fence is awaited with a bounded timeout on every exit path
+  (early input end, downstream close, write failure), with a `[drain]`
+  summary line; the unreachable writeDoneSem was removed.
+- SR postprocess guide-producer thread exits via a stop event and is joined
+  on shutdown; ffmpeg decoder stderr tails are reported on failure.
+- Direct `prepare_sr.py --engine sea-raft --bidirectional` calls are forced
+  to one-way Fast DIS with a one-time notice (expert `--engine dis
+  --bidirectional` is unchanged).
+- CI runs the dependency-light unit tests (numpy + opencv-python-headless;
+  a minimal torch stub replaces a real torch install for import checks).
 - Added opt-in per-stage timing for the SR pipeline: `--stage-timing` on
   `run_xess.py` (or `XESS_STAGE_TIMING=1`) makes every Python component print
   one machine-readable `[timing] component=<name> {...}` line to stderr, and
