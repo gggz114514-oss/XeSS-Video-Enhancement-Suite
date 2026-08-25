@@ -8,12 +8,31 @@ import io
 import os
 import pathlib
 import sys
+import types
 import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, os.fspath(ROOT))
 sys.path.insert(0, os.fspath(ROOT / "pipeline"))
+
+
+def _install_torch_stub_if_needed() -> None:
+    """Let the dependency-light CI run import xess_nodes without torch.
+
+    xess_nodes only touches torch inside function bodies; a minimal symbol
+    module is enough to satisfy the top-level import.
+    """
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        torch_stub = types.ModuleType("torch")
+        torch_stub.Tensor = type("Tensor", (), {})
+        torch_stub.is_tensor = lambda value: False
+        sys.modules["torch"] = torch_stub
+
+
+_install_torch_stub_if_needed()
 
 import xess_nodes  # noqa: E402
 import run_fg  # noqa: E402
@@ -108,6 +127,7 @@ class DriverFlowCompatTests(unittest.TestCase):
         self.assertIn("SEA-RAFT has been retired", stdout.getvalue())
 
     def test_prepare_engine_choice_maps_to_dis_once(self) -> None:
+        prepare_common._MIGRATION_PRINTED = False
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             resolved = prepare_common.resolve_engine("sea-raft")
@@ -115,6 +135,21 @@ class DriverFlowCompatTests(unittest.TestCase):
         self.assertIn("Fast DIS", stderr.getvalue())
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(prepare_common.resolve_engine("sea-raft"), "dis")
+
+    def test_prepare_legacy_engine_forces_bidirectional_off(self) -> None:
+        prepare_common._MIGRATION_PRINTED = False
+        args = argparse.Namespace(engine="sea-raft", bidirectional=True)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            prepare_common.normalize_legacy_engine(args)
+        self.assertEqual((args.engine, args.bidirectional), ("dis", False))
+        self.assertIn("forced off", stderr.getvalue())
+        # Expert native DIS keeps explicit bidirectional.
+        expert = argparse.Namespace(engine="dis", bidirectional=True)
+        prepare_common._MIGRATION_PRINTED = False
+        with contextlib.redirect_stderr(io.StringIO()):
+            prepare_common.normalize_legacy_engine(expert)
+        self.assertEqual((expert.engine, expert.bidirectional), ("dis", True))
 
 
 if __name__ == "__main__":
