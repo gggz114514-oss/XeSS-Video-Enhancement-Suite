@@ -29,6 +29,7 @@
 #include <dxgi1_4.h>
 #include <fcntl.h>
 #include <io.h>
+#include <intrin.h>
 
 #include "xess/xess.h"
 #include "xess/xess_d3d12.h"
@@ -89,6 +90,78 @@ static uint32_t crc32_bytes(const uint8_t* data, size_t size) {
         crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
     return ~crc;
 }
+
+// ---- SIMD 转换（运行时检测，AVX2 不可用时自动走标量）----
+static bool g_avx2 = false;
+static bool g_f16c = false;  // 仅探测记录用；FP16 路径保持标量（见下方说明）
+
+static void detect_cpu_features() {
+    int info[4] = {};
+    __cpuid(info, 0);
+    if (info[0] >= 7) {
+        __cpuidex(info, 7, 0);
+        g_avx2 = (info[1] & (1u << 5)) != 0;
+    }
+    __cpuid(info, 1);
+    const bool osxsave = (info[2] & (1u << 27)) != 0;
+    const bool avx = (info[2] & (1u << 28)) != 0;
+    g_f16c = (info[2] & (1u << 29)) != 0;
+    if (!osxsave || !avx || (_xgetbv(0) & 0x6) != 0x6)
+        g_avx2 = g_f16c = false;
+}
+
+// RGB24 -> RGBA8（alpha=255）。对有限 RGB 输入与标量路径逐字节一致。
+// 4 像素一组（12B→16B），128 位 lane 正好一组，避免跨 lane 错位；
+// SIMD 循环保证 16B 读取不越过 bufferEnd。
+static void convert_rgb24_to_rgba8(const uint8_t* src, uint8_t* dst, int count,
+                                   const uint8_t* bufferEnd) {
+    const __m128i alpha = _mm_set1_epi32(0xFF000000);
+    const __m128i mask = _mm_setr_epi8(0, 1, 2, -1, 3, 4, 5, -1,
+                                       6, 7, 8, -1, 9, 10, 11, -1);
+    int x = 0;
+    if (g_avx2) {
+        for (; x + 4 <= count && src + (size_t)x * 3 + 16 <= bufferEnd; x += 4) {
+            __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + (size_t)x * 3));
+            v = _mm_shuffle_epi8(v, mask);
+            v = _mm_or_si128(v, alpha);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + (size_t)x * 4), v);
+        }
+    }
+    for (; x < count; x++) {
+        dst[x * 4 + 0] = src[x * 3 + 0];
+        dst[x * 4 + 1] = src[x * 3 + 1];
+        dst[x * 4 + 2] = src[x * 3 + 2];
+        dst[x * 4 + 3] = 255;
+    }
+}
+
+// RGBA8 -> RGB24。4 像素一组压缩打包：前 8B 由 storel_epi64（像素 0/1），
+// 后 4B 由 extract dword2（像素 2/3）落位，无越界无改写污染。
+static void convert_rgba8_to_rgb24(const uint8_t* src, uint8_t* dst, int count) {
+    const __m128i mask = _mm_setr_epi8(0, 1, 2, 4, 5, 6, 8, 9, 10,
+                                       12, 13, 14, -1, -1, -1, -1);
+    int x = 0;
+    if (g_avx2) {
+        for (; x + 4 <= count; x += 4) {
+            __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + (size_t)x * 4));
+            v = _mm_shuffle_epi8(v, mask);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + (size_t)x * 3), v);
+            *reinterpret_cast<uint32_t*>(dst + (size_t)x * 3 + 8) =
+                (uint32_t)_mm_extract_epi32(v, 2);
+        }
+    }
+    for (; x < count; x++) {
+        dst[x * 3 + 0] = src[x * 4 + 0];
+        dst[x * 3 + 1] = src[x * 4 + 1];
+        dst[x * 3 + 2] = src[x * 4 + 2];
+    }
+}
+
+// 注意：FP32->FP16 不做 F16C 批量替换。经逐位扫描，旧标量 f32_to_f16 在
+// “half mantissa LSB=1 且 remainder>halfway”时丢失进位（恒向下舍入），
+// 与 IEEE RNE（numpy/F16C 硬件，约一半上舍入场景相差 1 ULP）。按质量门禁
+// 规则，硬件舍入与旧实现不一致时不得直接替换默认；差异已记录，待后续
+// 视频/质量评估后另行决定。
 
 static bool read_exact(FILE* file, void* destination, size_t bytes) {
     uint8_t* output = static_cast<uint8_t*>(destination);
@@ -611,6 +684,7 @@ static void fill_upload(D3D12Ctx& c, D3D12Ctx::Slot& slot, const uint8_t* rgb,
     velocityScratch.resize((size_t)velocityW * velocityH * 2);
     uint16_t* velocity = velocityScratch.data();
     if (a.lowResMv) {
+        // FP16 保持旧标量逐位一致（F16C 硬件舍入差异见上方说明）。
         for (size_t i = 0; i < (size_t)a.inW * a.inH * 2; ++i)
             velocity[i] = f32_to_f16(velLow[i]);
     } else {
@@ -619,15 +693,10 @@ static void fill_upload(D3D12Ctx& c, D3D12Ctx::Slot& slot, const uint8_t* rgb,
 
     uint8_t* upPtr = slot.uploadPtr;
     uint8_t* colorDst = upPtr;
+    const uint8_t* rgbEnd = rgb + (size_t)a.inH * a.inW * 3;
     for (int y = 0; y < a.inH; y++) {
-        const uint8_t* src = rgb + (size_t)y * a.inW * 3;
-        uint8_t* dst = colorDst + (size_t)y * c.colorPitch;
-        for (int x = 0; x < a.inW; x++) {
-            dst[x * 4 + 0] = src[x * 3 + 0];
-            dst[x * 4 + 1] = src[x * 3 + 1];
-            dst[x * 4 + 2] = src[x * 3 + 2];
-            dst[x * 4 + 3] = 255;
-        }
+        convert_rgb24_to_rgba8(rgb + (size_t)y * a.inW * 3,
+                               colorDst + (size_t)y * c.colorPitch, a.inW, rgbEnd);
     }
     uint8_t* velDst = upPtr + c.velOffset;
     for (int y = 0; y < velocityH; y++)
@@ -760,8 +829,10 @@ static bool record_and_submit(D3D12Ctx& c, D3D12Ctx::Slot& slot,
     return true;
 }
 
-// 写出侧：等本帧 GPU 完成（含回读拷贝），RGBA->RGB 逐行落盘。
-static bool write_frame(D3D12Ctx& c, D3D12Ctx::Slot& slot, FILE* outFp, const CmdArgs& a) {
+// 写出侧：等本帧 GPU 完成（含回读拷贝），RGBA->RGB 打包进预分配的
+// frameBuf 后单次落盘（保留 row-pitch 处理；行缓冲即 frameBuf 的分段）。
+static bool write_frame(D3D12Ctx& c, D3D12Ctx::Slot& slot, FILE* outFp, const CmdArgs& a,
+                        std::vector<uint8_t>& frameBuf) {
     const bool timing = g_timing.enabled;
     const double tFence = timing ? g_timing.now() : 0.0;
     if (!c.wait_fence(slot.lastFence)) return false;
@@ -781,18 +852,16 @@ static bool write_frame(D3D12Ctx& c, D3D12Ctx::Slot& slot, FILE* outFp, const Cm
     }
 
     const uint8_t* src = slot.readbackPtr;
-    std::vector<uint8_t> rowBuf((size_t)a.outW * 3);
+    uint8_t* dst = frameBuf.data();
+    const size_t rowBytes = (size_t)a.outW * 3;
     const double tWrite = timing ? g_timing.now() : 0.0;
     for (int y = 0; y < a.outH; y++) {
-        const uint8_t* row = src + (size_t)y * c.readPitch;
-        for (int x = 0; x < a.outW; x++) {          // RGBA -> RGB，跳过 alpha
-            rowBuf[x * 3 + 0] = row[x * 4 + 0];
-            rowBuf[x * 3 + 1] = row[x * 4 + 1];
-            rowBuf[x * 3 + 2] = row[x * 4 + 2];
-        }
-        if (fwrite(rowBuf.data(), 3, (size_t)a.outW, outFp) != (size_t)a.outW)
-            return false;
+        convert_rgba8_to_rgb24(src + (size_t)y * c.readPitch,
+                               dst + (size_t)y * rowBytes, a.outW);
     }
+    if (fwrite(frameBuf.data(), 1, rowBytes * (size_t)a.outH, outFp) !=
+        rowBytes * (size_t)a.outH)
+        return false;
     if (timing) {
         g_timing.stdoutWrite += g_timing.now() - tWrite;
         g_timing.frames++;
@@ -866,82 +935,108 @@ struct StreamFrame {
     uint32_t flags = 0;
 };
 
+// 每帧复用的临时缓冲（管道路径），热路径不再逐帧分配 packet/payload。
+struct StreamScratch {
+    std::vector<uint8_t> buf;  // [XSPK 头 48B][color][motion][depth][mask]
+};
+
 // Returns 1 for a frame, 0 for EOS, and -1 for invalid/truncated input.
+// ring 路径零拷贝：peek 拿槽位视图，直接校验/CRC/按字段拷进 frame，再
+// commit 释放槽位；管道路径读进复用的 StreamScratch 缓冲，同样省去
+// packet+payload 两段临时容器。
 static int read_stream_frame(FILE* input, XessSharedRingReader* ring,
-                             const CmdArgs& a, int expectedIndex, StreamFrame& frame) {
-    std::vector<uint8_t> packet;
+                             const CmdArgs& a, int expectedIndex,
+                             StreamFrame& frame, StreamScratch& scratch) {
     StreamHeader header{};
+    const uint8_t* payload = nullptr;
+    uint64_t total64 = 0;
     if (ring) {
-        if (!ring->read(packet) || packet.size() < sizeof(header)) {
+        XessSharedRingReader::SlotView view;
+        if (!ring->peek(view)) {
             fprintf(stderr, "[shm] missing packet at frame %d\n", expectedIndex);
             return -1;
         }
-        memcpy(&header, packet.data(), sizeof(header));
-    } else if (!read_exact(input, &header, sizeof(header))) {
-        fprintf(stderr, "[stream] truncated header at frame %d\n", expectedIndex);
-        return -1;
+        if (view.size < sizeof(header)) {
+            fprintf(stderr, "[shm] undersized packet at frame %d\n", expectedIndex);
+            ring->abort();
+            return -1;
+        }
+        memcpy(&header, view.data, sizeof(header));
+        payload = view.data + sizeof(header);
+        total64 = (uint64_t)view.size - sizeof(header);
+    } else {
+        if (!read_exact(input, &header, sizeof(header))) {
+            fprintf(stderr, "[stream] truncated header at frame %d\n", expectedIndex);
+            return -1;
+        }
+        total64 = (uint64_t)header.colorBytes + header.motionBytes +
+                  header.depthBytes + header.maskBytes;
+        if (total64 > 512ull * 1024 * 1024) {
+            fprintf(stderr, "[stream] metadata mismatch at frame %d\n", expectedIndex);
+            return -1;
+        }
+        if (scratch.buf.size() < (size_t)total64)
+            scratch.buf.resize((size_t)total64);
+        if (!read_exact(input, scratch.buf.data(), (size_t)total64)) {
+            fprintf(stderr, "[stream] truncated payload at frame %d\n", expectedIndex);
+            return -1;
+        }
+        payload = scratch.buf.data();  // 仅负载区（不含协议头），与 CRC 语义一致
     }
     if (memcmp(header.magic, "XSPK", 4) || header.version != 1 ||
         header.headerSize != sizeof(StreamHeader)) {
         fprintf(stderr, "[stream] invalid protocol header at frame %d\n", expectedIndex);
+        if (ring) ring->abort();
         return -1;
     }
     if (header.flags & STREAM_FLAG_EOS) {
         if (header.frameIndex != (uint32_t)expectedIndex || header.colorBytes ||
             header.motionBytes || header.depthBytes || header.maskBytes) {
             fprintf(stderr, "[stream] malformed EOS packet\n");
+            if (ring) ring->abort();
             return -1;
         }
+        if (ring) ring->commit();
         return 0;
     }
-    const uint64_t total64 = (uint64_t)header.colorBytes + header.motionBytes +
-                             header.depthBytes + header.maskBytes;
+    const size_t pixels = (size_t)a.inW * a.inH;
     if (total64 > 512ull * 1024 * 1024 || header.frameIndex != (uint32_t)expectedIndex ||
         header.width != (uint32_t)a.inW || header.height != (uint32_t)a.inH ||
         header.pixelFormat != 1) {
         fprintf(stderr, "[stream] metadata mismatch at frame %d\n", expectedIndex);
+        if (ring) ring->abort();
         return -1;
     }
-    const size_t pixels = (size_t)a.inW * a.inH;
     if (header.colorBytes != pixels * 3 || header.motionBytes != pixels * 2 * sizeof(float) ||
         (header.depthBytes && header.depthBytes != pixels * sizeof(float)) ||
         (header.maskBytes && header.maskBytes != pixels) ||
         (a.lowResMv && header.depthBytes != pixels * sizeof(float)) ||
         (a.responsiveMask && header.maskBytes != pixels)) {
         fprintf(stderr, "[stream] payload sizes mismatch at frame %d\n", expectedIndex);
+        if (ring) ring->abort();
         return -1;
     }
-    std::vector<uint8_t> payload((size_t)total64);
-    if (ring) {
-        if (packet.size() != sizeof(header) + payload.size()) {
-            fprintf(stderr, "[shm] packet length mismatch at frame %d\n", expectedIndex);
-            return -1;
-        }
-        memcpy(payload.data(), packet.data() + sizeof(header), payload.size());
-    } else if (!read_exact(input, payload.data(), payload.size())) {
-        fprintf(stderr, "[stream] truncated payload at frame %d\n", expectedIndex);
-        return -1;
-    }
-    if (crc32_bytes(payload.data(), payload.size()) != header.checksum) {
+    if (crc32_bytes(payload, (size_t)total64) != header.checksum) {
         fprintf(stderr, "[stream] checksum mismatch at frame %d\n", expectedIndex);
+        if (ring) ring->abort();
         return -1;
     }
     size_t offset = 0;
-    frame.color.assign(payload.begin(), payload.begin() + header.colorBytes);
+    frame.color.assign(payload + offset, payload + offset + header.colorBytes);
     offset += header.colorBytes;
     frame.motion.resize(pixels * 2);
-    memcpy(frame.motion.data(), payload.data() + offset, header.motionBytes);
+    memcpy(frame.motion.data(), payload + offset, header.motionBytes);
     offset += header.motionBytes;
-    frame.depth.clear();
     if (header.depthBytes) {
-        frame.depth.resize(pixels);
-        memcpy(frame.depth.data(), payload.data() + offset, header.depthBytes);
+        if (frame.depth.size() != pixels) frame.depth.resize(pixels);
+        memcpy(frame.depth.data(), payload + offset, header.depthBytes);
+    } else {
+        frame.depth.clear();
     }
     offset += header.depthBytes;
-    frame.mask.clear();
-    if (header.maskBytes)
-        frame.mask.assign(payload.begin() + offset, payload.begin() + offset + header.maskBytes);
+    frame.mask.assign(payload + offset, payload + offset + header.maskBytes);
     frame.flags = header.flags;
+    if (ring) ring->commit();
     return 1;
 }
 
@@ -954,6 +1049,9 @@ int main(int argc, char** argv) {
                         "[--mv-path highres|lowres-depth] [--depth DIR] [--mask DIR] [--stage-timing]\n");
         return 2;
     }
+    detect_cpu_features();
+    if (g_avx2 || g_f16c)
+        fprintf(stderr, "[cpu] avx2=%d f16c=%d\n", g_avx2 ? 1 : 0, g_f16c ? 1 : 0);
     if (!a.stageTiming) {
         const char* envTiming = getenv("XESS_STAGE_TIMING");
         if (envTiming && *envTiming && _stricmp(envTiming, "0") &&
@@ -1099,7 +1197,9 @@ int main(int argc, char** argv) {
     char path[1024];
     bool complete = true;
     StreamFrame streamFrame;
+    StreamScratch streamScratch;
     std::vector<uint16_t> velocityScratch;
+    std::vector<uint8_t> outputBuf((size_t)a.outW * a.outH * 3);  // 预分配，循环复用
 
     // 3 槽流水线主循环：
     //   生产段 —— 取输入 -> CPU 填上传缓冲 -> 录制并提交 GPU（不等完成）
@@ -1124,17 +1224,19 @@ int main(int argc, char** argv) {
             const double tInput = g_timing.enabled ? g_timing.now() : 0.0;
             bool reset = resetHistory[(size_t)i] != 0;
             if (a.stream) {
-                const int streamResult = read_stream_frame(rawIn, sharedRingPtr, a, i, streamFrame);
+                const int streamResult = read_stream_frame(rawIn, sharedRingPtr, a, i,
+                                                           streamFrame, streamScratch);
                 if (streamResult != 1) {
                     fprintf(stderr, "[stream] expected frame %d, got %s\n", i,
                             streamResult == 0 ? "early EOS" : "invalid input");
                     complete = false;
                     break;
                 }
-                rgb = streamFrame.color;
-                velLow = streamFrame.motion;
-                if (a.lowResMv) depthLow = streamFrame.depth;
-                if (a.responsiveMask) maskLow = streamFrame.mask;
+                // 交换容器所有权，零拷贝把帧数据移交给上游缓冲。
+                rgb.swap(streamFrame.color);
+                velLow.swap(streamFrame.motion);
+                if (a.lowResMv) depthLow.swap(streamFrame.depth);
+                if (a.responsiveMask) maskLow.swap(streamFrame.mask);
                 reset = (streamFrame.flags & (STREAM_FLAG_RESET | STREAM_FLAG_SCENE_CUT)) != 0;
             } else {
                 if (!read_exact(rawIn, rgb.data(), rgb.size())) {
@@ -1191,7 +1293,7 @@ int main(int argc, char** argv) {
 
         const int i = written;
         D3D12Ctx::Slot& slot = d3d.slots[i % PIPE_DEPTH];
-        if (!write_frame(d3d, slot, outFp, a)) {
+        if (!write_frame(d3d, slot, outFp, a, outputBuf)) {
             fprintf(stderr, "[io] write failed at frame %d\n", i);
             complete = false;
             break;
@@ -1202,7 +1304,8 @@ int main(int argc, char** argv) {
     }
 
     if (complete && a.stream) {
-        const int eosResult = read_stream_frame(rawIn, sharedRingPtr, a, a.framesCount, streamFrame);
+        const int eosResult = read_stream_frame(rawIn, sharedRingPtr, a, a.framesCount,
+                                                streamFrame, streamScratch);
         if (eosResult != 0) {
             fprintf(stderr, "[stream] missing EOS or extra frame\n");
             complete = false;

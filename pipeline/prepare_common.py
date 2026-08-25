@@ -15,14 +15,22 @@ from pathlib import Path
 
 import numpy as np
 import cv2
+import zlib
 
 from motion_core import DepthEstimator, DisFlow, FrameAnalyzer, write_debug
 from shm_ring import RingWriter
 from stage_timer import StageTimer
-from stream_protocol import Flags, FramePacket, eos, encode, write_packet
+from stream_protocol import (Flags, FramePacket, MAGIC, VERSION, PIXEL_RGB24,
+                             HEADER as PACKET_HEADER, eos, encode, write_packet)
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _part_size(part) -> int:
+    """Byte size of a payload section (bytes or C-contiguous numpy array)."""
+    size = getattr(part, "nbytes", None)
+    return size if size is not None else len(part)
 
 _MIGRATION_NOTICE = ("[prepare] SEA-RAFT has been retired from the mainline; "
                      "this job runs on native Fast DIS instead")
@@ -216,31 +224,44 @@ def run_preparer(args: argparse.Namespace) -> None:
             result.flow[..., 0] = np.clip(result.flow[..., 0], -args.in_w, args.in_w)
             result.flow[..., 1] = np.clip(result.flow[..., 1], -args.in_h, args.in_h)
             with timer.span("packet_encode"):
-                color_bytes = np.ascontiguousarray(entry.rgb, dtype=np.uint8).tobytes()
-                flow_bytes = np.ascontiguousarray(result.flow, dtype=np.float32).tobytes()
+                color = np.ascontiguousarray(entry.rgb, dtype=np.uint8)
+                flow = np.ascontiguousarray(result.flow, dtype=np.float32)
                 output_depth = result.depth
                 if output_depth is None and args.kind == "fg":
                     output_depth = np.full((args.in_h, args.in_w), 0.5, np.float32)
-                depth_bytes = (np.ascontiguousarray(output_depth, dtype=np.float32).tobytes()
-                               if output_depth is not None else b"")
+                depth = (np.ascontiguousarray(output_depth, dtype=np.float32)
+                         if output_depth is not None else b"")
                 if overlay_mask is not None and args.kind == "fg":
-                    mask_bytes = np.ascontiguousarray(overlay_mask, dtype=np.uint8).tobytes()
+                    mask = np.ascontiguousarray(overlay_mask, dtype=np.uint8)
                 else:
-                    mask_bytes = (np.clip(result.mask * 255.0, 0, 255).astype(np.uint8).tobytes()
-                                  if result.mask is not None else b"")
-                packet = FramePacket(index=entry.index, width=args.in_w,
-                                     height=args.in_h, flags=entry.flags,
-                                     color=color_bytes, motion=flow_bytes,
-                                     depth=depth_bytes, mask=mask_bytes)
+                    mask = (np.clip(result.mask * 255.0, 0, 255).astype(np.uint8)
+                            if result.mask is not None else b"")
+                # 直接构造协议头：CRC 按 color/motion/depth/mask 分块增量计算，
+                # 各段以缓冲区直写 transport，整帧不再拼成一个大 bytes。
+                parts = [color, flow, depth, mask]
+                sizes = [_part_size(part) for part in parts]
+                crc = 0
+                for part in parts:
+                    crc = zlib.crc32(part, crc)
+                header = PACKET_HEADER.pack(
+                    MAGIC, VERSION, PACKET_HEADER.size, entry.index,
+                    args.in_w, args.in_h, PIXEL_RGB24, int(entry.flags),
+                    sizes[0], sizes[1], sizes[2], sizes[3], crc & 0xFFFFFFFF)
             if output is not None:
                 # write_packet minus the CRC/encode pass so the blocking
                 # transport portion (worker_read_wait) stays separable.
                 with timer.span("transport_write"):
-                    data = encode(packet)
-                    output.write(data)
-                    output.flush()
+                    if isinstance(output, RingWriter):
+                        output.write_parts(header, parts)
+                    else:
+                        output.write(header)
+                        for part in parts:
+                            output.write(part)
+                        output.flush()
             else:
-                emit_file(args, entry.index, flow_bytes, depth_bytes, mask_bytes)
+                emit_file(args, entry.index, flow.tobytes(),
+                          depth.tobytes() if depth is not b"" else b"",
+                          mask.tobytes() if mask is not b"" else b"")
             if args.debug_dir:
                 write_debug(args.debug_dir, entry.index, result)
 

@@ -111,6 +111,69 @@ public:
         }
     }
 
+    // 零拷贝读取：返回下一个槽位内数据视图（含 XSPK 协议头），不推进
+    // readSequence。消费方直接按字段拷完后调用 commit() 释放槽位；
+    // 校验失败时调用 abort() 标记 error，让生产者尽快感知。
+    struct SlotView {
+        const uint8_t* data = nullptr;  // 槽内数据起点（含 XSPK 协议头）
+        uint32_t size = 0;              // 槽内数据总字节数
+    };
+
+    bool peek(SlotView& view, DWORD timeoutMs = 30000) {
+        if (!header_) return false;
+        LARGE_INTEGER freq{}, started{}, ready{};
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&started);
+        const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+        for (;;) {
+            const LONG64 writeSequence =
+                InterlockedCompareExchange64(&header_->writeSequence, 0, 0);
+            const LONG64 readSequence =
+                InterlockedCompareExchange64(&header_->readSequence, 0, 0);
+            if (readSequence < writeSequence) {
+                QueryPerformanceCounter(&ready);
+                waitSeconds += (double)(ready.QuadPart - started.QuadPart) / (double)freq.QuadPart;
+                const uint32_t slot = static_cast<uint32_t>(readSequence % slots_);
+                const uint8_t* base = view_ + sizeof(XessSharedRingHeader) +
+                    static_cast<size_t>(slot) * (sizeof(XessSharedSlotHeader) + slotSize_);
+                const auto* slotHeader = reinterpret_cast<const XessSharedSlotHeader*>(base);
+                const uint32_t size = slotHeader->packetSize;
+                if (!size || size > slotSize_) {
+                    fprintf(stderr, "[shm] invalid packet size %u\n", size);
+                    InterlockedExchange(&header_->error, 1);
+                    return false;
+                }
+                view.data = base + sizeof(XessSharedSlotHeader);
+                view.size = size;
+                return true;
+            }
+            const ULONGLONG now = GetTickCount64();
+            if (now >= deadline) {
+                fprintf(stderr, "[shm] timed out waiting for a packet\n");
+                return false;
+            }
+            const DWORD remaining = static_cast<DWORD>(std::min<ULONGLONG>(deadline - now, timeoutMs));
+            const DWORD result = WaitForSingleObject(dataEvent_, remaining);
+            if (result == WAIT_FAILED) return report("WaitForSingleObject(data)");
+            if (result == WAIT_TIMEOUT && GetTickCount64() >= deadline) {
+                fprintf(stderr, "[shm] timed out waiting for a packet\n");
+                return false;
+            }
+        }
+    }
+
+    void commit() {
+        const LONG64 readSequence =
+            InterlockedCompareExchange64(&header_->readSequence, 0, 0);
+        MemoryBarrier();  // 槽位数据全部消费完，生产者才允许覆写
+        InterlockedExchange64(&header_->readSequence, readSequence + 1);
+        if (!SetEvent(spaceEvent_)) report("SetEvent(space)");
+    }
+
+    void abort() {
+        InterlockedExchange(&header_->error, 1);
+    }
+
     void close() {
         header_ = nullptr;
         if (view_) { UnmapViewOfFile(view_); view_ = nullptr; }
