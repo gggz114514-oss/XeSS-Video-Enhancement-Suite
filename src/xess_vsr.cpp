@@ -314,6 +314,9 @@ struct CmdArgs {
     const char* shmName = nullptr;
     uint32_t shmSlots = 0;
     uint32_t shmSlotSize = 0;
+    const char* outShmName = nullptr;
+    uint32_t outShmSlots = 0;
+    uint32_t outShmSlotSize = 0;
     bool stageTiming = false;
 };
 
@@ -345,6 +348,13 @@ static bool parse_args(int argc, char** argv, CmdArgs& a) {
         else if (!strcmp(k, "--shm-slot-size")) {
             const char* v = next(k); if (!v) return false; a.shmSlotSize = (uint32_t)strtoul(v, nullptr, 10);
         }
+        else if (!strcmp(k, "--out-shm-name")) { a.outShmName = next(k); a.stream = true; }
+        else if (!strcmp(k, "--out-shm-slots")) {
+            const char* v = next(k); if (!v) return false; a.outShmSlots = (uint32_t)strtoul(v, nullptr, 10);
+        }
+        else if (!strcmp(k, "--out-shm-slot-size")) {
+            const char* v = next(k); if (!v) return false; a.outShmSlotSize = (uint32_t)strtoul(v, nullptr, 10);
+        }
         else if (!strcmp(k, "--responsive-max")) {
             const char* v = next(k); if (!v) return false; a.responsiveMax = (float)atof(v);
         }
@@ -372,7 +382,9 @@ static bool parse_args(int argc, char** argv, CmdArgs& a) {
     const bool io = a.stream || (a.framesRaw && a.mvDir && a.outRaw);
     const bool depthOk = !a.lowResMv || a.stream || a.depthDir;
     const bool shmOk = !a.shmName || (a.shmSlots >= 2 && a.shmSlotSize >= sizeof(StreamHeader));
-    return dimensions && io && depthOk && shmOk &&
+    const bool outShmOk = !a.outShmName ||
+        (a.outShmSlots >= 2 && a.outShmSlotSize >= (uint32_t)a.outW * a.outH * 3);
+    return dimensions && io && depthOk && shmOk && outShmOk &&
            a.responsiveMax >= 0.0f && a.responsiveMax <= 1.0f;
 }
 
@@ -830,8 +842,9 @@ static bool record_and_submit(D3D12Ctx& c, D3D12Ctx::Slot& slot,
 }
 
 // 写出侧：等本帧 GPU 完成（含回读拷贝），RGBA->RGB 打包进预分配的
-// frameBuf 后单次落盘（保留 row-pitch 处理；行缓冲即 frameBuf 的分段）。
-static bool write_frame(D3D12Ctx& c, D3D12Ctx::Slot& slot, FILE* outFp, const CmdArgs& a,
+// frameBuf 后单次写出（共享 ring 或 stdout；保留 row-pitch 处理）。
+static bool write_frame(D3D12Ctx& c, D3D12Ctx::Slot& slot, FILE* outFp,
+                        XessSharedRingWriter* outRing, const CmdArgs& a,
                         std::vector<uint8_t>& frameBuf) {
     const bool timing = g_timing.enabled;
     const double tFence = timing ? g_timing.now() : 0.0;
@@ -859,9 +872,14 @@ static bool write_frame(D3D12Ctx& c, D3D12Ctx::Slot& slot, FILE* outFp, const Cm
         convert_rgba8_to_rgb24(src + (size_t)y * c.readPitch,
                                dst + (size_t)y * rowBytes, a.outW);
     }
-    if (fwrite(frameBuf.data(), 1, rowBytes * (size_t)a.outH, outFp) !=
-        rowBytes * (size_t)a.outH)
-        return false;
+    const size_t frameBytes = rowBytes * (size_t)a.outH;
+    bool written = false;
+    if (outRing) {
+        written = outRing->write(frameBuf.data(), (uint32_t)frameBytes);
+    } else {
+        written = fwrite(frameBuf.data(), 1, frameBytes, outFp) == frameBytes;
+    }
+    if (!written) return false;
     if (timing) {
         g_timing.stdoutWrite += g_timing.now() - tWrite;
         g_timing.frames++;
@@ -1172,6 +1190,16 @@ int main(int argc, char** argv) {
         }
         sharedRingPtr = &sharedRing;
     }
+    XessSharedRingWriter outRing;
+    XessSharedRingWriter* outRingPtr = nullptr;
+    if (a.outShmName) {
+        if (!outRing.open(a.outShmName, a.outShmSlots, a.outShmSlotSize)) {
+            if (!a.stream) { fclose(outFp); fclose(rawIn); }
+            xessDestroyContext(ctx);
+            return 1;
+        }
+        outRingPtr = &outRing;
+    }
 
     std::vector<uint8_t> rgb((size_t)a.inW * a.inH * 3);
     std::vector<float> velLow((size_t)a.inW * a.inH * 2);
@@ -1293,7 +1321,7 @@ int main(int argc, char** argv) {
 
         const int i = written;
         D3D12Ctx::Slot& slot = d3d.slots[i % PIPE_DEPTH];
-        if (!write_frame(d3d, slot, outFp, a, outputBuf)) {
+        if (!write_frame(d3d, slot, outFp, outRingPtr, a, outputBuf)) {
             fprintf(stderr, "[io] write failed at frame %d\n", i);
             complete = false;
             break;
@@ -1340,14 +1368,16 @@ int main(int argc, char** argv) {
                 "\"texture_upload_cpu_s\": %.3f, \"texture_upload_gpu_s\": %.3f, "
                 "\"xess_execute_cpu_s\": %.3f, \"xess_execute_gpu_s\": %.3f, "
                 "\"gpu_fence_wait_s\": %.3f, \"readback_copy_gpu_s\": %.3f, "
-                "\"readback_wait_s\": %.4f, \"stdout_write_s\": %.3f}\n",
+                "\"readback_wait_s\": %.4f, \"stdout_write_s\": %.3f, "
+                "\"out_ring_wait_s\": %.3f}\n",
                 g_timing.frames,
                 g_timing.inputRead,
                 sharedRingPtr ? sharedRingPtr->waitSeconds : 0.0,
                 g_timing.textureUpload, g_timing.textureUploadGpu,
                 g_timing.xessExecuteCpu, g_timing.xessExecuteGpu,
                 g_timing.gpuFenceWait, g_timing.readbackCopyGpu,
-                g_timing.readbackWait, g_timing.stdoutWrite);
+                g_timing.readbackWait, g_timing.stdoutWrite,
+                outRingPtr ? outRingPtr->waitSeconds : 0.0);
     }
     fprintf(stderr, "[xess] %s\n", complete ? "complete" : "failed");
     return complete ? 0 : 1;

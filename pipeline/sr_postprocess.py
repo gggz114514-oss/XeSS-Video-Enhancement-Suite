@@ -26,6 +26,7 @@ import threading
 import cv2
 import numpy as np
 
+from shm_ring import RingReader
 from stage_timer import StageTimer
 
 
@@ -193,6 +194,9 @@ def main() -> None:
     parser.add_argument("--ffmpeg", default="")
     parser.add_argument("--in-w", type=int, default=0)
     parser.add_argument("--in-h", type=int, default=0)
+    parser.add_argument("--shm-name", default="", help="read frames from a shared ring instead of stdin")
+    parser.add_argument("--shm-slots", type=int, default=0)
+    parser.add_argument("--shm-slot-size", type=int, default=0)
     args = parser.parse_args()
     if args.width <= 0 or args.height <= 0 or args.frames <= 0:
         raise SystemExit("[post] invalid dimensions/frame count")
@@ -283,10 +287,21 @@ def main() -> None:
         return gb
 
     try:
+        ring_reader = RingReader(args.shm_name, args.shm_slots, args.shm_slot_size) \
+            if args.shm_name else None
+    except Exception as exc:
+        raise SystemExit(f"[post] cannot open shared ring: {exc}")
+    try:
         for index in range(args.frames):
             with timer.span("upstream_read"):
-                if not read_exact(sys.stdin.buffer, frame_bytes, inbuf):
-                    raise SystemExit(f"[post] input ended at frame {index}")
+                if ring_reader is not None:
+                    inbuf = ring_reader.read()
+                    if len(inbuf) != frame_bytes:
+                        raise SystemExit(f"[post] ring frame {index} has {len(inbuf)} bytes, "
+                                         f"expected {frame_bytes}")
+                else:
+                    if not read_exact(sys.stdin.buffer, frame_bytes, inbuf):
+                        raise SystemExit(f"[post] input ended at frame {index}")
                 frame_u8 = np.frombuffer(inbuf, np.uint8).reshape(
                     args.height, args.width, 3)
             if guard:
@@ -335,6 +350,8 @@ def main() -> None:
             producer.join(timeout=5)
         if decoder is not None:
             decoder.stdout.close()
+        if ring_reader is not None:
+            ring_reader.close()
     timer.report("sr-post")
 
 

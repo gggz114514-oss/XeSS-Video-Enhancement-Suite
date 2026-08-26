@@ -207,6 +207,81 @@ class RingWriter:
         self.close()
 
 
+class RingReader:
+    """Consumer side of the shared ring (mirror of the C++ reader).
+
+    ``read()`` returns the full slot payload as bytes and advances the ring.
+    Used by downstream components (e.g. sr_postprocess) that consume raw
+    per-frame buffers written by a C++ writer.
+    """
+
+    def __init__(self, name: str, slots: int, slot_size: int, timeout_seconds: float = 30.0):
+        self.name = name
+        self.slots = slots
+        self.slot_size = slot_size
+        self.timeout_ms = max(1, int(timeout_seconds * 1000))
+        self.wait_seconds = 0.0
+        self._api = _windows_api()
+        self.mapping = mmap.mmap(-1, _mapping_size(slots, slot_size), tagname=name,
+                                 access=mmap.ACCESS_WRITE)
+        values = HEADER.unpack_from(self.mapping, 0)
+        if values[:4] != (MAGIC, VERSION, slots, slot_size):
+            self.mapping.close()
+            raise SharedRingError(f"shared ring header mismatch: {values[:4]}")
+        rights = EVENT_MODIFY_STATE | SYNCHRONIZE
+        self.data_event = self._api.OpenEventW(rights, False, _event_name(name, "data"))
+        self.space_event = self._api.OpenEventW(rights, False, _event_name(name, "space"))
+        if not self.data_event or not self.space_event:
+            self.close()
+            raise SharedRingError(f"OpenEventW failed: {ctypes.get_last_error()}")
+
+    def read(self) -> bytes:
+        deadline = time.monotonic() + self.timeout_ms / 1000.0
+        while True:
+            write_sequence, read_sequence = self._sequences()
+            if read_sequence < write_sequence:
+                slot = read_sequence % self.slots
+                offset = HEADER.size + slot * (SLOT_HEADER.size + self.slot_size)
+                (packet_size,) = SLOT_HEADER.unpack_from(self.mapping, offset)
+                if not packet_size or packet_size > self.slot_size:
+                    raise SharedRingError(f"invalid packet size {packet_size}")
+                payload = bytes(self.mapping[offset + SLOT_HEADER.size:
+                                             offset + SLOT_HEADER.size + packet_size])
+                struct.pack_into("<Q", self.mapping, 24, read_sequence + 1)
+                if not self._api.SetEvent(self.space_event):
+                    raise SharedRingError(f"SetEvent(space) failed: {ctypes.get_last_error()}")
+                return payload
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SharedRingError(f"timed out waiting for a packet (frames lagging)")
+            waited_from = time.perf_counter()
+            result = self._api.WaitForSingleObject(
+                self.data_event, min(self.timeout_ms, int(remaining * 1000)))
+            self.wait_seconds += time.perf_counter() - waited_from
+            if result not in (WAIT_OBJECT_0, WAIT_TIMEOUT):
+                raise SharedRingError(f"WaitForSingleObject(data) failed: {result}")
+
+    def close(self) -> None:
+        mapping = getattr(self, "mapping", None)
+        if mapping is not None:
+            try:
+                mapping.close()
+            finally:
+                self.mapping = None
+        api = getattr(self, "_api", None)
+        for attribute in ("data_event", "space_event"):
+            handle = getattr(self, attribute, None)
+            if api and handle:
+                api.CloseHandle(handle)
+                setattr(self, attribute, None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
 def packet_slot_size(width: int, height: int, *, depth: bool, mask: bool) -> int:
     from stream_protocol import HEADER as PACKET_HEADER
     pixels = width * height
