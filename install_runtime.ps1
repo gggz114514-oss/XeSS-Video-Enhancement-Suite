@@ -28,6 +28,23 @@ function Assert-InRuntimeRoot([string]$Path) {
     }
 }
 
+function Get-Sha256([string]$Path) {
+    # Get-FileHash lives in Microsoft.PowerShell.Utility, whose module search
+    # path can be replaced by oneAPI/portable ComfyUI launch environments.
+    # The .NET implementation is available in every supported PowerShell and
+    # does not depend on module auto-loading.
+    $Stream = [System.IO.File]::OpenRead($Path)
+    $Hasher = $null
+    try {
+        $Hasher = [System.Security.Cryptography.SHA256]::Create()
+        $Bytes = $Hasher.ComputeHash($Stream)
+        return ([System.BitConverter]::ToString($Bytes)).Replace("-", "").ToLowerInvariant()
+    } finally {
+        if ($null -ne $Hasher) { $Hasher.Dispose() }
+        $Stream.Dispose()
+    }
+}
+
 function Test-Runtime([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
     foreach ($Relative in $Manifest.required_files) {
@@ -45,7 +62,7 @@ function Test-Runtime([string]$Path) {
     foreach ($Property in $Manifest.file_hashes.PSObject.Properties) {
         $File = Join-Path $Path ($Property.Name -replace '/', '\')
         if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { return $false }
-        if ((Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash.ToLowerInvariant() -ne
+        if ((Get-Sha256 $File) -ne
             ([string]$Property.Value).ToLowerInvariant()) { return $false }
     }
     return $true
@@ -123,7 +140,7 @@ try {
             throw "Runtime asset not found: $Archive"
         }
     }
-    $ActualHash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    $ActualHash = Get-Sha256 $Archive
     if ($ActualHash -ne ([string]$Manifest.sha256).ToLowerInvariant()) {
         throw "Runtime SHA256 mismatch: expected $($Manifest.sha256), got $ActualHash"
     }

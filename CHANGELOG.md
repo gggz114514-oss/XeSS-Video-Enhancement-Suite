@@ -6,6 +6,8 @@
   payloads by type instead of relying on Python object identity.
 - Fixed runtime status/validation after installation by Windows PowerShell 5,
   whose UTF-8 state files include a byte-order mark.
+- Made runtime SHA256 verification independent of `Get-FileHash`, which can
+  disappear when portable ComfyUI/oneAPI environments replace `PSModulePath`.
 - Fixed the Runtime r2 asset builder to allow-list production depth models;
   the retired SEA-RAFT checkpoint is no longer shipped in new archives.
 
