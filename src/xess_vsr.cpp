@@ -249,23 +249,130 @@ static uint16_t f32_to_f16(float f) {
 
 // 双线性放大运动矢量：输入 inWxInH float32 [fx,fy] -> 输出 outWxOutH float16
 // （HIGH_RES_MV：单位是输出分辨率像素/帧，所以采样值要乘 out/in 缩放）
+// 中部区域 AVX2 8 像素一组，边缘行/列与残余列标量；AVX2 逐 lane 复刻标量
+// 运算序列（无 FMA、cvttps 截断、相同加减/乘除顺序），输出逐位一致。
 static void upsample_velocity(const float* in, uint16_t* out,
                               int inW, int inH, int outW, int outH,
                               bool nearest) {
     const float sx = (float)inW / outW;
     const float sy = (float)inH / outH;
-    for (int oy = 0; oy < outH; oy++) {
-        if (nearest) {
-            const int iy = std::min(inH - 1, std::max(0, (int)((oy + 0.5f) * sy)));
-            for (int ox = 0; ox < outW; ox++) {
-                const int ix = std::min(inW - 1, std::max(0, (int)((ox + 0.5f) * sx)));
-                const float* v = in + ((size_t)iy * inW + ix) * 2;
-                uint16_t* o = out + ((size_t)oy * outW + ox) * 2;
-                o[0] = f32_to_f16(v[0] * (float)outW / inW);
-                o[1] = f32_to_f16(v[1] * (float)outH / inH);
-            }
-            continue;
+    auto pixel_scalar = [&](int oy, int ox) {
+        const int iy = std::min(inH - 1, std::max(0, (int)((oy + 0.5f) * sy)));
+        const int ix = std::min(inW - 1, std::max(0, (int)((ox + 0.5f) * sx)));
+        const float* v = in + ((size_t)iy * inW + ix) * 2;
+        uint16_t* o = out + ((size_t)oy * outW + ox) * 2;
+        o[0] = f32_to_f16(v[0] * (float)outW / inW);
+        o[1] = f32_to_f16(v[1] * (float)outH / inH);
+    };
+    if (nearest) {
+        for (int oy = 0; oy < outH; oy++) {
+            for (int ox = 0; ox < outW; ox++)
+                pixel_scalar(oy, ox);
         }
+        return;
+    }
+    if (g_avx2) {
+        const float outWf = (float)outW, inWf = (float)inW;
+        const float outHf = (float)outH, inHf = (float)inH;
+        auto scalar_px = [&](int oy, int ox) {
+            float fy = (oy + 0.5f) * sy - 0.5f;
+            int y0 = (int)fy;
+            float wy = fy - y0;
+            if (y0 < 0) { y0 = 0; wy = 0; }
+            int y1 = y0 + 1;
+            if (y1 >= inH) { y1 = inH - 1; wy = 0; }
+            float fx = (ox + 0.5f) * sx - 0.5f;
+            int x0 = (int)fx;
+            float wx = fx - x0;
+            if (x0 < 0) { x0 = 0; wx = 0; }
+            int x1 = x0 + 1;
+            if (x1 >= inW) { x1 = inW - 1; wx = 0; }
+            const float* a = in + ((size_t)y0 * inW + x0) * 2;
+            const float* b = in + ((size_t)y0 * inW + x1) * 2;
+            const float* c = in + ((size_t)y1 * inW + x0) * 2;
+            const float* d = in + ((size_t)y1 * inW + x1) * 2;
+            float vx = (a[0] * (1 - wx) + b[0] * wx) * (1 - wy) + (c[0] * (1 - wx) + d[0] * wx) * wy;
+            float vy = (a[1] * (1 - wx) + b[1] * wx) * (1 - wy) + (c[1] * (1 - wx) + d[1] * wx) * wy;
+            uint16_t* o = out + ((size_t)oy * outW + ox) * 2;
+            o[0] = f32_to_f16(vx * outWf / inWf);
+            o[1] = f32_to_f16(vy * outHf / inHf);
+        };
+        const __m256 sxv = _mm256_set1_ps(sx);
+        const __m256 half = _mm256_set1_ps(0.5f);
+        const __m256 p05 = _mm256_set1_ps(0.5f);
+        const __m256 one = _mm256_set1_ps(1.0f);
+        const __m256 outWv = _mm256_set1_ps(outWf);
+        const __m256 inWv = _mm256_set1_ps(inWf);
+        const __m256 outHv = _mm256_set1_ps(outHf);
+        const __m256 inHv = _mm256_set1_ps(inHf);
+        const bool downsample = sx >= 1.0f || sy >= 1.0f;
+        for (int oy = 0; oy < outH; oy++) {
+            float fy = (oy + 0.5f) * sy - 0.5f;
+            int y0 = (int)fy;
+            float wy = fy - y0;
+            if (y0 < 0 || y0 + 1 >= inH || downsample) {
+                for (int ox = 0; ox < outW; ox++) scalar_px(oy, ox);
+                continue;
+            }
+            const float iwy = 1.0f - wy;
+            const __m256 iwyv = _mm256_set1_ps(iwy);
+            const __m256 wyv = _mm256_set1_ps(wy);
+            const float* row0 = in + (size_t)y0 * inW * 2;
+            const float* row1 = in + (size_t)(y0 + 1) * inW * 2;
+            // 首列标量（x0 可能为负的边缘列）
+            scalar_px(oy, 0);
+            int ox = 1;
+            const int oxEnd = outW - 1;
+            for (; ox + 8 <= oxEnd; ox += 8) {
+                __m128i oxlo = _mm_set_epi32(ox + 3, ox + 2, ox + 1, ox);
+                __m128i oxhi = _mm_set_epi32(ox + 7, ox + 6, ox + 5, ox + 4);
+                __m256 oxf = _mm256_castps128_ps256(_mm_cvtepi32_ps(oxlo));
+                oxf = _mm256_insertf128_ps(oxf, _mm_cvtepi32_ps(oxhi), 1);
+                __m256 fx = _mm256_sub_ps(_mm256_mul_ps(_mm256_add_ps(oxf, half), sxv), p05);
+                __m256i x0v = _mm256_cvttps_epi32(fx);
+                __m256 x0f = _mm256_cvtepi32_ps(x0v);
+                __m256 wx = _mm256_sub_ps(fx, x0f);
+                __m256 iwx = _mm256_sub_ps(one, wx);
+                __m256i i0 = _mm256_slli_epi32(x0v, 1);
+                __m256i i0p = _mm256_add_epi32(i0, _mm256_set1_epi32(2));
+                __m256 a0 = _mm256_i32gather_ps(row0, i0, 4);
+                __m256 a1 = _mm256_i32gather_ps(row0, i0p, 4);
+                __m256 c0 = _mm256_i32gather_ps(row1, i0, 4);
+                __m256 c1 = _mm256_i32gather_ps(row1, i0p, 4);
+                __m256 b0 = _mm256_i32gather_ps(row0 + 1, i0, 4);
+                __m256 b1 = _mm256_i32gather_ps(row0 + 1, i0p, 4);
+                __m256 d0 = _mm256_i32gather_ps(row1 + 1, i0, 4);
+                __m256 d1 = _mm256_i32gather_ps(row1 + 1, i0p, 4);
+                __m256 t1 = _mm256_mul_ps(a0, iwx);
+                t1 = _mm256_add_ps(t1, _mm256_mul_ps(a1, wx));
+                t1 = _mm256_mul_ps(t1, iwyv);
+                __m256 t2 = _mm256_mul_ps(c0, iwx);
+                t2 = _mm256_add_ps(t2, _mm256_mul_ps(c1, wx));
+                t2 = _mm256_mul_ps(t2, wyv);
+                __m256 vx = _mm256_add_ps(t1, t2);
+                vx = _mm256_div_ps(_mm256_mul_ps(vx, outWv), inWv);
+                __m256 t3 = _mm256_mul_ps(b0, iwx);
+                t3 = _mm256_add_ps(t3, _mm256_mul_ps(b1, wx));
+                t3 = _mm256_mul_ps(t3, iwyv);
+                __m256 t4 = _mm256_mul_ps(d0, iwx);
+                t4 = _mm256_add_ps(t4, _mm256_mul_ps(d1, wx));
+                t4 = _mm256_mul_ps(t4, wyv);
+                __m256 vy = _mm256_add_ps(t3, t4);
+                vy = _mm256_div_ps(_mm256_mul_ps(vy, outHv), inHv);
+                float fxv[8], fyv[8];
+                _mm256_storeu_ps(fxv, vx);
+                _mm256_storeu_ps(fyv, vy);
+                uint16_t* o = out + ((size_t)oy * outW + ox) * 2;
+                for (int lane = 0; lane < 8; lane++) {
+                    o[lane * 2 + 0] = f32_to_f16(fxv[lane]);
+                    o[lane * 2 + 1] = f32_to_f16(fyv[lane]);
+                }
+            }
+            for (; ox <= oxEnd; ox++) scalar_px(oy, ox);
+        }
+        return;
+    }
+    for (int oy = 0; oy < outH; oy++) {
         float fy = (oy + 0.5f) * sy - 0.5f;
         int y0 = (int)fy;
         float wy = fy - y0;
