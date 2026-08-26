@@ -157,11 +157,60 @@ static void convert_rgba8_to_rgb24(const uint8_t* src, uint8_t* dst, int count) 
     }
 }
 
-// 注意：FP32->FP16 不做 F16C 批量替换。经逐位扫描，旧标量 f32_to_f16 在
-// “half mantissa LSB=1 且 remainder>halfway”时丢失进位（恒向下舍入），
-// 与 IEEE RNE（numpy/F16C 硬件，约一半上舍入场景相差 1 ULP）。按质量门禁
-// 规则，硬件舍入与旧实现不一致时不得直接替换默认；差异已记录，待后续
-// 视频/质量评估后另行决定。
+// 注意：旧的标量 f32_to_f16 在 kept-LSB=1 且 rem>halfway 时丢进位(恒向下舍),
+// 与 IEEE RNE 相差 1 ULP(约 25% 取值)。默认保留旧行为保证逐位一致;
+// --f16-rne / --f16-hw 提供正确 RNE 实验变体(rne=标量修正版, hw=F16C 硬件,
+// 两者在有限值域逐位一致)。
+
+// float32 -> float16（IEEE 754 舍入到最近偶数，正确进位版）
+static uint16_t f32_to_f16_rne(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    if (((x >> 23) & 0xFF) == 0xFF)  // inf/nan
+        return (uint16_t)(sign | 0x7C00u | (mant ? 0x200u : 0));
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00u);
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half = mant >> shift;
+        uint32_t rem = mant & ((1u << shift) - 1);
+        uint32_t halfway = 1u << (shift - 1);
+        if (rem > halfway || (rem == halfway && (half & 1))) half++;
+        return (uint16_t)(sign | half);
+    }
+    uint32_t h = (uint32_t)exp << 10;
+    uint32_t rem = mant & 0x1FFFu;
+    uint32_t kept = mant >> 13;
+    if (rem > 0x1000u || (rem == 0x1000u && (kept & 1))) {
+        kept++;
+        if (kept == 0x400u) {
+            kept = 0;
+            h += 0x400u;
+        }
+        if (h == 0x7C00u) return (uint16_t)(sign | 0x7C00u);
+    }
+    return (uint16_t)(sign | h | kept);
+}
+
+// F16C 硬件转换（批量时用 cvtps2ph;标量逐值对照用 __m128 单值）
+static uint16_t f32_to_f16_hw_scalar(float f) {
+    __m128 v = _mm_set_ss(f);
+    __m128i h = _mm_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+    return (uint16_t)_mm_cvtsi128_si32(h);
+}
+
+static bool g_f16_rne = false;   // 实验:正确 RNE 标量
+static bool g_f16_hw = false;    // 实验:F16C 硬件(仅当 g_f16c)
+static uint16_t f32_to_f16(float f);  // 定义在后面;默认路径
+static uint16_t f16_convert(float f) {
+    if (g_f16_hw && g_f16c) return f32_to_f16_hw_scalar(f);
+    if (g_f16_rne) return f32_to_f16_rne(f);
+    return f32_to_f16(f);
+}
 
 static bool read_exact(FILE* file, void* destination, size_t bytes) {
     uint8_t* output = static_cast<uint8_t*>(destination);
@@ -218,7 +267,7 @@ struct StageTiming {
 static StageTiming g_timing;
 
 
-// float32 -> float16（IEEE 754 舍入到最近偶数）
+// float32 -> float16（旧标量:保留逐位一致默认行为）
 static uint16_t f32_to_f16(float f) {
     uint32_t x;
     memcpy(&x, &f, 4);
@@ -261,8 +310,8 @@ static void upsample_velocity(const float* in, uint16_t* out,
         const int ix = std::min(inW - 1, std::max(0, (int)((ox + 0.5f) * sx)));
         const float* v = in + ((size_t)iy * inW + ix) * 2;
         uint16_t* o = out + ((size_t)oy * outW + ox) * 2;
-        o[0] = f32_to_f16(v[0] * (float)outW / inW);
-        o[1] = f32_to_f16(v[1] * (float)outH / inH);
+        o[0] = f16_convert(v[0] * (float)outW / inW);
+        o[1] = f16_convert(v[1] * (float)outH / inH);
     };
     if (nearest) {
         for (int oy = 0; oy < outH; oy++) {
@@ -294,8 +343,8 @@ static void upsample_velocity(const float* in, uint16_t* out,
             float vx = (a[0] * (1 - wx) + b[0] * wx) * (1 - wy) + (c[0] * (1 - wx) + d[0] * wx) * wy;
             float vy = (a[1] * (1 - wx) + b[1] * wx) * (1 - wy) + (c[1] * (1 - wx) + d[1] * wx) * wy;
             uint16_t* o = out + ((size_t)oy * outW + ox) * 2;
-            o[0] = f32_to_f16(vx * outWf / inWf);
-            o[1] = f32_to_f16(vy * outHf / inHf);
+            o[0] = f16_convert(vx * outWf / inWf);
+            o[1] = f16_convert(vy * outHf / inHf);
         };
         const __m256 sxv = _mm256_set1_ps(sx);
         const __m256 half = _mm256_set1_ps(0.5f);
@@ -364,8 +413,8 @@ static void upsample_velocity(const float* in, uint16_t* out,
                 _mm256_storeu_ps(fyv, vy);
                 uint16_t* o = out + ((size_t)oy * outW + ox) * 2;
                 for (int lane = 0; lane < 8; lane++) {
-                    o[lane * 2 + 0] = f32_to_f16(fxv[lane]);
-                    o[lane * 2 + 1] = f32_to_f16(fyv[lane]);
+                    o[lane * 2 + 0] = f16_convert(fxv[lane]);
+                    o[lane * 2 + 1] = f16_convert(fyv[lane]);
                 }
             }
             for (; ox <= oxEnd; ox++) scalar_px(oy, ox);
@@ -393,8 +442,8 @@ static void upsample_velocity(const float* in, uint16_t* out,
             float vx = (a[0] * (1 - wx) + b[0] * wx) * (1 - wy) + (c[0] * (1 - wx) + d[0] * wx) * wy;
             float vy = (a[1] * (1 - wx) + b[1] * wx) * (1 - wy) + (c[1] * (1 - wx) + d[1] * wx) * wy;
             uint16_t* o = out + ((size_t)oy * outW + ox) * 2;
-            o[0] = f32_to_f16(vx * (float)outW / inW);
-            o[1] = f32_to_f16(vy * (float)outH / inH);
+            o[0] = f16_convert(vx * (float)outW / inW);
+            o[1] = f16_convert(vy * (float)outH / inH);
         }
     }
 }
@@ -481,6 +530,8 @@ static bool parse_args(int argc, char** argv, CmdArgs& a) {
         }
         else if (!strcmp(k, "--reset-frames")) { a.resetFrames = next(k); }
         else if (!strcmp(k, "--stage-timing")) { a.stageTiming = true; }
+        else if (!strcmp(k, "--f16-rne")) { g_f16_rne = true; }
+        else if (!strcmp(k, "--f16-hw")) { g_f16_hw = true; g_f16_rne = true; }
         else if (!strcmp(k, "--dump")) { a.dumpDir = next(k); }        else if (!strcmp(k, "--dbg-upload")) { a.dbgUpload = next(k); }
         else { fprintf(stderr, "[args] 未知参数 %s\n", k); return false; }
         if (!k) return false;
@@ -805,7 +856,7 @@ static void fill_upload(D3D12Ctx& c, D3D12Ctx::Slot& slot, const uint8_t* rgb,
     if (a.lowResMv) {
         // FP16 保持旧标量逐位一致（F16C 硬件舍入差异见上方说明）。
         for (size_t i = 0; i < (size_t)a.inW * a.inH * 2; ++i)
-            velocity[i] = f32_to_f16(velLow[i]);
+            velocity[i] = f16_convert(velLow[i]);
     } else {
         upsample_velocity(velLow, velocity, a.inW, a.inH, a.outW, a.outH, a.nearestMv);
     }
