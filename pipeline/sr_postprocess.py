@@ -197,6 +197,8 @@ def main() -> None:
     parser.add_argument("--shm-name", default="", help="read frames from a shared ring instead of stdin")
     parser.add_argument("--shm-slots", type=int, default=0)
     parser.add_argument("--shm-slot-size", type=int, default=0)
+    parser.add_argument("--threads", type=int, default=1,
+                        help="frames processed concurrently (order preserved; default 1 = r2 path)")
     args = parser.parse_args()
     if args.width <= 0 or args.height <= 0 or args.frames <= 0:
         raise SystemExit("[post] invalid dimensions/frame count")
@@ -230,61 +232,93 @@ def main() -> None:
     frame_bytes = args.width * args.height * 3
     source_bytes = args.in_w * args.in_h * 3
     timer = StageTimer()
-    buf = _SharpenBuffers(args.height, args.width)
+    threads = max(1, args.threads)
+    worker_ctx = [_SharpenBuffers(args.height, args.width) for _ in range(threads)]
+    worker_guides = [_GuideBuffers(args.height, args.width) for _ in range(threads)]
+    worker_timers = [StageTimer() for _ in range(threads)]
     inbuf = bytearray(frame_bytes)
+    frame_pool = [bytearray(frame_bytes) for _ in range(threads + 2)]
+    source_pool = [bytearray(source_bytes) for _ in range(threads + 2)]
+
+    def process_frame(worker_id: int, frame_buf: bytearray, source_buf=None):
+        """sharpen + guard blend in one pass; returns (out_bytes, source_buf)."""
+        buf = worker_ctx[worker_id]
+        gb = worker_guides[worker_id]
+        wt = worker_timers[worker_id]
+        frame_u8 = np.frombuffer(frame_buf, np.uint8).reshape(
+            args.height, args.width, 3)
+        with wt.span("sharpen"):
+            if args.sharpen_mode == "off":
+                np.copyto(buf.sharp_u8, frame_u8)
+            else:
+                sharpen_frame(buf, frame_u8, args.sharpen_mode,
+                              args.static, args.motion)
+        with wt.span("guard_blend"):
+            if guard:
+                source = np.frombuffer(source_buf, np.uint8).reshape(
+                    args.in_h, args.in_w, 3)
+                compute_blend(gb, source, args.width, args.height,
+                              args.guard_strength)
+                blend, inv_blend = gb.blend, gb.inv_blend
+                result = buf.result
+                np.copyto(result, buf.sharp_u8, casting="unsafe")
+                np.multiply(result, inv_blend[:, :, None], out=result)
+                np.multiply(gb.guide_f, blend[:, :, None], out=buf.guide_scaled)
+                np.add(result, buf.guide_scaled, out=result)
+                np.clip(result, 0.0, 255.0, out=result)
+                np.copyto(buf.out_u8, result, casting="unsafe")
+            else:
+                np.copyto(buf.out_u8, buf.sharp_u8)
+        return bytes(buf.out_u8.data), source_buf
 
     guide_pool = queue.Queue()
-    guide_ready = queue.Queue(maxsize=2)
+    guide_ready = queue.Queue(maxsize=max(2, threads + 1))
     producer = None
     stop_event = threading.Event()
+    source_pool = queue.Queue()
+    source_ready = queue.Queue(maxsize=threads + 2)
     if guard:
-        for _ in range(3):
-            guide_pool.put(_GuideBuffers(args.height, args.width))
-        sourcebuf = bytearray(source_bytes)
+        for _ in range(threads + 2):
+            source_pool.put(bytearray(source_bytes))
 
-        def ready_put(item) -> None:
-            """Bound guide_ready puts so a stopped consumer can never trap us."""
+        def ready_put_src(item) -> None:
+            """Bound source_ready puts so a stopped consumer can never trap us."""
             while not stop_event.is_set():
                 try:
-                    guide_ready.put(item, timeout=0.25)
+                    source_ready.put(item, timeout=0.25)
                     return
                 except queue.Full:
                     continue
 
-        def produce_guides() -> None:
+        def produce_sources() -> None:
             try:
+                # 只解码/读出原始向导帧,blend 计算交给并行 worker
                 for _ in range(args.frames):
-                    gb = None
-                    while gb is None and not stop_event.is_set():
+                    sbuf = None
+                    while sbuf is None and not stop_event.is_set():
                         try:
-                            gb = guide_pool.get(timeout=0.25)
+                            sbuf = source_pool.get(timeout=0.25)
                         except queue.Empty:
                             continue
                     if stop_event.is_set():
                         return
-                    if not read_exact(decoder.stdout, source_bytes, sourcebuf):
+                    if not read_exact(decoder.stdout, source_bytes, sbuf):
                         raise RuntimeError("source decoder ended early")
-                    source = np.frombuffer(sourcebuf, np.uint8).reshape(
-                        args.in_h, args.in_w, 3)
-                    compute_blend(gb, source, args.width, args.height,
-                                  args.guard_strength)
-                    ready_put(gb)
-                ready_put(None)
+                    ready_put_src(sbuf)
             except BaseException as exc:
-                # 传给主线程；队列满说明主线程已停止消费，直接结束。
                 try:
-                    guide_ready.put_nowait(exc)
+                    source_ready.put_nowait(exc)
                 except queue.Full:
                     pass
 
-        producer = threading.Thread(target=produce_guides, name="guide-producer")
+        producer = threading.Thread(target=produce_sources, name="source-producer")
         producer.start()
 
-    def next_guide():
-        gb = guide_ready.get()
-        if isinstance(gb, BaseException):
-            raise gb
-        return gb
+    def next_source():
+        sbuf = source_ready.get()
+        if isinstance(sbuf, BaseException):
+            raise sbuf
+        return sbuf
 
     try:
         ring_reader = RingReader(args.shm_name, args.shm_slots, args.shm_slot_size) \
@@ -292,42 +326,53 @@ def main() -> None:
     except Exception as exc:
         raise SystemExit(f"[post] cannot open shared ring: {exc}")
     try:
-        for index in range(args.frames):
-            with timer.span("upstream_read"):
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="post")
+        pending: dict[int, tuple] = {}   # index -> (future, frame_buf, source_buf)
+        next_out = 0
+        free_buffers = list(frame_pool)
+        with timer.span("upstream_read_total"):
+            for index in range(args.frames):
+                sbuf = next_source() if guard else None
+                with timer.span("upstream_read"):
+                    if ring_reader is not None:
+                        inbuf = ring_reader.read()
+                        if len(inbuf) != frame_bytes:
+                            raise SystemExit(f"[post] ring frame {index} has {len(inbuf)} bytes, "
+                                             f"expected {frame_bytes}")
+                    else:
+                        if not read_exact(sys.stdin.buffer, frame_bytes, inbuf):
+                            raise SystemExit(f"[post] input ended at frame {index}")
                 if ring_reader is not None:
-                    inbuf = ring_reader.read()
-                    if len(inbuf) != frame_bytes:
-                        raise SystemExit(f"[post] ring frame {index} has {len(inbuf)} bytes, "
-                                         f"expected {frame_bytes}")
+                    # ring 载荷本身是独立 bytes,直接交给 worker,无需再拷贝
+                    frame_buf = inbuf
                 else:
-                    if not read_exact(sys.stdin.buffer, frame_bytes, inbuf):
-                        raise SystemExit(f"[post] input ended at frame {index}")
-                frame_u8 = np.frombuffer(inbuf, np.uint8).reshape(
-                    args.height, args.width, 3)
-            if guard:
-                gb = next_guide()
-            with timer.span("sharpen"):
-                if args.sharpen_mode == "off":
-                    np.copyto(buf.sharp_u8, frame_u8)
-                else:
-                    sharpen_frame(buf, frame_u8, args.sharpen_mode,
-                                  args.static, args.motion)
-            with timer.span("guard_blend"):
+                    # 取空闲输入缓冲（worker 未消费完时按序排水）
+                    while not free_buffers:
+                        idx = next_out
+                        fut, used_buf, used_sbuf = pending.pop(idx)
+                        out_bytes, returned_sbuf = fut.result()
+                        sys.stdout.buffer.write(out_bytes)
+                        free_buffers.append(used_buf)
+                        next_out += 1
+                    frame_buf = free_buffers.pop()
+                    frame_buf[:] = inbuf
+                future = executor.submit(process_frame,
+                                         index % threads, frame_buf, sbuf)
                 if guard:
-                    blend, inv_blend = gb.blend, gb.inv_blend
-                    result = buf.result
-                    np.copyto(result, buf.sharp_u8, casting="unsafe")
-                    np.multiply(result, inv_blend[:, :, None], out=result)
-                    np.multiply(gb.guide_f, blend[:, :, None], out=buf.guide_scaled)
-                    np.add(result, buf.guide_scaled, out=result)
-                    np.clip(result, 0.0, 255.0, out=result)
-                    np.copyto(buf.out_u8, result, casting="unsafe")
-                    guide_pool.put(gb)
-                else:
-                    np.copyto(buf.out_u8, buf.sharp_u8)
-                sys.stdout.buffer.write(buf.out_u8.data)
-            if index and index % 60 == 0:
-                print(f"[post] {index}/{args.frames}", file=sys.stderr, flush=True)
+                    # worker 完成即归还源缓冲,保证 next_source() 不会因等待 drain 而饿死
+                    future.add_done_callback(
+                        lambda done: source_pool.put(done.result()[1]))
+                pending[index] = (future, frame_buf, sbuf)
+                if index and index % 60 == 0:
+                    print(f"[post] {index}/{args.frames}", file=sys.stderr, flush=True)
+        executor.shutdown(wait=True)
+        while next_out in pending:
+            idx = next_out
+            fut, used_buf, used_sbuf = pending.pop(idx)
+            out_bytes, returned_sbuf = fut.result()
+            sys.stdout.buffer.write(out_bytes)
+            next_out += 1
         sys.stdout.buffer.flush()
         if decoder is not None and decoder.wait() != 0:
             detail = f"\nffmpeg decoder stderr:\n{decoder_errors.summary()}" \
@@ -343,6 +388,7 @@ def main() -> None:
             if tail:
                 print(f"[post] ffmpeg decoder stderr:\n{tail}",
                       file=sys.stderr, flush=True)
+        executor.shutdown(wait=False, cancel_futures=True)
         raise
     finally:
         stop_event.set()
@@ -352,6 +398,11 @@ def main() -> None:
             decoder.stdout.close()
         if ring_reader is not None:
             ring_reader.close()
+    for wt in worker_timers:
+        for name, seconds in wt.totals.items():
+            timer.totals[name] = timer.totals.get(name, 0.0) + seconds
+        for name, calls in wt.counts.items():
+            timer.counts[name] = timer.counts.get(name, 0) + calls
     timer.report("sr-post")
 
 
