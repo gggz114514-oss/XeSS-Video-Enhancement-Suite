@@ -32,6 +32,13 @@ def _part_size(part) -> int:
     size = getattr(part, "nbytes", None)
     return size if size is not None else len(part)
 
+
+def _part_bytes(part) -> bytes:
+    """Return a payload section as bytes without relying on object identity."""
+    if isinstance(part, bytes):
+        return part
+    return memoryview(part).tobytes()
+
 _MIGRATION_NOTICE = ("[prepare] SEA-RAFT has been retired from the mainline; "
                      "this job runs on native Fast DIS instead")
 _MIGRATION_PRINTED = False
@@ -260,8 +267,7 @@ def run_preparer(args: argparse.Namespace) -> None:
                         output.flush()
             else:
                 emit_file(args, entry.index, flow.tobytes(),
-                          depth.tobytes() if depth is not b"" else b"",
-                          mask.tobytes() if mask is not b"" else b"")
+                          _part_bytes(depth), _part_bytes(mask))
             if args.debug_dir:
                 write_debug(args.debug_dir, entry.index, result)
 

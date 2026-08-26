@@ -102,13 +102,15 @@ xess-vsr.exe 没有独立“写线程”：主线程按 3 槽流水线推进，�
 源码更新不会自动同步 `xess-vsr.exe`（`sync_overlay` 只同步 pipeline/ 文本）。
 二进制通过固定 Runtime 资产发布：
 
-- 本轮候选 `runtime-2026.08.27-r2`
-  `xess-runtime-windows-x64-2026.08.27-r2.zip`（303.32 MiB，
-  SHA256 `53b59b4139931de6275aeacc1dcf451c4f78c7a179713cd293d045359c8ee063`）
+- 发布资产 `runtime-2026.08.27-r2`
+  `xess-runtime-windows-x64-2026.08.27-r2.zip`（271.72 MiB，
+  SHA256 `54194b102b7faaa9d2bf5208569e5de6bdb36b43d42b2b8d946e3997d5df071e`）
 - 包含新 `xess-vsr.exe`（SHA256 `be3f55aa570cb7760d3066c25acb30c38730dccc8840220cc246e51a7dafad04`）
-- 干净 git archive 克隆 + 本地资产安装验证：`runtime status` compatible、
-  `self_test.py --sr-only` 通过、48 帧 SR 与工作树构建逐字节一致。
-- 未创建 GitHub Release / 未上传 / 未 push manifest（等发布授权）。
+- 打包器仅收录生产用 Depth Anything 模型，已退役的 SEA-RAFT 检查点不再进入资产；
+  `RUNTIME_BUILD.json` 也不再泄漏维护者本机绝对路径。
+- E 盘空目录本地资产安装验证：`runtime status` compatible；4 帧 ComfyUI
+  共享内存 SR→FG 自检、8 帧独立 SR、8→15 帧独立 FG 均通过。此前同一个
+  `xess-vsr.exe` 的 48 帧 SR 与工作树构建逐字节一致。
 
 ## 9. 被否决/未采纳实验
 
@@ -125,10 +127,10 @@ worker 全链基准（解码→prepare→ring→xess-vsr→sr-post→SHA256 流�
 不含编码器：
 
 - 场景 A（480p 243 帧 → 720p，Fast，默认振铃保护）：
-  新链中位 **20.537s** vs 旧链（封存版 2aa9855）**22.574s** ≈ **9.9%** 提速。
+  新链中位 **20.537s** vs 旧链（封存版 2aa9855）**22.574s** ≈ **9.0%** 提速。
 - 场景 B（1080×1920 300 帧 → 1440×2560，Fast，shared，振铃 0.75）确认轮
   （第三轮，同一开机会话、控制样本漂移 <0.1%）：
-  新链中位 **53.965s** vs 旧链 **57.983s** ≈ **7.4%** 提速。
+  新链中位 **53.965s** vs 旧链 **57.983s** ≈ **6.9%** 提速。
   此前两轮：ring 零拷贝轮 54.709 vs 57.680（5.4%）；最终构建轮受会话状态
   漂移影响（两配置前两跑同时偏慢 11–14s，漂移超 5%）标记“不确定”，已用
   确认轮取代（见 benchmarks/scenarioB_confirmed.csv）。

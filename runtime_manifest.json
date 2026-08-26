@@ -4,10 +4,10 @@
   "release_tag": "runtime-2026.08.27-r2",
   "asset_name": "xess-runtime-windows-x64-2026.08.27-r2.zip",
   "download_url": "https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/download/runtime-2026.08.27-r2/xess-runtime-windows-x64-2026.08.27-r2.zip",
-  "sha256": "53b59b4139931de6275aeacc1dcf451c4f78c7a179713cd293d045359c8ee063",
+  "sha256": "54194b102b7faaa9d2bf5208569e5de6bdb36b43d42b2b8d946e3997d5df071e",
   "archive_root": "xess-runtime-windows-x64",
-  "archive_size": 318056351,
-  "installed_size": 654836217,
+  "archive_size": 284917863,
+  "installed_size": 619227272,
   "required_files": [
     "ffmpeg.exe",
     "xess-vsr.exe",

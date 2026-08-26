@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 - 2026-08-27
+
+- Fixed file-mode packet generation to serialize optional depth and mask
+  payloads by type instead of relying on Python object identity.
+- Fixed runtime status/validation after installation by Windows PowerShell 5,
+  whose UTF-8 state files include a byte-order mark.
+- Fixed the Runtime r2 asset builder to allow-list production depth models;
+  the retired SEA-RAFT checkpoint is no longer shipped in new archives.
 
 - Pipelined the SR critical path: xess-vsr.exe now runs a three-slot
   upload/execute/readback pipeline (multiple frames in flight, CPU/GPU stage

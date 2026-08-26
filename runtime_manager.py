@@ -27,7 +27,10 @@ class RuntimeManagerError(RuntimeError):
 
 def _load_json(path: pathlib.Path) -> dict:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        # Windows PowerShell 5 writes `Set-Content -Encoding UTF8` with a BOM,
+        # while PowerShell 7 and Python normally do not.  Accept both forms so
+        # a runtime installed by install_runtime.bat is immediately readable.
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise RuntimeManagerError(f"cannot read {path}: {exc}") from exc
 

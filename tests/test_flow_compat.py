@@ -11,6 +11,8 @@ import sys
 import types
 import unittest
 
+import numpy as np
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, os.fspath(ROOT))
@@ -150,6 +152,15 @@ class DriverFlowCompatTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             prepare_common.normalize_legacy_engine(expert)
         self.assertEqual((expert.engine, expert.bidirectional), ("dis", True))
+
+
+class PreparePayloadTests(unittest.TestCase):
+    def test_part_bytes_preserves_empty_bytes(self) -> None:
+        self.assertEqual(prepare_common._part_bytes(bytes()), b"")
+
+    def test_part_bytes_serializes_numpy_payload(self) -> None:
+        payload = np.array([[1.0, -2.5]], dtype=np.float32)
+        self.assertEqual(prepare_common._part_bytes(payload), payload.tobytes())
 
 
 if __name__ == "__main__":
