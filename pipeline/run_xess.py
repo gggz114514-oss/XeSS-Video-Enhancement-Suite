@@ -120,6 +120,13 @@ def resolve_settings(args):
             "motion": motion, "io_mode": io_mode}
 
 
+def resolve_io_mode(requested: str, input_height: int, output_height: int) -> str:
+    """Choose the default transport for a resolution without hidden thresholds."""
+    if requested == "auto":
+        return "shared" if max(input_height, output_height) >= 720 else "stream"
+    return requested
+
+
 def prep_command(args, settings, width, height, frames, *, stream,
                  raw="", mv_dir="", depth_dir="", mask_dir="", debug_dir="", ring=None):
     command = [PY, PREPARE, "--in-w", str(width), "--in-h", str(height),
@@ -151,7 +158,7 @@ def prep_command(args, settings, width, height, frames, *, stream,
 
 def xess_command(args, settings, width, height, out_w, out_h, frames, quality, *,
                  stream, raw="", mv_dir="", depth_dir="", mask_dir="", out_raw="", reset="",
-                 ring=None):
+                 ring=None, out_ring=None):
     command = [XESS, "--in-w", str(width), "--in-h", str(height), "--out-w", str(out_w),
                "--out-h", str(out_h), "--frames-count", str(frames), "--quality", str(quality),
                "--mv-path", settings["mv_path"], "--responsive-max", str(args.responsive_max)]
@@ -159,6 +166,10 @@ def xess_command(args, settings, width, height, out_w, out_h, frames, quality, *
         command.append("--stream")
         if ring is not None:
             command.extend(ring.arguments())
+        if out_ring is not None:
+            command.extend(["--out-shm-name", out_ring.name,
+                            "--out-shm-slots", str(out_ring.slots),
+                            "--out-shm-slot-size", str(out_ring.slot_size)])
         if settings["responsive"]:
             command.extend(("--mask", "stream"))
     else:
@@ -191,7 +202,7 @@ def encoder_command(args, settings, out_w, out_h, fps, frames, partial):
     return command
 
 
-def post_command(args, settings, width, height, out_w, out_h, frames):
+def post_command(args, settings, width, height, out_w, out_h, frames, *, ring=None):
     """Fused final-stage processor: sharpening + vertical ringing guard.
 
     Returns ``None`` when neither effect needs its own stage -- fixed
@@ -205,6 +216,9 @@ def post_command(args, settings, width, height, out_w, out_h, frames):
     command = [PY, POST, "--width", str(out_w), "--height", str(out_h),
                "--frames", str(frames),
                "--sharpen-mode", settings["sharpen_mode"] if sharpen_process else "off"]
+    command.extend(("--threads", str(getattr(args, "post_threads", 4))))
+    if ring is not None:
+        command.extend(ring.arguments())
     if sharpen_process:
         if settings["sharpen_mode"] == "adaptive":
             command.extend(("--static", str(settings["static"]),
@@ -237,13 +251,24 @@ def run_stream(args, settings, environment, driver_environment, width, height, o
                        "-vframes", str(frames), "-"]
     needs_depth = settings["mv_path"] == "lowres-depth" or args.force_depth
     ring = None
+    output_ring = None
+    post_args = post_command(args, settings, width, height, out_w, out_h, frames)
     if settings["io_mode"] == "shared":
         ring = RingOwner(slots=4, slot_size=packet_slot_size(
             width, height, depth=needs_depth, mask=settings["responsive"]), prefix="xess-sr")
+        # The post stage used to receive xess-vsr stdout through a small
+        # anonymous pipe, which serialized the two CPU-heavy processes.  Use
+        # a second raw-frame ring when there is a post stage.  MFSR still
+        # requires stdin, so keep its legacy pipe path for that expert mode.
+        if post_args is not None and not args.five_frame_mfsr:
+            output_ring = RingOwner(slots=6, slot_size=out_w * out_h * 3,
+                                    prefix="xess-sr-out")
+            post_args = post_command(args, settings, width, height, out_w, out_h,
+                                     frames, ring=output_ring)
     prepare_command, _ = prep_command(args, settings, width, height, frames,
                                       stream=True, ring=ring)
     worker_command = xess_command(args, settings, width, height, out_w, out_h, frames, quality,
-                                  stream=True, ring=ring)
+                                  stream=True, ring=ring, out_ring=output_ring)
     for command in (decoder_command, prepare_command, worker_command):
         print(f"[run_xess] $ {command_text(command)}")
     processes = []
@@ -266,7 +291,7 @@ def run_stream(args, settings, environment, driver_environment, width, height, o
         source_stream.close()
         processes.append(prepare)
         worker = subprocess.Popen(worker_command, stdin=(prepare.stdout if ring is None else subprocess.DEVNULL),
-                                  stdout=subprocess.PIPE,
+                                  stdout=(subprocess.PIPE if output_ring is None else subprocess.DEVNULL),
                                   env=driver_environment)
         if prepare.stdout is not None:
             prepare.stdout.close()
@@ -285,12 +310,13 @@ def run_stream(args, settings, environment, driver_environment, width, height, o
             video_stream.close()
             video_stream = mfsr.stdout
             processes.append(mfsr)
-        post_args = post_command(args, settings, width, height, out_w, out_h, frames)
         if post_args is not None:
             print(f"[run_xess] $ {command_text(post_args)}")
-            post = subprocess.Popen(post_args, stdin=video_stream,
+            post = subprocess.Popen(post_args,
+                                    stdin=(subprocess.DEVNULL if output_ring is not None else video_stream),
                                     stdout=subprocess.PIPE, env=environment)
-            video_stream.close()
+            if video_stream is not None:
+                video_stream.close()
             video_stream = post.stdout
             processes.append(post)
         encode_command = encoder_command(args, settings, out_w, out_h, fps, frames, partial)
@@ -307,6 +333,8 @@ def run_stream(args, settings, environment, driver_environment, width, height, o
     finally:
         if ring is not None:
             ring.close()
+        if output_ring is not None:
+            output_ring.close()
 
 
 def run_chunked(args, settings, environment, driver_environment, workspace,
@@ -416,6 +444,8 @@ def main():
     parser.add_argument("--mfsr-max-injection", type=float, default=22.0)
     parser.add_argument("--edge-guard-strength", type=float, default=0.75,
                         help="suppress XeSS vertical edge ringing; 0 disables it")
+    parser.add_argument("--post-threads", type=int, default=4,
+                        help="parallel SR postprocess workers (default: 4)")
     parser.add_argument("--io-mode", choices=("auto", "stream", "chunked", "file"), default="auto")
     parser.add_argument("--chunk-frames", type=int, default=48)
     parser.add_argument("--work-dir", default="")
@@ -451,6 +481,8 @@ def main():
         die("--mfsr-max-injection must be in 0..128")
     if not 0 <= args.edge_guard_strength <= 1:
         die("--edge-guard-strength must be in 0..1")
+    if not 1 <= args.post_threads <= 16:
+        die("--post-threads must be in 1..16")
     if args.five_frame_fusion and args.five_frame_mfsr:
         die("choose either --five-frame-fusion or --five-frame-mfsr, not both")
     if args.five_frame_fusion and not os.path.isfile(FUSION):
@@ -472,9 +504,7 @@ def main():
     if not 0 <= quality <= 6:
         die("--quality must be in 0..6")
     settings = resolve_settings(args)
-    if settings["io_mode"] == "auto":
-        settings["io_mode"] = ("shared" if max(height, out_h) > 720
-                               else "stream")
+    settings["io_mode"] = resolve_io_mode(settings["io_mode"], height, out_h)
     if (args.five_frame_fusion or args.five_frame_mfsr) and settings["io_mode"] not in ("stream", "shared"):
         die("five-frame processing currently requires --io-mode stream/shared")
     needs_depth = settings["mv_path"] == "lowres-depth" or args.force_depth

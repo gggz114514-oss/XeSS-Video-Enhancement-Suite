@@ -34,10 +34,20 @@ def remap(array: np.ndarray, map_x: np.ndarray, map_y: np.ndarray, border=0.0,
                      borderMode=cv2.BORDER_CONSTANT, borderValue=border)
 
 
-def sampling_map(flow: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def sampling_map(flow: np.ndarray,
+                 grids: tuple[np.ndarray, np.ndarray] | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build (map_x, map_y, inside) for one-way warping of `flow`.
+
+    `grids` is a reusable (grid_x, grid_y) pair for the same frame size; the
+    grids depend only on the dimensions, so hot loops pass a cached copy.
+    Values (and therefore every downstream result) are byte-identical.
+    """
     height, width = flow.shape[:2]
-    grid_x, grid_y = np.meshgrid(np.arange(width, dtype=np.float32),
-                                 np.arange(height, dtype=np.float32))
+    if grids is None:
+        grid_x, grid_y = np.meshgrid(np.arange(width, dtype=np.float32),
+                                     np.arange(height, dtype=np.float32))
+    else:
+        grid_x, grid_y = grids
     map_x = grid_x + flow[..., 0]
     map_y = grid_y + flow[..., 1]
     inside = ((map_x >= 0.0) & (map_x <= width - 1.0) &
@@ -59,8 +69,9 @@ def flow_consistency(backward: np.ndarray, forward: np.ndarray, threshold: float
 
 def single_direction_confidence(backward: np.ndarray, uncertainty: np.ndarray | None,
                                 previous_gray: np.ndarray | None = None,
-                                current_gray: np.ndarray | None = None):
-    map_x, map_y, inside = sampling_map(backward)
+                                current_gray: np.ndarray | None = None,
+                                grids: tuple[np.ndarray, np.ndarray] | None = None):
+    map_x, map_y, inside = sampling_map(backward, grids)
     if uncertainty is None:
         confidence = inside.astype(np.float32)
     else:
@@ -161,8 +172,9 @@ def make_responsive_mask(previous_gray: np.ndarray, current_gray: np.ndarray,
                          backward: np.ndarray, confidence: np.ndarray,
                          inverse_depth: np.ndarray | None,
                          uncertainty: np.ndarray | None,
-                         maximum: float = 0.8) -> np.ndarray:
-    map_x, map_y, inside = sampling_map(backward)
+                         maximum: float = 0.8,
+                         grids: tuple[np.ndarray, np.ndarray] | None = None) -> np.ndarray:
+    map_x, map_y, inside = sampling_map(backward, grids)
     warped = remap(previous_gray, map_x, map_y, border=0.0)
     luma_change = np.abs(current_gray.astype(np.float32) - warped.astype(np.float32)) / 80.0
     response = np.maximum(1.0 - confidence, np.clip(luma_change, 0.0, 1.0) * 0.65)
@@ -269,6 +281,17 @@ class FrameAnalyzer:
         self.previous_rgb: np.ndarray | None = None
         self.previous_gray: np.ndarray | None = None
         self.previous_depth: np.ndarray | None = None
+        self._grid_shape: tuple[int, int] | None = None
+        self._grids: tuple[np.ndarray, np.ndarray] | None = None
+
+    def _sampling_grids(self, shape):
+        height, width = shape[:2]
+        if self._grid_shape != (height, width):
+            grid_x, grid_y = np.meshgrid(np.arange(width, dtype=np.float32),
+                                         np.arange(height, dtype=np.float32))
+            self._grid_shape = (height, width)
+            self._grids = (grid_x, grid_y)
+        return self._grids
 
     def first(self, rgb: np.ndarray, with_mask: bool) -> MotionResult:
         height, width = rgb.shape[:2]
@@ -291,7 +314,8 @@ class FrameAnalyzer:
             reliable, confidence, _, _, error = single_direction_confidence(
                 backward, uncertainty,
                 self.previous_gray if self.photometric_confidence else None,
-                current_gray if self.photometric_confidence else None)
+                current_gray if self.photometric_confidence else None,
+                grids=self._sampling_grids(backward.shape))
         reliable_fraction = float(np.mean(reliable))
         scene_cut, metrics = detect_scene_cut(self.previous_gray, current_gray, reliable_fraction)
         current_depth = self.depth_estimator.infer(rgb) if self.depth_estimator else None
@@ -307,12 +331,16 @@ class FrameAnalyzer:
         if dilate_highres and stable_depth is not None:
             motion = depth_aware_dilate(backward, stable_depth, reliable,
                                         self.dilation, self.depth_edge)
-        motion = np.nan_to_num(motion.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        # DisFlow 输出已是 float32;只做无拷贝视图,保持逐位一致且省去整帧复制
+        motion = np.asarray(motion, dtype=np.float32)
+        if not np.isfinite(motion).all():
+            motion = np.nan_to_num(motion, nan=0.0, posinf=0.0, neginf=0.0)
         mask = None
         if with_mask:
             mask = make_responsive_mask(self.previous_gray, current_gray, backward,
                                         confidence, stable_depth, uncertainty,
-                                        self.responsive_max)
+                                        self.responsive_max,
+                                        grids=self._sampling_grids(backward.shape))
             if scene_cut:
                 mask.fill(self.responsive_max)
         self.previous_rgb = rgb.copy()

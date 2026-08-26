@@ -208,3 +208,118 @@ private:
     uint32_t slots_ = 0;
     uint32_t slotSize_ = 0;
 };
+
+// 生产者侧（与 shm_ring.py RingWriter 同协议，单生产者/单消费者）：
+// 等待空槽 -> 直写槽位 -> 递增 writeSequence -> SetEvent(data)。
+class XessSharedRingWriter {
+public:
+    double waitSeconds = 0.0;  // 因消费者滞后而阻塞的时间
+
+    XessSharedRingWriter() = default;
+    XessSharedRingWriter(const XessSharedRingWriter&) = delete;
+    XessSharedRingWriter& operator=(const XessSharedRingWriter&) = delete;
+    ~XessSharedRingWriter() { close(); }
+
+    bool open(const char* name, uint32_t slots, uint32_t slotSize) {
+        close();
+        if (!name || slots < 2 || !slotSize) return false;
+        std::wstring wideName = widen(name);
+        mapping_ = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, wideName.c_str());
+        if (!mapping_) return report("OpenFileMappingW");
+        view_ = static_cast<uint8_t*>(MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, 0));
+        if (!view_) return report("MapViewOfFile");
+        header_ = reinterpret_cast<XessSharedRingHeader*>(view_);
+        if (memcmp(header_->magic, "XSRG", 4) || header_->version != 1 ||
+            header_->slots != slots || header_->slotSize != slotSize) {
+            fprintf(stderr, "[shm] ring header mismatch\n");
+            close();
+            return false;
+        }
+        slots_ = slots;
+        slotSize_ = slotSize;
+        std::wstring dataName = wideName + L"-data";
+        std::wstring spaceName = wideName + L"-space";
+        dataEvent_ = OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, dataName.c_str());
+        spaceEvent_ = OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, spaceName.c_str());
+        if (!dataEvent_ || !spaceEvent_) return report("OpenEventW");
+        return true;
+    }
+
+    bool write(const uint8_t* data, uint32_t size, DWORD timeoutMs = 30000) {
+        if (!header_ || size > slotSize_) {
+            fprintf(stderr, "[shm] writer: size %u exceeds slot capacity %u\n", size, slotSize_);
+            return false;
+        }
+        LARGE_INTEGER freq{}, started{}, ready{};
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&started);
+        const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+        for (;;) {
+            const LONG64 writeSequence =
+                InterlockedCompareExchange64(&header_->writeSequence, 0, 0);
+            const LONG64 readSequence =
+                InterlockedCompareExchange64(&header_->readSequence, 0, 0);
+            if (writeSequence - readSequence < slots_) {
+                QueryPerformanceCounter(&ready);
+                waitSeconds += (double)(ready.QuadPart - started.QuadPart) / (double)freq.QuadPart;
+                const uint32_t slot = static_cast<uint32_t>(writeSequence % slots_);
+                uint8_t* base = view_ + sizeof(XessSharedRingHeader) +
+                    static_cast<size_t>(slot) * (sizeof(XessSharedSlotHeader) + slotSize_);
+                auto* slotHeader = reinterpret_cast<XessSharedSlotHeader*>(base);
+                slotHeader->packetSize = size;
+                if (size)
+                    memcpy(base + sizeof(XessSharedSlotHeader), data, size);
+                MemoryBarrier();
+                InterlockedExchange64(&header_->writeSequence, writeSequence + 1);
+                if (!SetEvent(dataEvent_)) return report("SetEvent(data)");
+                return true;
+            }
+            const ULONGLONG now = GetTickCount64();
+            if (now >= deadline) {
+                fprintf(stderr, "[shm] writer timed out waiting for a free slot\n");
+                return false;
+            }
+            const DWORD remaining = static_cast<DWORD>(std::min<ULONGLONG>(deadline - now, timeoutMs));
+            const DWORD result = WaitForSingleObject(spaceEvent_, remaining);
+            if (result == WAIT_FAILED) return report("WaitForSingleObject(space)");
+            if (result == WAIT_TIMEOUT && GetTickCount64() >= deadline) {
+                fprintf(stderr, "[shm] writer timed out waiting for a free slot\n");
+                return false;
+            }
+        }
+    }
+
+    void close() {
+        header_ = nullptr;
+        if (view_) { UnmapViewOfFile(view_); view_ = nullptr; }
+        if (dataEvent_) { CloseHandle(dataEvent_); dataEvent_ = nullptr; }
+        if (spaceEvent_) { CloseHandle(spaceEvent_); spaceEvent_ = nullptr; }
+        if (mapping_) { CloseHandle(mapping_); mapping_ = nullptr; }
+        slots_ = slotSize_ = 0;
+    }
+
+private:
+    static std::wstring widen(const char* value) {
+        const int count = MultiByteToWideChar(CP_UTF8, 0, value, -1, nullptr, 0);
+        if (count <= 1) return {};
+        std::wstring result(static_cast<size_t>(count), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, value, -1, result.data(), count);
+        result.resize(static_cast<size_t>(count - 1));
+        return result;
+    }
+
+    bool report(const char* operation) {
+        fprintf(stderr, "[shm] %s failed: %lu\n", operation,
+                static_cast<unsigned long>(GetLastError()));
+        close();
+        return false;
+    }
+
+    HANDLE mapping_ = nullptr;
+    HANDLE dataEvent_ = nullptr;
+    HANDLE spaceEvent_ = nullptr;
+    uint8_t* view_ = nullptr;
+    XessSharedRingHeader* header_ = nullptr;
+    uint32_t slots_ = 0;
+    uint32_t slotSize_ = 0;
+};

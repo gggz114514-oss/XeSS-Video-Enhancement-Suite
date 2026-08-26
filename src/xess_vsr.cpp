@@ -157,11 +157,60 @@ static void convert_rgba8_to_rgb24(const uint8_t* src, uint8_t* dst, int count) 
     }
 }
 
-// 注意：FP32->FP16 不做 F16C 批量替换。经逐位扫描，旧标量 f32_to_f16 在
-// “half mantissa LSB=1 且 remainder>halfway”时丢失进位（恒向下舍入），
-// 与 IEEE RNE（numpy/F16C 硬件，约一半上舍入场景相差 1 ULP）。按质量门禁
-// 规则，硬件舍入与旧实现不一致时不得直接替换默认；差异已记录，待后续
-// 视频/质量评估后另行决定。
+// 注意：旧的标量 f32_to_f16 在 kept-LSB=1 且 rem>halfway 时丢进位(恒向下舍),
+// 与 IEEE RNE 相差 1 ULP(约 25% 取值)。默认保留旧行为保证逐位一致;
+// --f16-rne / --f16-hw 提供正确 RNE 实验变体(rne=标量修正版, hw=F16C 硬件,
+// 两者在有限值域逐位一致)。
+
+// float32 -> float16（IEEE 754 舍入到最近偶数，正确进位版）
+static uint16_t f32_to_f16_rne(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    if (((x >> 23) & 0xFF) == 0xFF)  // inf/nan
+        return (uint16_t)(sign | 0x7C00u | (mant ? 0x200u : 0));
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00u);
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half = mant >> shift;
+        uint32_t rem = mant & ((1u << shift) - 1);
+        uint32_t halfway = 1u << (shift - 1);
+        if (rem > halfway || (rem == halfway && (half & 1))) half++;
+        return (uint16_t)(sign | half);
+    }
+    uint32_t h = (uint32_t)exp << 10;
+    uint32_t rem = mant & 0x1FFFu;
+    uint32_t kept = mant >> 13;
+    if (rem > 0x1000u || (rem == 0x1000u && (kept & 1))) {
+        kept++;
+        if (kept == 0x400u) {
+            kept = 0;
+            h += 0x400u;
+        }
+        if (h == 0x7C00u) return (uint16_t)(sign | 0x7C00u);
+    }
+    return (uint16_t)(sign | h | kept);
+}
+
+// F16C 硬件转换（批量时用 cvtps2ph;标量逐值对照用 __m128 单值）
+static uint16_t f32_to_f16_hw_scalar(float f) {
+    __m128 v = _mm_set_ss(f);
+    __m128i h = _mm_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+    return (uint16_t)_mm_cvtsi128_si32(h);
+}
+
+static bool g_f16_rne = false;   // 实验:正确 RNE 标量
+static bool g_f16_hw = false;    // 实验:F16C 硬件(仅当 g_f16c)
+static uint16_t f32_to_f16(float f);  // 定义在后面;默认路径
+static uint16_t f16_convert(float f) {
+    if (g_f16_hw && g_f16c) return f32_to_f16_hw_scalar(f);
+    if (g_f16_rne) return f32_to_f16_rne(f);
+    return f32_to_f16(f);
+}
 
 static bool read_exact(FILE* file, void* destination, size_t bytes) {
     uint8_t* output = static_cast<uint8_t*>(destination);
@@ -218,7 +267,7 @@ struct StageTiming {
 static StageTiming g_timing;
 
 
-// float32 -> float16（IEEE 754 舍入到最近偶数）
+// float32 -> float16（旧标量:保留逐位一致默认行为）
 static uint16_t f32_to_f16(float f) {
     uint32_t x;
     memcpy(&x, &f, 4);
@@ -249,23 +298,130 @@ static uint16_t f32_to_f16(float f) {
 
 // 双线性放大运动矢量：输入 inWxInH float32 [fx,fy] -> 输出 outWxOutH float16
 // （HIGH_RES_MV：单位是输出分辨率像素/帧，所以采样值要乘 out/in 缩放）
+// 中部区域 AVX2 8 像素一组，边缘行/列与残余列标量；AVX2 逐 lane 复刻标量
+// 运算序列（无 FMA、cvttps 截断、相同加减/乘除顺序），输出逐位一致。
 static void upsample_velocity(const float* in, uint16_t* out,
                               int inW, int inH, int outW, int outH,
                               bool nearest) {
     const float sx = (float)inW / outW;
     const float sy = (float)inH / outH;
-    for (int oy = 0; oy < outH; oy++) {
-        if (nearest) {
-            const int iy = std::min(inH - 1, std::max(0, (int)((oy + 0.5f) * sy)));
-            for (int ox = 0; ox < outW; ox++) {
-                const int ix = std::min(inW - 1, std::max(0, (int)((ox + 0.5f) * sx)));
-                const float* v = in + ((size_t)iy * inW + ix) * 2;
-                uint16_t* o = out + ((size_t)oy * outW + ox) * 2;
-                o[0] = f32_to_f16(v[0] * (float)outW / inW);
-                o[1] = f32_to_f16(v[1] * (float)outH / inH);
-            }
-            continue;
+    auto pixel_scalar = [&](int oy, int ox) {
+        const int iy = std::min(inH - 1, std::max(0, (int)((oy + 0.5f) * sy)));
+        const int ix = std::min(inW - 1, std::max(0, (int)((ox + 0.5f) * sx)));
+        const float* v = in + ((size_t)iy * inW + ix) * 2;
+        uint16_t* o = out + ((size_t)oy * outW + ox) * 2;
+        o[0] = f16_convert(v[0] * (float)outW / inW);
+        o[1] = f16_convert(v[1] * (float)outH / inH);
+    };
+    if (nearest) {
+        for (int oy = 0; oy < outH; oy++) {
+            for (int ox = 0; ox < outW; ox++)
+                pixel_scalar(oy, ox);
         }
+        return;
+    }
+    if (g_avx2) {
+        const float outWf = (float)outW, inWf = (float)inW;
+        const float outHf = (float)outH, inHf = (float)inH;
+        auto scalar_px = [&](int oy, int ox) {
+            float fy = (oy + 0.5f) * sy - 0.5f;
+            int y0 = (int)fy;
+            float wy = fy - y0;
+            if (y0 < 0) { y0 = 0; wy = 0; }
+            int y1 = y0 + 1;
+            if (y1 >= inH) { y1 = inH - 1; wy = 0; }
+            float fx = (ox + 0.5f) * sx - 0.5f;
+            int x0 = (int)fx;
+            float wx = fx - x0;
+            if (x0 < 0) { x0 = 0; wx = 0; }
+            int x1 = x0 + 1;
+            if (x1 >= inW) { x1 = inW - 1; wx = 0; }
+            const float* a = in + ((size_t)y0 * inW + x0) * 2;
+            const float* b = in + ((size_t)y0 * inW + x1) * 2;
+            const float* c = in + ((size_t)y1 * inW + x0) * 2;
+            const float* d = in + ((size_t)y1 * inW + x1) * 2;
+            float vx = (a[0] * (1 - wx) + b[0] * wx) * (1 - wy) + (c[0] * (1 - wx) + d[0] * wx) * wy;
+            float vy = (a[1] * (1 - wx) + b[1] * wx) * (1 - wy) + (c[1] * (1 - wx) + d[1] * wx) * wy;
+            uint16_t* o = out + ((size_t)oy * outW + ox) * 2;
+            o[0] = f16_convert(vx * outWf / inWf);
+            o[1] = f16_convert(vy * outHf / inHf);
+        };
+        const __m256 sxv = _mm256_set1_ps(sx);
+        const __m256 half = _mm256_set1_ps(0.5f);
+        const __m256 p05 = _mm256_set1_ps(0.5f);
+        const __m256 one = _mm256_set1_ps(1.0f);
+        const __m256 outWv = _mm256_set1_ps(outWf);
+        const __m256 inWv = _mm256_set1_ps(inWf);
+        const __m256 outHv = _mm256_set1_ps(outHf);
+        const __m256 inHv = _mm256_set1_ps(inHf);
+        const bool downsample = sx >= 1.0f || sy >= 1.0f;
+        for (int oy = 0; oy < outH; oy++) {
+            float fy = (oy + 0.5f) * sy - 0.5f;
+            int y0 = (int)fy;
+            float wy = fy - y0;
+            if (y0 < 0 || y0 + 1 >= inH || downsample) {
+                for (int ox = 0; ox < outW; ox++) scalar_px(oy, ox);
+                continue;
+            }
+            const float iwy = 1.0f - wy;
+            const __m256 iwyv = _mm256_set1_ps(iwy);
+            const __m256 wyv = _mm256_set1_ps(wy);
+            const float* row0 = in + (size_t)y0 * inW * 2;
+            const float* row1 = in + (size_t)(y0 + 1) * inW * 2;
+            // 首列标量（x0 可能为负的边缘列）
+            scalar_px(oy, 0);
+            int ox = 1;
+            const int oxEnd = outW - 1;
+            for (; ox + 8 <= oxEnd; ox += 8) {
+                __m128i oxlo = _mm_set_epi32(ox + 3, ox + 2, ox + 1, ox);
+                __m128i oxhi = _mm_set_epi32(ox + 7, ox + 6, ox + 5, ox + 4);
+                __m256 oxf = _mm256_castps128_ps256(_mm_cvtepi32_ps(oxlo));
+                oxf = _mm256_insertf128_ps(oxf, _mm_cvtepi32_ps(oxhi), 1);
+                __m256 fx = _mm256_sub_ps(_mm256_mul_ps(_mm256_add_ps(oxf, half), sxv), p05);
+                __m256i x0v = _mm256_cvttps_epi32(fx);
+                __m256 x0f = _mm256_cvtepi32_ps(x0v);
+                __m256 wx = _mm256_sub_ps(fx, x0f);
+                __m256 iwx = _mm256_sub_ps(one, wx);
+                __m256i i0 = _mm256_slli_epi32(x0v, 1);
+                __m256i i0p = _mm256_add_epi32(i0, _mm256_set1_epi32(2));
+                __m256 a0 = _mm256_i32gather_ps(row0, i0, 4);
+                __m256 a1 = _mm256_i32gather_ps(row0, i0p, 4);
+                __m256 c0 = _mm256_i32gather_ps(row1, i0, 4);
+                __m256 c1 = _mm256_i32gather_ps(row1, i0p, 4);
+                __m256 b0 = _mm256_i32gather_ps(row0 + 1, i0, 4);
+                __m256 b1 = _mm256_i32gather_ps(row0 + 1, i0p, 4);
+                __m256 d0 = _mm256_i32gather_ps(row1 + 1, i0, 4);
+                __m256 d1 = _mm256_i32gather_ps(row1 + 1, i0p, 4);
+                __m256 t1 = _mm256_mul_ps(a0, iwx);
+                t1 = _mm256_add_ps(t1, _mm256_mul_ps(a1, wx));
+                t1 = _mm256_mul_ps(t1, iwyv);
+                __m256 t2 = _mm256_mul_ps(c0, iwx);
+                t2 = _mm256_add_ps(t2, _mm256_mul_ps(c1, wx));
+                t2 = _mm256_mul_ps(t2, wyv);
+                __m256 vx = _mm256_add_ps(t1, t2);
+                vx = _mm256_div_ps(_mm256_mul_ps(vx, outWv), inWv);
+                __m256 t3 = _mm256_mul_ps(b0, iwx);
+                t3 = _mm256_add_ps(t3, _mm256_mul_ps(b1, wx));
+                t3 = _mm256_mul_ps(t3, iwyv);
+                __m256 t4 = _mm256_mul_ps(d0, iwx);
+                t4 = _mm256_add_ps(t4, _mm256_mul_ps(d1, wx));
+                t4 = _mm256_mul_ps(t4, wyv);
+                __m256 vy = _mm256_add_ps(t3, t4);
+                vy = _mm256_div_ps(_mm256_mul_ps(vy, outHv), inHv);
+                float fxv[8], fyv[8];
+                _mm256_storeu_ps(fxv, vx);
+                _mm256_storeu_ps(fyv, vy);
+                uint16_t* o = out + ((size_t)oy * outW + ox) * 2;
+                for (int lane = 0; lane < 8; lane++) {
+                    o[lane * 2 + 0] = f16_convert(fxv[lane]);
+                    o[lane * 2 + 1] = f16_convert(fyv[lane]);
+                }
+            }
+            for (; ox <= oxEnd; ox++) scalar_px(oy, ox);
+        }
+        return;
+    }
+    for (int oy = 0; oy < outH; oy++) {
         float fy = (oy + 0.5f) * sy - 0.5f;
         int y0 = (int)fy;
         float wy = fy - y0;
@@ -286,8 +442,8 @@ static void upsample_velocity(const float* in, uint16_t* out,
             float vx = (a[0] * (1 - wx) + b[0] * wx) * (1 - wy) + (c[0] * (1 - wx) + d[0] * wx) * wy;
             float vy = (a[1] * (1 - wx) + b[1] * wx) * (1 - wy) + (c[1] * (1 - wx) + d[1] * wx) * wy;
             uint16_t* o = out + ((size_t)oy * outW + ox) * 2;
-            o[0] = f32_to_f16(vx * (float)outW / inW);
-            o[1] = f32_to_f16(vy * (float)outH / inH);
+            o[0] = f16_convert(vx * (float)outW / inW);
+            o[1] = f16_convert(vy * (float)outH / inH);
         }
     }
 }
@@ -314,6 +470,9 @@ struct CmdArgs {
     const char* shmName = nullptr;
     uint32_t shmSlots = 0;
     uint32_t shmSlotSize = 0;
+    const char* outShmName = nullptr;
+    uint32_t outShmSlots = 0;
+    uint32_t outShmSlotSize = 0;
     bool stageTiming = false;
 };
 
@@ -345,6 +504,13 @@ static bool parse_args(int argc, char** argv, CmdArgs& a) {
         else if (!strcmp(k, "--shm-slot-size")) {
             const char* v = next(k); if (!v) return false; a.shmSlotSize = (uint32_t)strtoul(v, nullptr, 10);
         }
+        else if (!strcmp(k, "--out-shm-name")) { a.outShmName = next(k); a.stream = true; }
+        else if (!strcmp(k, "--out-shm-slots")) {
+            const char* v = next(k); if (!v) return false; a.outShmSlots = (uint32_t)strtoul(v, nullptr, 10);
+        }
+        else if (!strcmp(k, "--out-shm-slot-size")) {
+            const char* v = next(k); if (!v) return false; a.outShmSlotSize = (uint32_t)strtoul(v, nullptr, 10);
+        }
         else if (!strcmp(k, "--responsive-max")) {
             const char* v = next(k); if (!v) return false; a.responsiveMax = (float)atof(v);
         }
@@ -364,6 +530,8 @@ static bool parse_args(int argc, char** argv, CmdArgs& a) {
         }
         else if (!strcmp(k, "--reset-frames")) { a.resetFrames = next(k); }
         else if (!strcmp(k, "--stage-timing")) { a.stageTiming = true; }
+        else if (!strcmp(k, "--f16-rne")) { g_f16_rne = true; }
+        else if (!strcmp(k, "--f16-hw")) { g_f16_hw = true; g_f16_rne = true; }
         else if (!strcmp(k, "--dump")) { a.dumpDir = next(k); }        else if (!strcmp(k, "--dbg-upload")) { a.dbgUpload = next(k); }
         else { fprintf(stderr, "[args] 未知参数 %s\n", k); return false; }
         if (!k) return false;
@@ -372,7 +540,9 @@ static bool parse_args(int argc, char** argv, CmdArgs& a) {
     const bool io = a.stream || (a.framesRaw && a.mvDir && a.outRaw);
     const bool depthOk = !a.lowResMv || a.stream || a.depthDir;
     const bool shmOk = !a.shmName || (a.shmSlots >= 2 && a.shmSlotSize >= sizeof(StreamHeader));
-    return dimensions && io && depthOk && shmOk &&
+    const bool outShmOk = !a.outShmName ||
+        (a.outShmSlots >= 2 && a.outShmSlotSize >= (uint32_t)a.outW * a.outH * 3);
+    return dimensions && io && depthOk && shmOk && outShmOk &&
            a.responsiveMax >= 0.0f && a.responsiveMax <= 1.0f;
 }
 
@@ -686,7 +856,7 @@ static void fill_upload(D3D12Ctx& c, D3D12Ctx::Slot& slot, const uint8_t* rgb,
     if (a.lowResMv) {
         // FP16 保持旧标量逐位一致（F16C 硬件舍入差异见上方说明）。
         for (size_t i = 0; i < (size_t)a.inW * a.inH * 2; ++i)
-            velocity[i] = f32_to_f16(velLow[i]);
+            velocity[i] = f16_convert(velLow[i]);
     } else {
         upsample_velocity(velLow, velocity, a.inW, a.inH, a.outW, a.outH, a.nearestMv);
     }
@@ -830,8 +1000,9 @@ static bool record_and_submit(D3D12Ctx& c, D3D12Ctx::Slot& slot,
 }
 
 // 写出侧：等本帧 GPU 完成（含回读拷贝），RGBA->RGB 打包进预分配的
-// frameBuf 后单次落盘（保留 row-pitch 处理；行缓冲即 frameBuf 的分段）。
-static bool write_frame(D3D12Ctx& c, D3D12Ctx::Slot& slot, FILE* outFp, const CmdArgs& a,
+// frameBuf 后单次写出（共享 ring 或 stdout；保留 row-pitch 处理）。
+static bool write_frame(D3D12Ctx& c, D3D12Ctx::Slot& slot, FILE* outFp,
+                        XessSharedRingWriter* outRing, const CmdArgs& a,
                         std::vector<uint8_t>& frameBuf) {
     const bool timing = g_timing.enabled;
     const double tFence = timing ? g_timing.now() : 0.0;
@@ -859,9 +1030,14 @@ static bool write_frame(D3D12Ctx& c, D3D12Ctx::Slot& slot, FILE* outFp, const Cm
         convert_rgba8_to_rgb24(src + (size_t)y * c.readPitch,
                                dst + (size_t)y * rowBytes, a.outW);
     }
-    if (fwrite(frameBuf.data(), 1, rowBytes * (size_t)a.outH, outFp) !=
-        rowBytes * (size_t)a.outH)
-        return false;
+    const size_t frameBytes = rowBytes * (size_t)a.outH;
+    bool written = false;
+    if (outRing) {
+        written = outRing->write(frameBuf.data(), (uint32_t)frameBytes);
+    } else {
+        written = fwrite(frameBuf.data(), 1, frameBytes, outFp) == frameBytes;
+    }
+    if (!written) return false;
     if (timing) {
         g_timing.stdoutWrite += g_timing.now() - tWrite;
         g_timing.frames++;
@@ -1172,6 +1348,16 @@ int main(int argc, char** argv) {
         }
         sharedRingPtr = &sharedRing;
     }
+    XessSharedRingWriter outRing;
+    XessSharedRingWriter* outRingPtr = nullptr;
+    if (a.outShmName) {
+        if (!outRing.open(a.outShmName, a.outShmSlots, a.outShmSlotSize)) {
+            if (!a.stream) { fclose(outFp); fclose(rawIn); }
+            xessDestroyContext(ctx);
+            return 1;
+        }
+        outRingPtr = &outRing;
+    }
 
     std::vector<uint8_t> rgb((size_t)a.inW * a.inH * 3);
     std::vector<float> velLow((size_t)a.inW * a.inH * 2);
@@ -1293,7 +1479,7 @@ int main(int argc, char** argv) {
 
         const int i = written;
         D3D12Ctx::Slot& slot = d3d.slots[i % PIPE_DEPTH];
-        if (!write_frame(d3d, slot, outFp, a, outputBuf)) {
+        if (!write_frame(d3d, slot, outFp, outRingPtr, a, outputBuf)) {
             fprintf(stderr, "[io] write failed at frame %d\n", i);
             complete = false;
             break;
@@ -1340,14 +1526,16 @@ int main(int argc, char** argv) {
                 "\"texture_upload_cpu_s\": %.3f, \"texture_upload_gpu_s\": %.3f, "
                 "\"xess_execute_cpu_s\": %.3f, \"xess_execute_gpu_s\": %.3f, "
                 "\"gpu_fence_wait_s\": %.3f, \"readback_copy_gpu_s\": %.3f, "
-                "\"readback_wait_s\": %.4f, \"stdout_write_s\": %.3f}\n",
+                "\"readback_wait_s\": %.4f, \"stdout_write_s\": %.3f, "
+                "\"out_ring_wait_s\": %.3f}\n",
                 g_timing.frames,
                 g_timing.inputRead,
                 sharedRingPtr ? sharedRingPtr->waitSeconds : 0.0,
                 g_timing.textureUpload, g_timing.textureUploadGpu,
                 g_timing.xessExecuteCpu, g_timing.xessExecuteGpu,
                 g_timing.gpuFenceWait, g_timing.readbackCopyGpu,
-                g_timing.readbackWait, g_timing.stdoutWrite);
+                g_timing.readbackWait, g_timing.stdoutWrite,
+                outRingPtr ? outRingPtr->waitSeconds : 0.0);
     }
     fprintf(stderr, "[xess] %s\n", complete ? "complete" : "failed");
     return complete ? 0 : 1;

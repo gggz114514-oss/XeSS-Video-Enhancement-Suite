@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.3.0 - 2026-08-28
+
+- Added a symmetric six-slot shared-memory ring from `xess-vsr.exe` to the
+  fused SR postprocess stage.  The normal launcher now enables both shared
+  rings for 720p-or-larger output instead of leaving the measured r3 path
+  reachable only from benchmark scripts.
+- Parallelized sharpening and vertical-ringing protection with four ordered
+  workers by default.  `--post-threads 1..16` is available for diagnostics;
+  file/MFSR and explicit stream transports keep their compatible paths.
+- Vectorized velocity bilinear upsampling with runtime-detected AVX2 and a
+  scalar fallback, and cached DIS sampling grids while removing redundant
+  frame-analysis copies.
+- Fixed a shutdown hang where an ffmpeg guide-decoder failure could be
+  dropped when the postprocess ready queue was full.
+- Same-session, three-run interleaved B580 medians (worker chain, encoder
+  excluded): 480p→720p/243 frames 15.488s → 7.683s (50.4% faster), and
+  1080×1920→1440×2560/300 frames 57.702s → 46.117s (20.1% faster).  Both
+  raw RGB output hashes are byte-identical to 1.2.0.  A770 remains untested.
+- Added low-level `xess-vsr.exe --f16-rne` and `--f16-hw` experiments for
+  correct IEEE round-to-nearest-even velocity conversion.  They remain
+  opt-in because changing the historical one-ULP behavior breaks the strict
+  byte-identity gate even though the measured visual difference is tiny.
+
 ## 1.2.0 - 2026-08-27
 
 - Fixed file-mode packet generation to serialize optional depth and mask
