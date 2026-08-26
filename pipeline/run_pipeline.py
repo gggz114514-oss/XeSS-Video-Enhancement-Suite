@@ -79,8 +79,6 @@ def run_chunked_pipeline(args, workspace, environment, width, height, out_w, out
             "--crf", str(args.crf), "--encoder-preset", args.encoder_preset,
             "--slice-start", str(slice_start), "--slice-count", str(slice_count),
         ]
-        if args.torch_python:
-            command.extend(("--torch-python", args.torch_python))
         if args.allow_system_drive_temp:
             command.append("--allow-system-drive-temp")
         if args.reserve_free_gb is not None:
@@ -132,7 +130,6 @@ def main():
     parser.add_argument("--temporal-motion-strength", type=float, default=0.65)
     parser.add_argument("--temporal-depth-strength", type=float, default=0.18)
     parser.add_argument("--responsive-max", type=float, default=0.8)
-    parser.add_argument("--torch-python", default="")
     parser.add_argument("--final-sharpen", default="auto", help="auto or 0..1")
     parser.add_argument("--sharpen-mode", choices=("auto", "off", "fixed", "adaptive"), default="auto")
     parser.add_argument("--frames", type=int, default=0)
@@ -220,10 +217,6 @@ def main():
         fg_settings["sharpen"] = final_strength
         if final_strength == 0:
             fg_settings["sharpen_mode"] = "off"
-    sr_runtime = (sr.find_xpu_python(args.torch_python)
-                  if sr_settings["flow"] == "sea-raft" else sr.PY)
-    fg_runtime = (fg.find_xpu_python(args.torch_python)
-                  if fg_settings["flow"] == "sea-raft" else fg.PY)
 
     output_dir = os.path.abspath(args.out_dir or os.path.dirname(os.path.abspath(args.video)))
     os.makedirs(output_dir, exist_ok=True)
@@ -231,7 +224,7 @@ def main():
     output = os.path.join(output_dir,
                           f"{base}_xess_pipeline_sr12-{args.sr_preset}_fg12-{args.fg_preset}_{out_w}x{out_h}_{fps * 2:g}fps.mp4")
     partial = partial_output_path(output)
-    sr_depth = sr_settings["mv_path"] == "lowres-depth" or sr_settings["flow"] != "dis"
+    sr_depth = sr_settings["mv_path"] == "lowres-depth"
     estimate = estimate_sr_bytes(width, height, out_w, out_h, frames, io_mode=transport,
                                  include_depth=sr_depth, include_mask=sr_settings["responsive"],
                                  chunk_frames=args.chunk_frames)
@@ -287,12 +280,12 @@ def main():
                 prefix="xess-pipeline-sr")
             fg_ring = RingOwner(slots=4, slot_size=packet_slot_size(
                 out_w, out_h, depth=True, mask=False), prefix="xess-pipeline-fg")
-        sr_prepare, _ = sr.prep_command(sr_args, sr_settings, sr_runtime, width, height,
-                                       frames, stream=True, ring=sr_ring)
+        sr_prepare, _ = sr.prep_command(sr_args, sr_settings, width, height,
+                                        frames, stream=True, ring=sr_ring)
         sr_worker = sr.xess_command(sr_args, sr_settings, width, height, out_w, out_h,
                                     frames, quality, stream=True, ring=sr_ring)
-        fg_prepare = fg.prep_command(fg_args, fg_settings, fg_runtime, out_w, out_h,
-                                    frames, stream=True, ring=fg_ring)
+        fg_prepare = fg.prep_command(fg_args, fg_settings, out_w, out_h,
+                                     frames, stream=True, ring=fg_ring)
         fg_worker = fg.worker_command(fg_args, out_w, out_h, fps, frames,
                                       stream=True, ring=fg_ring)
         for command in (decoder_command, sr_prepare, sr_worker, fg_prepare, fg_worker):
@@ -331,7 +324,7 @@ def main():
         if trim_start < 0 or output_frames <= 0 or trim_start + output_frames > raw_output_frames:
             die("invalid pipeline raw output slice")
         if fg_settings["sharpen_mode"] == "adaptive" and fg_settings["sharpen"] > 0:
-            sharpen_command = [sr.PY, sr.SHARPEN, "--width", str(out_w), "--height", str(out_h),
+            sharpen_command = [sr.PY, fg.SHARPEN, "--width", str(out_w), "--height", str(out_h),
                                "--frames", str(raw_output_frames), "--static", str(fg_settings["static"]),
                                "--motion", str(fg_settings["motion"])]
             print(f"[pipeline] $ {command_text(sharpen_command)}")

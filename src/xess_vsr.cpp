@@ -3,6 +3,12 @@
 // 管线：ffmpeg 解码 -> flow.py 算 DIS 光流 -> 本程序逐帧喂给官方 libxess.dll (D3D12)
 // -> 输出放大后的 rgb24 raw -> ffmpeg 编码。
 //
+// 帧处理是 3 槽流水线（多帧在途、CPU/GPU 阶段重叠）：帧 N 在 GPU 上执行时，
+// 帧 N-1 在等 fence 并完成 GPU->CPU 回读拷贝，帧 N-2 由主线程转写输出。
+// 每槽有独立的命令分配器/列表和持久映射的上传/回读缓冲，用每槽 fence
+// 保证绝不覆写仍在使用的资源；输出帧序与输入严格一致。
+// 收尾时先排空最后一个已提交 fence 再销毁 XeSS 上下文与 D3D12 资源。
+//
 // XeSS 配置（官方 SDK 2.1.0 ABI，见 sdk/official/inc/xess/）：
 //   - xessD3D12CreateContext(device, &ctx) 只建上下文，init 参数在 xessD3D12Init 传
 //   - XESS_INIT_FLAG_HIGH_RES_MV：运动矢量按输出分辨率提供（R16G16_FLOAT，半精度，
@@ -23,6 +29,7 @@
 #include <dxgi1_4.h>
 #include <fcntl.h>
 #include <io.h>
+#include <intrin.h>
 
 #include "xess/xess.h"
 #include "xess/xess_d3d12.h"
@@ -30,6 +37,7 @@
 #include "shm_ring_win.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +48,11 @@
 static constexpr uint32_t STREAM_FLAG_RESET = 1u << 0;
 static constexpr uint32_t STREAM_FLAG_SCENE_CUT = 1u << 1;
 static constexpr uint32_t STREAM_FLAG_EOS = 1u << 2;
+
+// 流水线深度：同时驻留在 GPU/写盘路径上的帧数。
+static constexpr int PIPE_DEPTH = 3;
+// 收尾排空在途 GPU 任务的有界等待，避免错误路径永久死等。
+static constexpr DWORD DRAIN_TIMEOUT_MS = 15000;
 
 #pragma pack(push, 1)
 struct StreamHeader {
@@ -78,6 +91,78 @@ static uint32_t crc32_bytes(const uint8_t* data, size_t size) {
     return ~crc;
 }
 
+// ---- SIMD 转换（运行时检测，AVX2 不可用时自动走标量）----
+static bool g_avx2 = false;
+static bool g_f16c = false;  // 仅探测记录用；FP16 路径保持标量（见下方说明）
+
+static void detect_cpu_features() {
+    int info[4] = {};
+    __cpuid(info, 0);
+    if (info[0] >= 7) {
+        __cpuidex(info, 7, 0);
+        g_avx2 = (info[1] & (1u << 5)) != 0;
+    }
+    __cpuid(info, 1);
+    const bool osxsave = (info[2] & (1u << 27)) != 0;
+    const bool avx = (info[2] & (1u << 28)) != 0;
+    g_f16c = (info[2] & (1u << 29)) != 0;
+    if (!osxsave || !avx || (_xgetbv(0) & 0x6) != 0x6)
+        g_avx2 = g_f16c = false;
+}
+
+// RGB24 -> RGBA8（alpha=255）。对有限 RGB 输入与标量路径逐字节一致。
+// 4 像素一组（12B→16B），128 位 lane 正好一组，避免跨 lane 错位；
+// SIMD 循环保证 16B 读取不越过 bufferEnd。
+static void convert_rgb24_to_rgba8(const uint8_t* src, uint8_t* dst, int count,
+                                   const uint8_t* bufferEnd) {
+    const __m128i alpha = _mm_set1_epi32(0xFF000000);
+    const __m128i mask = _mm_setr_epi8(0, 1, 2, -1, 3, 4, 5, -1,
+                                       6, 7, 8, -1, 9, 10, 11, -1);
+    int x = 0;
+    if (g_avx2) {
+        for (; x + 4 <= count && src + (size_t)x * 3 + 16 <= bufferEnd; x += 4) {
+            __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + (size_t)x * 3));
+            v = _mm_shuffle_epi8(v, mask);
+            v = _mm_or_si128(v, alpha);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + (size_t)x * 4), v);
+        }
+    }
+    for (; x < count; x++) {
+        dst[x * 4 + 0] = src[x * 3 + 0];
+        dst[x * 4 + 1] = src[x * 3 + 1];
+        dst[x * 4 + 2] = src[x * 3 + 2];
+        dst[x * 4 + 3] = 255;
+    }
+}
+
+// RGBA8 -> RGB24。4 像素一组压缩打包：前 8B 由 storel_epi64（像素 0/1），
+// 后 4B 由 extract dword2（像素 2/3）落位，无越界无改写污染。
+static void convert_rgba8_to_rgb24(const uint8_t* src, uint8_t* dst, int count) {
+    const __m128i mask = _mm_setr_epi8(0, 1, 2, 4, 5, 6, 8, 9, 10,
+                                       12, 13, 14, -1, -1, -1, -1);
+    int x = 0;
+    if (g_avx2) {
+        for (; x + 4 <= count; x += 4) {
+            __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + (size_t)x * 4));
+            v = _mm_shuffle_epi8(v, mask);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + (size_t)x * 3), v);
+            *reinterpret_cast<uint32_t*>(dst + (size_t)x * 3 + 8) =
+                (uint32_t)_mm_extract_epi32(v, 2);
+        }
+    }
+    for (; x < count; x++) {
+        dst[x * 3 + 0] = src[x * 4 + 0];
+        dst[x * 3 + 1] = src[x * 4 + 1];
+        dst[x * 3 + 2] = src[x * 4 + 2];
+    }
+}
+
+// 注意：FP32->FP16 不做 F16C 批量替换。经逐位扫描，旧标量 f32_to_f16 在
+// “half mantissa LSB=1 且 remainder>halfway”时丢失进位（恒向下舍入），
+// 与 IEEE RNE（numpy/F16C 硬件，约一半上舍入场景相差 1 ULP）。按质量门禁
+// 规则，硬件舍入与旧实现不一致时不得直接替换默认；差异已记录，待后续
+// 视频/质量评估后另行决定。
+
 static bool read_exact(FILE* file, void* destination, size_t bytes) {
     uint8_t* output = static_cast<uint8_t*>(destination);
     size_t done = 0;
@@ -112,6 +197,26 @@ const char* xess_err_str(int64_t r) {
 }
 
 static uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
+
+// ---- 可选分阶段计时（--stage-timing / XESS_STAGE_TIMING，默认关闭）----
+// CPU 墙钟 + D3D12 GPU timestamp query；普通路径零额外开销。
+struct StageTiming {
+    bool enabled = false;
+    LARGE_INTEGER freq{};
+    double inputRead = 0, ringWaitData = 0, textureUpload = 0;
+    double xessExecuteCpu = 0, gpuFenceWait = 0, readbackWait = 0, stdoutWrite = 0;
+    double textureUploadGpu = 0, xessExecuteGpu = 0, readbackCopyGpu = 0;
+    uint32_t frames = 0;
+
+    void begin() { QueryPerformanceFrequency(&freq); }
+    double now() const {
+        LARGE_INTEGER c;
+        QueryPerformanceCounter(&c);
+        return (double)c.QuadPart / (double)freq.QuadPart;
+    }
+};
+static StageTiming g_timing;
+
 
 // float32 -> float16（IEEE 754 舍入到最近偶数）
 static uint16_t f32_to_f16(float f) {
@@ -209,6 +314,7 @@ struct CmdArgs {
     const char* shmName = nullptr;
     uint32_t shmSlots = 0;
     uint32_t shmSlotSize = 0;
+    bool stageTiming = false;
 };
 
 static bool parse_args(int argc, char** argv, CmdArgs& a) {
@@ -257,8 +363,8 @@ static bool parse_args(int argc, char** argv, CmdArgs& a) {
             else { fprintf(stderr, "[args] --mv-upsample must be nearest or bilinear\n"); return false; }
         }
         else if (!strcmp(k, "--reset-frames")) { a.resetFrames = next(k); }
-        else if (!strcmp(k, "--dump")) { a.dumpDir = next(k); }
-        else if (!strcmp(k, "--dbg-upload")) { a.dbgUpload = next(k); }
+        else if (!strcmp(k, "--stage-timing")) { a.stageTiming = true; }
+        else if (!strcmp(k, "--dump")) { a.dumpDir = next(k); }        else if (!strcmp(k, "--dbg-upload")) { a.dbgUpload = next(k); }
         else { fprintf(stderr, "[args] 未知参数 %s\n", k); return false; }
         if (!k) return false;
     }
@@ -273,8 +379,6 @@ static bool parse_args(int argc, char** argv, CmdArgs& a) {
 struct D3D12Ctx {
     ID3D12Device* dev = nullptr;
     ID3D12CommandQueue* queue = nullptr;
-    ID3D12CommandAllocator* alloc = nullptr;
-    ID3D12GraphicsCommandList* list = nullptr;
     ID3D12Fence* fence = nullptr;
     HANDLE fenceEvent = nullptr;
     uint64_t fenceVal = 0;
@@ -284,40 +388,80 @@ struct D3D12Ctx {
     ID3D12Resource* depthTex = nullptr;   // optional R32_FLOAT inverse depth
     ID3D12Resource* maskTex = nullptr;    // optional R8_UNORM responsive mask
     ID3D12Resource* outTex = nullptr;     // RGBA8 输出（outW x outH）
-    ID3D12Resource* uploadBuf = nullptr;
-    ID3D12Resource* readbackBuf = nullptr;
     ID3D12DescriptorHeap* heap = nullptr;
     UINT heapInc = 0;
     D3D12_CPU_DESCRIPTOR_HANDLE hColorCpu, hVelCpu, hOutCpu;
     uint32_t colorPitch = 0, velPitch = 0, depthPitch = 0, maskPitch = 0, readPitch = 0;
     uint64_t velOffset = 0, depthOffset = 0, maskOffset = 0;
     ID3D12Resource* dbgReadback = nullptr;  // 调试：上传后的颜色纹理回读
+    // GPU timestamp query（仅 --stage-timing 时创建，全槽共用）
+    ID3D12QueryHeap* queryHeap = nullptr;
+    UINT64 queueFreq = 0;
+
+    // 流水线槽位：独立命令分配器/列表 + 持久映射的上传/回读缓冲
+    struct Slot {
+        ID3D12CommandAllocator* alloc = nullptr;
+        ID3D12GraphicsCommandList* list = nullptr;
+        ID3D12Resource* upload = nullptr;
+        ID3D12Resource* readback = nullptr;
+        ID3D12Resource* queryResult = nullptr;  // 4 个 GPU timestamp（仅计时模式）
+        uint8_t* uploadPtr = nullptr;
+        uint8_t* readbackPtr = nullptr;
+        uint64_t lastFence = 0;
+    };
+    std::array<Slot, PIPE_DEPTH> slots{};
 
     ~D3D12Ctx() {
+        for (Slot& s : slots) {
+            if (s.upload && s.uploadPtr) s.upload->Unmap(0, nullptr);
+            if (s.readback && s.readbackPtr) s.readback->Unmap(0, nullptr);
+            if (s.queryResult) s.queryResult->Release();
+            if (s.readback) s.readback->Release();
+            if (s.upload) s.upload->Release();
+            if (s.list) s.list->Release();
+            if (s.alloc) s.alloc->Release();
+        }
+        if (queryHeap) queryHeap->Release();
         if (dbgReadback) dbgReadback->Release();
-        if (readbackBuf) readbackBuf->Release();
-        if (uploadBuf) uploadBuf->Release();
         if (outTex) outTex->Release();
         if (maskTex) maskTex->Release();
         if (depthTex) depthTex->Release();
         if (velTex) velTex->Release();
         if (colorTex) colorTex->Release();
         if (heap) heap->Release();
-        if (alloc) alloc->Release();
-        if (list) list->Release();
         if (queue) queue->Release();
         if (fence) fence->Release();
         if (fenceEvent) CloseHandle(fenceEvent);
         if (dev) dev->Release();
     }
 
-    bool wait_gpu() {
-        fenceVal++;
-        queue->Signal(fence, fenceVal);
-        if (fence->GetCompletedValue() < fenceVal) {
-            fence->SetEventOnCompletion(fenceVal, fenceEvent);
-            WaitForSingleObject(fenceEvent, INFINITE);
+    // 等待 fence 到达 value；超时/失败返回 false，绝不无限期卡死在错误路径。
+    bool wait_fence(uint64_t value, DWORD timeoutMs = INFINITE, bool* timedOut = nullptr) {
+        if (timedOut) *timedOut = false;
+        if (fence->GetCompletedValue() >= value) return true;
+        const HRESULT hr = fence->SetEventOnCompletion(value, fenceEvent);
+        if (FAILED(hr)) {
+            fprintf(stderr, "[d3d12] SetEventOnCompletion(%llu) failed: 0x%08lX\n",
+                    (unsigned long long)value, (unsigned long)hr);
+            return false;
         }
+        const DWORD result = WaitForSingleObject(fenceEvent, timeoutMs);
+        if (result == WAIT_OBJECT_0) return true;
+        if (result == WAIT_TIMEOUT && timedOut) *timedOut = true;
+        fprintf(stderr, "[d3d12] wait_fence(%llu) failed: %lu\n",
+                (unsigned long long)value, (unsigned long)result);
+        return false;
+    }
+
+    bool wait_gpu() {
+        const double t0 = g_timing.enabled ? g_timing.now() : 0.0;
+        fenceVal++;
+        if (FAILED(queue->Signal(fence, fenceVal))) {
+            fprintf(stderr, "[d3d12] queue->Signal failed\n");
+            return false;
+        }
+        if (!wait_fence(fenceVal)) return false;
+        if (g_timing.enabled) g_timing.gpuFenceWait += g_timing.now() - t0;
         return true;
     }
 };
@@ -371,7 +515,7 @@ static ID3D12Resource* create_tex(ID3D12Device* dev, UINT w, UINT h,
 }
 
 static bool init_d3d(int wantAdapter, UINT inW, UINT inH, UINT outW, UINT outH,
-                     bool lowResMv, bool responsiveMask, D3D12Ctx& c) {
+                     bool lowResMv, bool responsiveMask, bool timing, D3D12Ctx& c) {
     IDXGIAdapter1* ad = pick_adapter(wantAdapter);
     if (!ad) { fprintf(stderr, "[d3d12] 没有可用适配器\n"); return false; }
     DXGI_ADAPTER_DESC1 desc;
@@ -390,12 +534,16 @@ static bool init_d3d(int wantAdapter, UINT inW, UINT inH, UINT outW, UINT outH,
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(c.dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&c.queue)))) return false;
-    if (FAILED(c.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&c.alloc)))) return false;
-    if (FAILED(c.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, c.alloc, nullptr,
-                                        IID_PPV_ARGS(&c.list)))) return false;
-    c.list->Close();
     if (FAILED(c.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&c.fence)))) return false;
     c.fenceEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+
+    if (timing) {
+        c.queue->GetTimestampFrequency(&c.queueFreq);
+        D3D12_QUERY_HEAP_DESC qhd{};
+        qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qhd.Count = 8 * PIPE_DEPTH;
+        if (FAILED(c.dev->CreateQueryHeap(&qhd, IID_PPV_ARGS(&c.queryHeap)))) return false;
+    }
 
     c.colorTex = create_tex(c.dev, inW, inH, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
                             D3D12_RESOURCE_STATE_COPY_DEST, "xess_color");
@@ -452,37 +600,61 @@ static bool init_d3d(int wantAdapter, UINT inW, UINT inH, UINT outW, UINT outH,
     UINT64 upSize = c.maskOffset + (responsiveMask ? (UINT64)c.maskPitch * inH : 0);
     if (!responsiveMask) upSize = c.depthOffset + (lowResMv ? (UINT64)c.depthPitch * inH : 0);
     if (!lowResMv && !responsiveMask) upSize = c.velOffset + (UINT64)c.velPitch * velocityH;
-    D3D12_RESOURCE_DESC ud{};
-    ud.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    ud.Alignment = 0;
-    ud.Width = upSize;
-    ud.Height = 1;
-    ud.DepthOrArraySize = 1;
-    ud.MipLevels = 1;
-    ud.SampleDesc = {1, 0};
-    ud.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    D3D12_HEAP_PROPERTIES upHp{};
-    upHp.Type = D3D12_HEAP_TYPE_UPLOAD;
-    if (FAILED(c.dev->CreateCommittedResource(&upHp, D3D12_HEAP_FLAG_NONE, &ud,
-                                              D3D12_RESOURCE_STATE_GENERIC_READ,
-                                              nullptr, IID_PPV_ARGS(&c.uploadBuf))))
-        return false;
     c.readPitch = align_up(outW * 4, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
-    D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Alignment = 0;
-    rd.Width = (UINT64)c.readPitch * outH;
-    rd.Height = 1;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.SampleDesc = {1, 0};
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     D3D12_HEAP_PROPERTIES rbHp{};
     rbHp.Type = D3D12_HEAP_TYPE_READBACK;
-    if (FAILED(c.dev->CreateCommittedResource(&rbHp, D3D12_HEAP_FLAG_NONE, &rd,
-                                              D3D12_RESOURCE_STATE_COPY_DEST,
-                                              nullptr, IID_PPV_ARGS(&c.readbackBuf))))
-        return false;
+
+    // 每个流水线槽：命令分配器/列表 + 持久映射上传/回读缓冲（+ GPU 计时结果缓冲）
+    for (int slotIndex = 0; slotIndex < PIPE_DEPTH; slotIndex++) {
+        D3D12Ctx::Slot& s = c.slots[slotIndex];
+        if (FAILED(c.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                 IID_PPV_ARGS(&s.alloc)))) return false;
+        if (FAILED(c.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.alloc, nullptr,
+                                            IID_PPV_ARGS(&s.list)))) return false;
+        s.list->Close();
+
+        D3D12_RESOURCE_DESC ud{};
+        ud.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        ud.Alignment = 0;
+        ud.Width = upSize;
+        ud.Height = 1;
+        ud.DepthOrArraySize = 1;
+        ud.MipLevels = 1;
+        ud.SampleDesc = {1, 0};
+        ud.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES upHp{};
+        upHp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        if (FAILED(c.dev->CreateCommittedResource(&upHp, D3D12_HEAP_FLAG_NONE, &ud,
+                                                  D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                  nullptr, IID_PPV_ARGS(&s.upload))))
+            return false;
+        if (FAILED(s.upload->Map(0, nullptr, reinterpret_cast<void**>(&s.uploadPtr)))) return false;
+
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Alignment = 0;
+        rd.Width = (UINT64)c.readPitch * outH;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc = {1, 0};
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(c.dev->CreateCommittedResource(&rbHp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST,
+                                                  nullptr, IID_PPV_ARGS(&s.readback))))
+            return false;
+        if (FAILED(s.readback->Map(0, nullptr, reinterpret_cast<void**>(&s.readbackPtr)))) return false;
+
+        if (timing) {
+            D3D12_RESOURCE_DESC qrd = rd;
+            qrd.Width = 4 * sizeof(UINT64);
+            if (FAILED(c.dev->CreateCommittedResource(&rbHp, D3D12_HEAP_FLAG_NONE, &qrd,
+                                                      D3D12_RESOURCE_STATE_COPY_DEST,
+                                                      nullptr, IID_PPV_ARGS(&s.queryResult))))
+                return false;
+        }
+    }
+
     // 调试回读缓冲（颜色纹理验证用，尺寸 = 输入）
     D3D12_RESOURCE_DESC drd{};
     drd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -500,82 +672,92 @@ static bool init_d3d(int wantAdapter, UINT inW, UINT inH, UINT outW, UINT outH,
     return true;
 }
 
-// 上传一帧 + 执行 XeSS + 回读一帧（全部录制到同一个命令列表，一次提交）
-static bool process_frame(D3D12Ctx& c, const uint8_t* rgb, const float* velLow,
-                           const float* depthLow, const uint8_t* maskLow,
-                           xess_context_handle_t xessCtx, const CmdArgs& a, FILE* outFp,
-                           int frameIdx, bool resetHistory) {
-    ID3D12GraphicsCommandList* L = c.list;
-    c.alloc->Reset();
-    L->Reset(c.alloc, nullptr);
-
-    // 填充上行缓冲：颜色 RGB->RGBA；运动矢量 低分辨率 float32 -> 放大+半精度
+// CPU 侧：把一帧输入写进槽位的持久映射上传缓冲。调用方已通过 fence+信号量
+// 保证该槽位的上一帧已完成 GPU 执行且已被写线程消费。
+static void fill_upload(D3D12Ctx& c, D3D12Ctx::Slot& slot, const uint8_t* rgb,
+                        const float* velLow, const float* depthLow, const uint8_t* maskLow,
+                        const CmdArgs& a, std::vector<uint16_t>& velocityScratch) {
+    const bool timing = g_timing.enabled;
+    const double tFill = timing ? g_timing.now() : 0.0;
     const int velocityW = a.lowResMv ? a.inW : a.outW;
     const int velocityH = a.lowResMv ? a.inH : a.outH;
-    std::vector<uint16_t> velocity((size_t)velocityW * velocityH * 2);
+    velocityScratch.resize((size_t)velocityW * velocityH * 2);
+    uint16_t* velocity = velocityScratch.data();
     if (a.lowResMv) {
+        // FP16 保持旧标量逐位一致（F16C 硬件舍入差异见上方说明）。
         for (size_t i = 0; i < (size_t)a.inW * a.inH * 2; ++i)
             velocity[i] = f32_to_f16(velLow[i]);
     } else {
-        upsample_velocity(velLow, velocity.data(), a.inW, a.inH, a.outW, a.outH,
-                          a.nearestMv);
+        upsample_velocity(velLow, velocity, a.inW, a.inH, a.outW, a.outH, a.nearestMv);
     }
 
-    void* upPtr = nullptr;
-    if (FAILED(c.uploadBuf->Map(0, nullptr, &upPtr))) return false;
-    uint8_t* colorDst = (uint8_t*)upPtr;
+    uint8_t* upPtr = slot.uploadPtr;
+    uint8_t* colorDst = upPtr;
+    const uint8_t* rgbEnd = rgb + (size_t)a.inH * a.inW * 3;
     for (int y = 0; y < a.inH; y++) {
-        const uint8_t* src = rgb + (size_t)y * a.inW * 3;
-        uint8_t* dst = colorDst + (size_t)y * c.colorPitch;
-        for (int x = 0; x < a.inW; x++) {
-            dst[x * 4 + 0] = src[x * 3 + 0];
-            dst[x * 4 + 1] = src[x * 3 + 1];
-            dst[x * 4 + 2] = src[x * 3 + 2];
-            dst[x * 4 + 3] = 255;
-        }
+        convert_rgb24_to_rgba8(rgb + (size_t)y * a.inW * 3,
+                               colorDst + (size_t)y * c.colorPitch, a.inW, rgbEnd);
     }
-    uint8_t* velDst = (uint8_t*)upPtr + c.velOffset;
+    uint8_t* velDst = upPtr + c.velOffset;
     for (int y = 0; y < velocityH; y++)
         memcpy(velDst + (size_t)y * c.velPitch,
-               (const uint8_t*)velocity.data() + (size_t)y * velocityW * 4, (size_t)velocityW * 4);
-    if (a.lowResMv) {
-        if (!depthLow) { c.uploadBuf->Unmap(0, nullptr); return false; }
-        uint8_t* depthDst = (uint8_t*)upPtr + c.depthOffset;
+               (const uint8_t*)velocity + (size_t)y * velocityW * 4, (size_t)velocityW * 4);
+    if (a.lowResMv && depthLow) {
+        uint8_t* depthDst = upPtr + c.depthOffset;
         for (int y = 0; y < a.inH; ++y)
             memcpy(depthDst + (size_t)y * c.depthPitch,
                    depthLow + (size_t)y * a.inW, (size_t)a.inW * sizeof(float));
     }
-    if (a.responsiveMask) {
-        if (!maskLow) { c.uploadBuf->Unmap(0, nullptr); return false; }
-        uint8_t* maskDst = (uint8_t*)upPtr + c.maskOffset;
+    if (a.responsiveMask && maskLow) {
+        uint8_t* maskDst = upPtr + c.maskOffset;
         for (int y = 0; y < a.inH; ++y)
             memcpy(maskDst + (size_t)y * c.maskPitch,
                    maskLow + (size_t)y * a.inW, (size_t)a.inW);
     }
-    c.uploadBuf->Unmap(0, nullptr);
+    if (timing) g_timing.textureUpload += g_timing.now() - tFill;
+}
+
+// GPU 录制 + 提交：上行拷贝 -> 屏障 -> XeSS 执行 -> 回读拷贝，录进本槽命令列表，
+// 提交后立刻返回（不等 GPU），由后续的 fence 等待统一收口。
+static bool record_and_submit(D3D12Ctx& c, D3D12Ctx::Slot& slot,
+                              xess_context_handle_t xessCtx, const CmdArgs& a,
+                              int frameIdx, bool resetHistory) {
+    ID3D12GraphicsCommandList* L = slot.list;
+    const bool timing = g_timing.enabled;
+    const double tUpload = timing ? g_timing.now() : 0.0;
+    slot.alloc->Reset();
+    L->Reset(slot.alloc, nullptr);
+
+    const int velocityW = a.lowResMv ? a.inW : a.outW;
+    const int velocityH = a.lowResMv ? a.inH : a.outH;
 
     D3D12_TEXTURE_COPY_LOCATION dstC = { c.colorTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
-    D3D12_TEXTURE_COPY_LOCATION srcC = { c.uploadBuf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, 0 };
+    D3D12_TEXTURE_COPY_LOCATION srcC = { slot.upload, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, 0 };
     srcC.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, (UINT)a.inW, (UINT)a.inH, 1, c.colorPitch };
+    if (timing) L->EndQuery(c.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
     L->CopyTextureRegion(&dstC, 0, 0, 0, &srcC, nullptr);
     D3D12_TEXTURE_COPY_LOCATION dstV = { c.velTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
-    D3D12_TEXTURE_COPY_LOCATION srcV = { c.uploadBuf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+    D3D12_TEXTURE_COPY_LOCATION srcV = { slot.upload, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                                          c.velOffset };
     srcV.PlacedFootprint.Footprint = { DXGI_FORMAT_R16G16_FLOAT, (UINT)velocityW, (UINT)velocityH, 1, c.velPitch };
     L->CopyTextureRegion(&dstV, 0, 0, 0, &srcV, nullptr);
     if (a.lowResMv) {
         D3D12_TEXTURE_COPY_LOCATION dstD = { c.depthTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
-        D3D12_TEXTURE_COPY_LOCATION srcD = { c.uploadBuf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        D3D12_TEXTURE_COPY_LOCATION srcD = { slot.upload, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                                              c.depthOffset };
         srcD.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_FLOAT, (UINT)a.inW, (UINT)a.inH, 1, c.depthPitch };
         L->CopyTextureRegion(&dstD, 0, 0, 0, &srcD, nullptr);
     }
     if (a.responsiveMask) {
         D3D12_TEXTURE_COPY_LOCATION dstM = { c.maskTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
-        D3D12_TEXTURE_COPY_LOCATION srcM = { c.uploadBuf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        D3D12_TEXTURE_COPY_LOCATION srcM = { slot.upload, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                                              c.maskOffset };
         srcM.PlacedFootprint.Footprint = { DXGI_FORMAT_R8_UNORM, (UINT)a.inW, (UINT)a.inH, 1, c.maskPitch };
         L->CopyTextureRegion(&dstM, 0, 0, 0, &srcM, nullptr);
+    }
+    if (timing) {
+        L->EndQuery(c.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        g_timing.textureUpload += g_timing.now() - tUpload;
     }
 
     auto bar = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
@@ -595,6 +777,7 @@ static bool process_frame(D3D12Ctx& c, const uint8_t* rgb, const float* velLow,
         bar(c.maskTex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     bar(c.outTex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
+    const double tExec = timing ? g_timing.now() : 0.0;
     xess_d3d12_execute_params_t exec{};
     exec.inputWidth = (uint32_t)a.inW;
     exec.inputHeight = (uint32_t)a.inH;
@@ -611,16 +794,19 @@ static bool process_frame(D3D12Ctx& c, const uint8_t* rgb, const float* velLow,
     exec.pDescriptorHeap = nullptr;
     exec.descriptorHeapOffset = 0;
     int64_t rc = xessD3D12Execute(xessCtx, L, &exec);
+    if (timing) g_timing.xessExecuteCpu += g_timing.now() - tExec;
     if (rc != XESS_RESULT_SUCCESS) {
         fprintf(stderr, "[xess] Execute 帧 %d 失败: %s\n", frameIdx, xess_err_str(rc));
         return false;
     }
+    if (timing) L->EndQuery(c.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
 
     bar(c.outTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION srcO = { c.outTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
-    D3D12_TEXTURE_COPY_LOCATION dstO = { c.readbackBuf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, 0 };
+    D3D12_TEXTURE_COPY_LOCATION dstO = { slot.readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, 0 };
     dstO.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, (UINT)a.outW, (UINT)a.outH, 1, c.readPitch };
     L->CopyTextureRegion(&dstO, 0, 0, 0, &srcO, nullptr);
+    if (timing) L->EndQuery(c.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
     bar(c.colorTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     bar(c.velTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     if (a.lowResMv)
@@ -629,40 +815,69 @@ static bool process_frame(D3D12Ctx& c, const uint8_t* rgb, const float* velLow,
         bar(c.maskTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     bar(c.outTex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 
+    if (timing)
+        L->ResolveQueryData(c.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, slot.queryResult, 0);
     L->Close();
     ID3D12CommandList* lists[] = { L };
     c.queue->ExecuteCommandLists(1, lists);
-    c.wait_gpu();
+    c.fenceVal++;
+    if (FAILED(c.queue->Signal(c.fence, c.fenceVal))) {
+        fprintf(stderr, "[d3d12] queue->Signal failed at frame %d\n", frameIdx);
+        return false;
+    }
+    slot.lastFence = c.fenceVal;
+    return true;
+}
 
-    void* rbPtr = nullptr;
-    if (FAILED(c.readbackBuf->Map(0, nullptr, &rbPtr))) return false;
-    const uint8_t* src = (const uint8_t*)rbPtr;
-    std::vector<uint8_t> rowBuf((size_t)a.outW * 3);
-    for (int y = 0; y < a.outH; y++) {
-        const uint8_t* row = src + (size_t)y * c.readPitch;
-        for (int x = 0; x < a.outW; x++) {          // RGBA -> RGB，跳过 alpha
-            rowBuf[x * 3 + 0] = row[x * 4 + 0];
-            rowBuf[x * 3 + 1] = row[x * 4 + 1];
-            rowBuf[x * 3 + 2] = row[x * 4 + 2];
-        }
-        if (fwrite(rowBuf.data(), 3, (size_t)a.outW, outFp) != (size_t)a.outW) {
-            c.readbackBuf->Unmap(0, nullptr);
-            return false;
+// 写出侧：等本帧 GPU 完成（含回读拷贝），RGBA->RGB 打包进预分配的
+// frameBuf 后单次落盘（保留 row-pitch 处理；行缓冲即 frameBuf 的分段）。
+static bool write_frame(D3D12Ctx& c, D3D12Ctx::Slot& slot, FILE* outFp, const CmdArgs& a,
+                        std::vector<uint8_t>& frameBuf) {
+    const bool timing = g_timing.enabled;
+    const double tFence = timing ? g_timing.now() : 0.0;
+    if (!c.wait_fence(slot.lastFence)) return false;
+    if (timing) g_timing.gpuFenceWait += g_timing.now() - tFence;
+
+    if (timing && slot.queryResult) {
+        UINT64 ts[4];
+        void* qp = nullptr;
+        if (SUCCEEDED(slot.queryResult->Map(0, nullptr, &qp))) {
+            memcpy(ts, qp, sizeof(ts));
+            slot.queryResult->Unmap(0, nullptr);
+            const double invFreq = c.queueFreq ? 1.0 / (double)c.queueFreq : 0.0;
+            g_timing.textureUploadGpu += (double)(ts[1] - ts[0]) * invFreq;
+            g_timing.xessExecuteGpu += (double)(ts[2] - ts[1]) * invFreq;
+            g_timing.readbackCopyGpu += (double)(ts[3] - ts[2]) * invFreq;
         }
     }
-    c.readbackBuf->Unmap(0, nullptr);
+
+    const uint8_t* src = slot.readbackPtr;
+    uint8_t* dst = frameBuf.data();
+    const size_t rowBytes = (size_t)a.outW * 3;
+    const double tWrite = timing ? g_timing.now() : 0.0;
+    for (int y = 0; y < a.outH; y++) {
+        convert_rgba8_to_rgb24(src + (size_t)y * c.readPitch,
+                               dst + (size_t)y * rowBytes, a.outW);
+    }
+    if (fwrite(frameBuf.data(), 1, rowBytes * (size_t)a.outH, outFp) !=
+        rowBytes * (size_t)a.outH)
+        return false;
+    if (timing) {
+        g_timing.stdoutWrite += g_timing.now() - tWrite;
+        g_timing.frames++;
+    }
     return true;
 }
 
 // 调试：只验证上传链路（颜色 RGB->RGBA -> CopyTextureRegion -> 回读），不跑 XeSS
 static bool dbg_upload_frame(D3D12Ctx& c, const uint8_t* rgb, const CmdArgs& a,
                              const char* outPath) {
-    ID3D12GraphicsCommandList* L = c.list;
-    c.alloc->Reset();
-    L->Reset(c.alloc, nullptr);
-    void* upPtr = nullptr;
-    if (FAILED(c.uploadBuf->Map(0, nullptr, &upPtr))) return false;
-    uint8_t* colorDst = (uint8_t*)upPtr;
+    D3D12Ctx::Slot& slot = c.slots[0];
+    ID3D12GraphicsCommandList* L = slot.list;
+    slot.alloc->Reset();
+    L->Reset(slot.alloc, nullptr);
+    uint8_t* upPtr = slot.uploadPtr;
+    uint8_t* colorDst = upPtr;
     for (int y = 0; y < a.inH; y++) {
         const uint8_t* src = rgb + (size_t)y * a.inW * 3;
         uint8_t* dst = colorDst + (size_t)y * c.colorPitch;
@@ -673,9 +888,8 @@ static bool dbg_upload_frame(D3D12Ctx& c, const uint8_t* rgb, const CmdArgs& a,
             dst[x * 4 + 3] = 255;
         }
     }
-    c.uploadBuf->Unmap(0, nullptr);
     D3D12_TEXTURE_COPY_LOCATION dstC = { c.colorTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
-    D3D12_TEXTURE_COPY_LOCATION srcC = { c.uploadBuf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, 0 };
+    D3D12_TEXTURE_COPY_LOCATION srcC = { slot.upload, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, 0 };
     srcC.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, (UINT)a.inW, (UINT)a.inH, 1, c.colorPitch };
     L->CopyTextureRegion(&dstC, 0, 0, 0, &srcC, nullptr);
     D3D12_RESOURCE_BARRIER b{};
@@ -721,82 +935,108 @@ struct StreamFrame {
     uint32_t flags = 0;
 };
 
+// 每帧复用的临时缓冲（管道路径），热路径不再逐帧分配 packet/payload。
+struct StreamScratch {
+    std::vector<uint8_t> buf;  // [XSPK 头 48B][color][motion][depth][mask]
+};
+
 // Returns 1 for a frame, 0 for EOS, and -1 for invalid/truncated input.
+// ring 路径零拷贝：peek 拿槽位视图，直接校验/CRC/按字段拷进 frame，再
+// commit 释放槽位；管道路径读进复用的 StreamScratch 缓冲，同样省去
+// packet+payload 两段临时容器。
 static int read_stream_frame(FILE* input, XessSharedRingReader* ring,
-                             const CmdArgs& a, int expectedIndex, StreamFrame& frame) {
-    std::vector<uint8_t> packet;
+                             const CmdArgs& a, int expectedIndex,
+                             StreamFrame& frame, StreamScratch& scratch) {
     StreamHeader header{};
+    const uint8_t* payload = nullptr;
+    uint64_t total64 = 0;
     if (ring) {
-        if (!ring->read(packet) || packet.size() < sizeof(header)) {
+        XessSharedRingReader::SlotView view;
+        if (!ring->peek(view)) {
             fprintf(stderr, "[shm] missing packet at frame %d\n", expectedIndex);
             return -1;
         }
-        memcpy(&header, packet.data(), sizeof(header));
-    } else if (!read_exact(input, &header, sizeof(header))) {
-        fprintf(stderr, "[stream] truncated header at frame %d\n", expectedIndex);
-        return -1;
+        if (view.size < sizeof(header)) {
+            fprintf(stderr, "[shm] undersized packet at frame %d\n", expectedIndex);
+            ring->abort();
+            return -1;
+        }
+        memcpy(&header, view.data, sizeof(header));
+        payload = view.data + sizeof(header);
+        total64 = (uint64_t)view.size - sizeof(header);
+    } else {
+        if (!read_exact(input, &header, sizeof(header))) {
+            fprintf(stderr, "[stream] truncated header at frame %d\n", expectedIndex);
+            return -1;
+        }
+        total64 = (uint64_t)header.colorBytes + header.motionBytes +
+                  header.depthBytes + header.maskBytes;
+        if (total64 > 512ull * 1024 * 1024) {
+            fprintf(stderr, "[stream] metadata mismatch at frame %d\n", expectedIndex);
+            return -1;
+        }
+        if (scratch.buf.size() < (size_t)total64)
+            scratch.buf.resize((size_t)total64);
+        if (!read_exact(input, scratch.buf.data(), (size_t)total64)) {
+            fprintf(stderr, "[stream] truncated payload at frame %d\n", expectedIndex);
+            return -1;
+        }
+        payload = scratch.buf.data();  // 仅负载区（不含协议头），与 CRC 语义一致
     }
     if (memcmp(header.magic, "XSPK", 4) || header.version != 1 ||
         header.headerSize != sizeof(StreamHeader)) {
         fprintf(stderr, "[stream] invalid protocol header at frame %d\n", expectedIndex);
+        if (ring) ring->abort();
         return -1;
     }
     if (header.flags & STREAM_FLAG_EOS) {
         if (header.frameIndex != (uint32_t)expectedIndex || header.colorBytes ||
             header.motionBytes || header.depthBytes || header.maskBytes) {
             fprintf(stderr, "[stream] malformed EOS packet\n");
+            if (ring) ring->abort();
             return -1;
         }
+        if (ring) ring->commit();
         return 0;
     }
-    const uint64_t total64 = (uint64_t)header.colorBytes + header.motionBytes +
-                             header.depthBytes + header.maskBytes;
+    const size_t pixels = (size_t)a.inW * a.inH;
     if (total64 > 512ull * 1024 * 1024 || header.frameIndex != (uint32_t)expectedIndex ||
         header.width != (uint32_t)a.inW || header.height != (uint32_t)a.inH ||
         header.pixelFormat != 1) {
         fprintf(stderr, "[stream] metadata mismatch at frame %d\n", expectedIndex);
+        if (ring) ring->abort();
         return -1;
     }
-    const size_t pixels = (size_t)a.inW * a.inH;
     if (header.colorBytes != pixels * 3 || header.motionBytes != pixels * 2 * sizeof(float) ||
         (header.depthBytes && header.depthBytes != pixels * sizeof(float)) ||
         (header.maskBytes && header.maskBytes != pixels) ||
         (a.lowResMv && header.depthBytes != pixels * sizeof(float)) ||
         (a.responsiveMask && header.maskBytes != pixels)) {
         fprintf(stderr, "[stream] payload sizes mismatch at frame %d\n", expectedIndex);
+        if (ring) ring->abort();
         return -1;
     }
-    std::vector<uint8_t> payload((size_t)total64);
-    if (ring) {
-        if (packet.size() != sizeof(header) + payload.size()) {
-            fprintf(stderr, "[shm] packet length mismatch at frame %d\n", expectedIndex);
-            return -1;
-        }
-        memcpy(payload.data(), packet.data() + sizeof(header), payload.size());
-    } else if (!read_exact(input, payload.data(), payload.size())) {
-        fprintf(stderr, "[stream] truncated payload at frame %d\n", expectedIndex);
-        return -1;
-    }
-    if (crc32_bytes(payload.data(), payload.size()) != header.checksum) {
+    if (crc32_bytes(payload, (size_t)total64) != header.checksum) {
         fprintf(stderr, "[stream] checksum mismatch at frame %d\n", expectedIndex);
+        if (ring) ring->abort();
         return -1;
     }
     size_t offset = 0;
-    frame.color.assign(payload.begin(), payload.begin() + header.colorBytes);
+    frame.color.assign(payload + offset, payload + offset + header.colorBytes);
     offset += header.colorBytes;
     frame.motion.resize(pixels * 2);
-    memcpy(frame.motion.data(), payload.data() + offset, header.motionBytes);
+    memcpy(frame.motion.data(), payload + offset, header.motionBytes);
     offset += header.motionBytes;
-    frame.depth.clear();
     if (header.depthBytes) {
-        frame.depth.resize(pixels);
-        memcpy(frame.depth.data(), payload.data() + offset, header.depthBytes);
+        if (frame.depth.size() != pixels) frame.depth.resize(pixels);
+        memcpy(frame.depth.data(), payload + offset, header.depthBytes);
+    } else {
+        frame.depth.clear();
     }
     offset += header.depthBytes;
-    frame.mask.clear();
-    if (header.maskBytes)
-        frame.mask.assign(payload.begin() + offset, payload.begin() + offset + header.maskBytes);
+    frame.mask.assign(payload + offset, payload + offset + header.maskBytes);
     frame.flags = header.flags;
+    if (ring) ring->commit();
     return 1;
 }
 
@@ -806,8 +1046,21 @@ int main(int argc, char** argv) {
         fprintf(stderr, "usage: xess-vsr.exe [--stream [--shm-name NAME --shm-slots N --shm-slot-size N] "
                         "| --frames in.raw --mv DIR --out out.raw] "
                         "--in-w W --in-h H --out-w OW --out-h OH --frames-count N "
-                        "[--mv-path highres|lowres-depth] [--depth DIR] [--mask DIR]\n");
+                        "[--mv-path highres|lowres-depth] [--depth DIR] [--mask DIR] [--stage-timing]\n");
         return 2;
+    }
+    detect_cpu_features();
+    if (g_avx2 || g_f16c)
+        fprintf(stderr, "[cpu] avx2=%d f16c=%d\n", g_avx2 ? 1 : 0, g_f16c ? 1 : 0);
+    if (!a.stageTiming) {
+        const char* envTiming = getenv("XESS_STAGE_TIMING");
+        if (envTiming && *envTiming && _stricmp(envTiming, "0") &&
+            _stricmp(envTiming, "false") && _stricmp(envTiming, "off"))
+            a.stageTiming = true;
+    }
+    if (a.stageTiming) {
+        g_timing.begin();
+        g_timing.enabled = true;
     }
 
     if (a.stream) {
@@ -824,7 +1077,7 @@ int main(int argc, char** argv) {
 
     D3D12Ctx d3d;
     if (!init_d3d(a.device, a.inW, a.inH, a.outW, a.outH,
-                  a.lowResMv, a.responsiveMask, d3d)) return 1;
+                  a.lowResMv, a.responsiveMask, g_timing.enabled, d3d)) return 1;
 
     if (a.dbgUpload) {
         std::vector<uint8_t> rgb((size_t)a.inW * a.inH * 3);
@@ -944,83 +1197,158 @@ int main(int argc, char** argv) {
     char path[1024];
     bool complete = true;
     StreamFrame streamFrame;
+    StreamScratch streamScratch;
+    std::vector<uint16_t> velocityScratch;
+    std::vector<uint8_t> outputBuf((size_t)a.outW * a.outH * 3);  // 预分配，循环复用
 
-    for (int i = 0; i < a.framesCount; i++) {
-        bool reset = resetHistory[(size_t)i] != 0;
-        if (a.stream) {
-            const int streamResult = read_stream_frame(rawIn, sharedRingPtr, a, i, streamFrame);
-            if (streamResult != 1) {
-                fprintf(stderr, "[stream] expected frame %d, got %s\n", i,
-                        streamResult == 0 ? "early EOS" : "invalid input");
+    // 3 槽流水线主循环：
+    //   生产段 —— 取输入 -> CPU 填上传缓冲 -> 录制并提交 GPU（不等完成）
+    //   写出段 —— 等帧 N 的 fence -> RGBA->RGB 落盘
+    // 槽位复用只由每槽 fence 保证：提交前等该槽上一帧 GPU 完成；写帧严格按
+    // 提交顺序由同一线程完成，因此槽位不会被未消费的回读数据覆写。
+    int submitted = 0;
+    int written = 0;
+    uint64_t lastSubmittedFence = 0;
+    while (written < a.framesCount && complete) {
+        while (complete && submitted < a.framesCount && submitted - written < PIPE_DEPTH) {
+            D3D12Ctx::Slot& slot = d3d.slots[submitted % PIPE_DEPTH];
+            const double tSlotFence = g_timing.enabled ? g_timing.now() : 0.0;
+            if (slot.lastFence && !d3d.wait_fence(slot.lastFence)) {
+                fprintf(stderr, "[d3d12] slot fence wait failed before frame %d\n", submitted);
                 complete = false;
                 break;
             }
-            rgb = streamFrame.color;
-            velLow = streamFrame.motion;
-            if (a.lowResMv) depthLow = streamFrame.depth;
-            if (a.responsiveMask) maskLow = streamFrame.mask;
-            reset = (streamFrame.flags & (STREAM_FLAG_RESET | STREAM_FLAG_SCENE_CUT)) != 0;
-        } else {
-            if (!read_exact(rawIn, rgb.data(), rgb.size())) {
-                fprintf(stderr, "[io] incomplete color frame %d\n", i);
-                complete = false;
-                break;
-            }
-            snprintf(path, sizeof(path), "%s\\mv_%06d.bin", a.mvDir, i);
-            FILE* file = fopen(path, "rb");
-            if (!file || !read_exact(file, velLow.data(), velLow.size() * sizeof(float))) {
-                fprintf(stderr, "[io] missing/incomplete motion file %s\n", path);
-                if (file) fclose(file);
-                complete = false;
-                break;
-            }
-            fclose(file);
-            if (a.lowResMv) {
-                snprintf(path, sizeof(path), "%s\\depth_%06d.bin", a.depthDir, i);
-                file = fopen(path, "rb");
-                if (!file || !read_exact(file, depthLow.data(), depthLow.size() * sizeof(float))) {
-                    fprintf(stderr, "[io] missing/incomplete depth file %s\n", path);
+            if (g_timing.enabled) g_timing.gpuFenceWait += g_timing.now() - tSlotFence;
+
+            const int i = submitted;
+            const double tInput = g_timing.enabled ? g_timing.now() : 0.0;
+            bool reset = resetHistory[(size_t)i] != 0;
+            if (a.stream) {
+                const int streamResult = read_stream_frame(rawIn, sharedRingPtr, a, i,
+                                                           streamFrame, streamScratch);
+                if (streamResult != 1) {
+                    fprintf(stderr, "[stream] expected frame %d, got %s\n", i,
+                            streamResult == 0 ? "early EOS" : "invalid input");
+                    complete = false;
+                    break;
+                }
+                // 交换容器所有权，零拷贝把帧数据移交给上游缓冲。
+                rgb.swap(streamFrame.color);
+                velLow.swap(streamFrame.motion);
+                if (a.lowResMv) depthLow.swap(streamFrame.depth);
+                if (a.responsiveMask) maskLow.swap(streamFrame.mask);
+                reset = (streamFrame.flags & (STREAM_FLAG_RESET | STREAM_FLAG_SCENE_CUT)) != 0;
+            } else {
+                if (!read_exact(rawIn, rgb.data(), rgb.size())) {
+                    fprintf(stderr, "[io] incomplete color frame %d\n", i);
+                    complete = false;
+                    break;
+                }
+                snprintf(path, sizeof(path), "%s\\mv_%06d.bin", a.mvDir, i);
+                FILE* file = fopen(path, "rb");
+                if (!file || !read_exact(file, velLow.data(), velLow.size() * sizeof(float))) {
+                    fprintf(stderr, "[io] missing/incomplete motion file %s\n", path);
                     if (file) fclose(file);
                     complete = false;
                     break;
                 }
                 fclose(file);
-            }
-            if (a.responsiveMask) {
-                snprintf(path, sizeof(path), "%s\\mask_%06d.bin", a.maskDir, i);
-                file = fopen(path, "rb");
-                if (!file || !read_exact(file, maskLow.data(), maskLow.size())) {
-                    fprintf(stderr, "[io] missing/incomplete mask file %s\n", path);
-                    if (file) fclose(file);
-                    complete = false;
-                    break;
+                if (a.lowResMv) {
+                    snprintf(path, sizeof(path), "%s\\depth_%06d.bin", a.depthDir, i);
+                    file = fopen(path, "rb");
+                    if (!file || !read_exact(file, depthLow.data(), depthLow.size() * sizeof(float))) {
+                        fprintf(stderr, "[io] missing/incomplete depth file %s\n", path);
+                        if (file) fclose(file);
+                        complete = false;
+                        break;
+                    }
+                    fclose(file);
                 }
-                fclose(file);
+                if (a.responsiveMask) {
+                    snprintf(path, sizeof(path), "%s\\mask_%06d.bin", a.maskDir, i);
+                    file = fopen(path, "rb");
+                    if (!file || !read_exact(file, maskLow.data(), maskLow.size())) {
+                        fprintf(stderr, "[io] missing/incomplete mask file %s\n", path);
+                        if (file) fclose(file);
+                        complete = false;
+                        break;
+                    }
+                    fclose(file);
+                }
             }
+            if (g_timing.enabled) g_timing.inputRead += g_timing.now() - tInput;
+
+            fill_upload(d3d, slot, rgb.data(), velLow.data(),
+                        a.lowResMv ? depthLow.data() : nullptr,
+                        a.responsiveMask ? maskLow.data() : nullptr,
+                        a, velocityScratch);
+            if (!record_and_submit(d3d, slot, ctx, a, i, reset)) {
+                complete = false;
+                break;
+            }
+            lastSubmittedFence = slot.lastFence;
+            submitted++;
         }
+        if (!complete) break;
 
-        if (!process_frame(d3d, rgb.data(), velLow.data(),
-                           a.lowResMv ? depthLow.data() : nullptr,
-                           a.responsiveMask ? maskLow.data() : nullptr,
-                           ctx, a, outFp, i, reset)) {
+        const int i = written;
+        D3D12Ctx::Slot& slot = d3d.slots[i % PIPE_DEPTH];
+        if (!write_frame(d3d, slot, outFp, a, outputBuf)) {
+            fprintf(stderr, "[io] write failed at frame %d\n", i);
             complete = false;
             break;
         }
         if (a.verbose || (i + 1) % 25 == 0)
             fprintf(stderr, "[xess] %d/%d\n", i + 1, a.framesCount);
+        written++;
     }
 
     if (complete && a.stream) {
-        const int eosResult = read_stream_frame(rawIn, sharedRingPtr, a, a.framesCount, streamFrame);
+        const int eosResult = read_stream_frame(rawIn, sharedRingPtr, a, a.framesCount,
+                                                streamFrame, streamScratch);
         if (eosResult != 0) {
             fprintf(stderr, "[stream] missing EOS or extra frame\n");
             complete = false;
+        } else if (fflush(outFp) != 0) {
+            fprintf(stderr, "[io] stdout flush failed\n");
+            complete = false;
         }
-        fflush(outFp);
+    }
+
+    // 统一收尾：无论正常还是异常结束，销毁 XeSS 上下文与 D3D12 资源前，
+    // 必须排空仍在 GPU 队列中的在途任务（含回读拷贝）。
+    {
+        bool drainOk = true;
+        const char* drain = "skipped";
+        if (submitted > written && lastSubmittedFence) {
+            bool timedOut = false;
+            drainOk = d3d.wait_fence(lastSubmittedFence, DRAIN_TIMEOUT_MS, &timedOut);
+            drain = drainOk ? "ok" : (timedOut ? "timeout" : "failed");
+        }
+        fprintf(stderr,
+                "[drain] submitted=%d written=%d last_submitted_fence=%llu drain_result=%s\n",
+                submitted, written, (unsigned long long)lastSubmittedFence, drain);
+        if (!drainOk) complete = false;
     }
 
     if (!a.stream) { fclose(outFp); fclose(rawIn); }
     xessDestroyContext(ctx);
+    if (g_timing.enabled) {
+        fprintf(stderr,
+                "[timing] component=xess-vsr {\"frames\":%u, "
+                "\"input_read_s\": %.3f, \"ring_wait_data_s\": %.3f, "
+                "\"texture_upload_cpu_s\": %.3f, \"texture_upload_gpu_s\": %.3f, "
+                "\"xess_execute_cpu_s\": %.3f, \"xess_execute_gpu_s\": %.3f, "
+                "\"gpu_fence_wait_s\": %.3f, \"readback_copy_gpu_s\": %.3f, "
+                "\"readback_wait_s\": %.4f, \"stdout_write_s\": %.3f}\n",
+                g_timing.frames,
+                g_timing.inputRead,
+                sharedRingPtr ? sharedRingPtr->waitSeconds : 0.0,
+                g_timing.textureUpload, g_timing.textureUploadGpu,
+                g_timing.xessExecuteCpu, g_timing.xessExecuteGpu,
+                g_timing.gpuFenceWait, g_timing.readbackCopyGpu,
+                g_timing.readbackWait, g_timing.stdoutWrite);
+    }
     fprintf(stderr, "[xess] %s\n", complete ? "complete" : "failed");
     return complete ? 0 : 1;
 }

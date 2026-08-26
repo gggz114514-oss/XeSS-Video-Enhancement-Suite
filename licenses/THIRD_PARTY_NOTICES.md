@@ -19,18 +19,6 @@ and preprocessing constants.
 The Python wheel's license and metadata files are retained under
 `python/Lib/site-packages/openvino-*.dist-info`.
 
-## SEA-RAFT
-
-- Project: https://github.com/princeton-vl/SEA-RAFT
-- Model: `spring-S`
-- License: BSD 3-Clause
-
-SR 1.2 / FG 1.2 include the inference core under `sea_raft_core/` and a self-contained
-copy of the official spring-S checkpoint. The upstream license text is retained
-at `sea_raft_core/LICENSE`. The runtime changes are limited to selecting the
-PyTorch XPU device, removing optional Hugging Face integration, and loading the
-merged checkpoint without a network download.
-
 ## Intel XeSS / XeSS-FG / XeLL SDK 2.1
 
 - Vendor: Intel Corporation

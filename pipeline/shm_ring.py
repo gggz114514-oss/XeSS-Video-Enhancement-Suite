@@ -94,12 +94,19 @@ class RingOwner:
         self.close()
 
 
+def _map_part(part):
+    """Byte measure of a payload part (bytes or contiguous numpy view)."""
+    size = getattr(part, "nbytes", None)
+    return size if size is not None else len(part)
+
+
 class RingWriter:
     def __init__(self, name: str, slots: int, slot_size: int, timeout_seconds: float = 30.0):
         self.name = name
         self.slots = slots
         self.slot_size = slot_size
         self.timeout_ms = max(1, int(timeout_seconds * 1000))
+        self.wait_seconds = 0.0  # time blocked because the consumer lagged
         self._api = _windows_api()
         self.mapping = mmap.mmap(-1, _mapping_size(slots, slot_size), tagname=name,
                                  access=mmap.ACCESS_WRITE)
@@ -117,29 +124,64 @@ class RingWriter:
     def _sequences(self) -> tuple[int, int]:
         return struct.unpack_from("<QQ", self.mapping, 16)
 
+    def _wait_slot(self) -> int:
+        deadline = time.monotonic() + self.timeout_ms / 1000.0
+        while True:
+            write_sequence, read_sequence = self._sequences()
+            if write_sequence - read_sequence < self.slots:
+                return write_sequence
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SharedRingError("timed out waiting for a free shared-memory slot")
+            waited_from = time.perf_counter()
+            result = self._api.WaitForSingleObject(self.space_event,
+                                                   min(self.timeout_ms, int(remaining * 1000)))
+            self.wait_seconds += time.perf_counter() - waited_from
+            if result not in (WAIT_OBJECT_0, WAIT_TIMEOUT):
+                raise SharedRingError(f"WaitForSingleObject(space) failed: {result}")
+
     def write(self, packet: bytes) -> int:
         if len(packet) > self.slot_size:
             raise SharedRingError(
                 f"packet is {len(packet)} bytes but shared slot capacity is {self.slot_size}"
             )
-        deadline = time.monotonic() + self.timeout_ms / 1000.0
-        while True:
-            write_sequence, read_sequence = self._sequences()
-            if write_sequence - read_sequence < self.slots:
-                slot = write_sequence % self.slots
-                offset = HEADER.size + slot * (SLOT_HEADER.size + self.slot_size)
-                SLOT_HEADER.pack_into(self.mapping, offset, len(packet), 0)
-                self.mapping[offset + SLOT_HEADER.size:offset + SLOT_HEADER.size + len(packet)] = packet
-                struct.pack_into("<Q", self.mapping, 16, write_sequence + 1)
-                if not self._api.SetEvent(self.data_event):
-                    raise SharedRingError(f"SetEvent(data) failed: {ctypes.get_last_error()}")
-                return len(packet)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise SharedRingError("timed out waiting for a free shared-memory slot")
-            result = self._api.WaitForSingleObject(self.space_event, min(self.timeout_ms, int(remaining * 1000)))
-            if result not in (WAIT_OBJECT_0, WAIT_TIMEOUT):
-                raise SharedRingError(f"WaitForSingleObject(space) failed: {result}")
+        write_sequence = self._wait_slot()
+        slot = write_sequence % self.slots
+        offset = HEADER.size + slot * (SLOT_HEADER.size + self.slot_size)
+        SLOT_HEADER.pack_into(self.mapping, offset, len(packet), 0)
+        self.mapping[offset + SLOT_HEADER.size:offset + SLOT_HEADER.size + len(packet)] = packet
+        struct.pack_into("<Q", self.mapping, 16, write_sequence + 1)
+        if not self._api.SetEvent(self.data_event):
+            raise SharedRingError(f"SetEvent(data) failed: {ctypes.get_last_error()}")
+        return len(packet)
+
+    def write_parts(self, header: bytes, parts) -> int:
+        """Write a pre-split packet (protocol header + payload parts) into one slot.
+
+        ``parts`` may mix ``bytes`` and contiguous numpy arrays; each is
+        written into the mmap slot directly, so the payload is never
+        concatenated or copied through an intermediate ``bytes`` object.
+        The header must already carry the incremental CRC over the parts.
+        """
+        total = len(header) + sum(_map_part(part) for part in parts)
+        if total > self.slot_size:
+            raise SharedRingError(
+                f"packet is {total} bytes but shared slot capacity is {self.slot_size}"
+            )
+        write_sequence = self._wait_slot()
+        slot = write_sequence % self.slots
+        offset = HEADER.size + slot * (SLOT_HEADER.size + self.slot_size)
+        SLOT_HEADER.pack_into(self.mapping, offset, total, 0)
+        cursor = offset + SLOT_HEADER.size
+        for part in (header, *parts):
+            size = _map_part(part)
+            if size:
+                self.mapping[cursor:cursor + size] = part
+                cursor += size
+        struct.pack_into("<Q", self.mapping, 16, write_sequence + 1)
+        if not self._api.SetEvent(self.data_event):
+            raise SharedRingError(f"SetEvent(data) failed: {ctypes.get_last_error()}")
+        return total
 
     def flush(self) -> None:
         return

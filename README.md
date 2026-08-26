@@ -2,7 +2,7 @@
 
 面向 Windows 与 Intel Arc 的视频超分、抗锯齿和 2× 帧生成工具，同时提供独立命令行入口与中文 ComfyUI 原生 `VIDEO → VIDEO` 节点。
 
-当前版本：源码/节点 `1.1.0`，SR `1.2`，FG `1.2`，固定运行时 `2026.08.21-r1`。
+当前版本：源码/节点 `1.2.0`，SR `1.2`，FG `1.2`，固定运行时 `2026.08.27-r2`。
 
 > 这是社区项目，不是 Intel 官方产品。实机验证平台为 Windows 11 与 Intel Arc B580。
 > ## 实测环境基线
@@ -19,19 +19,16 @@
 | XPU 设备数 | 1 |
 | OpenVINO | 2025.4.1 |
 | 显卡 | Intel Arc B580 |
-| XeSS 节点提交 | `e20e986` |
-| XeSS Runtime | `2026.08.21-r1` |
+| XeSS 节点版本 | `1.2.0` |
+| XeSS Runtime | `2026.08.27-r2` |
 | 操作系统 | Windows 11 |
 
 ### 依赖说明
 
-- 极速模式使用 DIS 光流，不需要 SEA-RAFT。
-- 均衡和极致画质模式使用 SEA-RAFT，需要在 ComfyUI 实际使用的 Python 环境中提供：
-  - Intel XPU 版 PyTorch；
-  - `safetensors`；
-  - OpenVINO。
+- 所有模式统一使用 OpenCV DIS 光流，不再依赖 PyTorch XPU 或 `safetensors`；
+  SEA-RAFT 已从主线退役（实验代码归档于 `experiment/sea-raft-xpu` 分支）。
+- 旧工作流中的 SEA-RAFT 选项会自动迁移到原生 Fast DIS，并在日志提示一次。
 - `.runtime/engine` 是 XeSS 固定运行时，不是 ComfyUI 的 Python 依赖环境。
-- 不要把普通 CPU/CUDA 版 PyTorch 当作 Intel XPU 版使用。
 
 ### 反馈问题时请提供
 
@@ -98,7 +95,7 @@ https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite.git
 1. 克隆本仓库到 `ComfyUI/custom_nodes`；
 2. 安装缺失的 NumPy/OpenCV 基础依赖；
 3. 执行 `install.py`；
-4. 从固定 Release 下载一次约 303 MiB 的运行时；
+4. 从固定 Release 下载一次约 272 MiB 的运行时；
 5. 校验 SHA256 后解压到节点目录的 `.runtime/engine`。
 
 安装完成后重启 ComfyUI，搜索 `XeSS`。以后在秋叶启动器点击“更新”即可，不需要重新安装节点，也不会重复下载未变化的运行时。
@@ -143,8 +140,8 @@ Load Video → XeSS 视频超分（两挡自动） → XeSS 视频插帧（两�
 
 主档位只有两套：
 
-- `极速模式（最低挡）`：DIS 光流，速度优先；
-- `极致画质（最高挡）`：双向 SEA-RAFT、AI 深度与五帧信息，适合复杂运动。
+- `极速模式（最低挡）`：DIS 光流 + 固定锐化，速度优先；
+- `极致画质（最高挡）`：DIS 光流 + 五帧融合与自适应锐化，适合复杂运动。
 
 需要逐项调节时使用 `XeSS 视频处理/专家` 分类。完整参数方案见 [EXPERT_GUIDE.md](EXPERT_GUIDE.md)，示例工作流位于 [workflows/xess超分帧生成.json](workflows/xess超分帧生成.json)。
 
@@ -197,7 +194,7 @@ N 个输入帧严格输出 `2N-1` 帧，顺序为 `f0,G1,f1,G2...`，输出帧�
 - 每个任务使用独立工作目录，结束后清理临时数据；
 - 输出先写 `.partial.mp4`，通过分辨率、帧数和帧率验证后再原子改名；
 - 非系统盘默认保留至少 5 GiB，系统盘默认保留至少 25 GiB；
-- `.runtime` 固定资源约 624 MiB，只在 Runtime 版本变化时更新；
+- `.runtime` 固定资源约 591 MiB，只在 Runtime 版本变化时更新；
 - `--keep` 与 `--io-mode file` 只用于调试，可能产生大量文件。
 
 如需指定工作盘：
@@ -211,11 +208,11 @@ run_fg.bat "C:\Videos\input.mp4" --work-dir "F:\XeSS-Work"
 当前固定资产：
 
 ```text
-Tag: runtime-2026.08.21-r1
-Asset: xess-runtime-windows-x64-2026.08.21-r1.zip
-SHA256: 0f69db8f652d4b63d849bd8f27fa6cc8950cd7ef98bfea94461230230e85f78b
-Archive: 303.32 MiB
-Installed: 624.49 MiB
+Tag: runtime-2026.08.27-r2
+Asset: xess-runtime-windows-x64-2026.08.27-r2.zip
+SHA256: 54194b102b7faaa9d2bf5208569e5de6bdb36b43d42b2b8d946e3997d5df071e
+Archive: 271.72 MiB
+Installed: 590.54 MiB
 ```
 
 下载地址和逐文件兼容哈希由 [runtime_manifest.json](runtime_manifest.json) 固定。安装器拒绝 SHA256 不匹配、路径穿越或超出清单安全上限的压缩包。

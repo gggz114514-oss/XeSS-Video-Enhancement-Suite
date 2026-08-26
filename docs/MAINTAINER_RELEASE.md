@@ -9,7 +9,7 @@ Use this for changes under `xess_nodes.py`, `pipeline/`, `src/`, workflows or do
 3. Commit and push the Git changes.
 4. Do not rebuild or upload the fixed runtime asset.
 
-On the next ComfyUI execution, `runtime_manager.py` copies the updated `pipeline/` files into `.runtime/engine`. The user's 303 MiB asset is not downloaded again.
+On the next ComfyUI execution, `runtime_manager.py` copies the updated `pipeline/` files into `.runtime/engine`. The user's fixed runtime asset is not downloaded again.
 
 ## Fixed-runtime release
 

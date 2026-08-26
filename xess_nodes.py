@@ -7,7 +7,6 @@ import os
 import pathlib
 import struct
 import subprocess
-import sys
 import threading
 import uuid
 from typing import Callable
@@ -38,28 +37,22 @@ ENGINE_ENV = "COMFYUI_XESS_ENGINE"
 CONFIG_PATH = NODE_DIR / "xess_config.json"
 _ENGINE_LOCK = threading.Lock()
 _MODULE_CACHE: dict[tuple[pathlib.Path, str], object] = {}
-_XPU_PROBE: dict[str, str] = {}
-
-_XPU_WORK_KEYS = (
-    "TEMP", "TMP", "XDG_CACHE_HOME", "HF_HOME", "TORCH_HOME",
-    "OPENVINO_CACHE_DIR", "PYTHONIOENCODING",
-)
 
 SR_PRESETS = {
     "fast": {"flow": "dis", "bidirectional": False, "mv_path": "highres",
              "sharpen_mode": "fixed", "sharpen": 0.25, "static": 0.30, "motion": 0.16},
-    "balanced": {"flow": "sea-raft", "bidirectional": False, "mv_path": "lowres-depth",
+    "balanced": {"flow": "dis", "bidirectional": False, "mv_path": "highres",
                  "sharpen_mode": "adaptive", "sharpen": 0.30, "static": 0.34, "motion": 0.18},
-    "quality": {"flow": "sea-raft", "bidirectional": True, "mv_path": "lowres-depth",
+    "quality": {"flow": "dis", "bidirectional": False, "mv_path": "highres",
                 "sharpen_mode": "adaptive", "sharpen": 0.35, "static": 0.38, "motion": 0.20},
 }
 
 FG_PRESETS = {
     "fast": {"flow": "dis", "bidirectional": False, "window": 2,
              "sharpen_mode": "fixed", "sharpen": 0.12, "static": 0.18, "motion": 0.08},
-    "balanced": {"flow": "sea-raft", "bidirectional": False, "window": 5,
+    "balanced": {"flow": "dis", "bidirectional": False, "window": 5,
                  "sharpen_mode": "adaptive", "sharpen": 0.16, "static": 0.22, "motion": 0.10},
-    "quality": {"flow": "sea-raft", "bidirectional": True, "window": 5,
+    "quality": {"flow": "dis", "bidirectional": False, "window": 5,
                 "sharpen_mode": "adaptive", "sharpen": 0.18, "static": 0.25, "motion": 0.10},
 }
 
@@ -72,10 +65,14 @@ QUALITY_CHOICES = (
     "3 质量", "4 超高质量", "5 超高质量+", "6 原尺寸抗锯齿",
 )
 QUALITY_VALUES = {"自动（按倍率选择）": "auto"}
-FLOW_CHOICES = ("跟随处理档位", "DIS 极速", "DIS 遮挡增强", "SEA-RAFT 单向", "SEA-RAFT 双向")
+FLOW_CHOICES = ("跟随处理档位", "DIS 极速", "DIS 遮挡增强")
 FLOW_VALUES = {
     "跟随处理档位": "preset", "DIS 极速": "dis-fast", "DIS 遮挡增强": "dis-occlusion",
+    # Old English workflow values stay valid.
+    "dis-fast": "dis-fast", "dis-occlusion": "dis-occlusion",
+    # Retired SEA-RAFT choices are accepted and migrated to native Fast DIS.
     "SEA-RAFT 单向": "sea-raft-single", "SEA-RAFT 双向": "sea-raft",
+    "sea-raft-single": "sea-raft-single", "sea-raft": "sea-raft",
 }
 MV_CHOICES = ("跟随处理档位", "高分辨率运动矢量", "低分辨率运动矢量+深度")
 MV_VALUES = {
@@ -118,10 +115,10 @@ INPUT_LABELS = {
 }
 
 INPUT_TOOLTIPS = {
-    "preset": "快速适合预览；均衡适合日常成片；高质量使用双向 SEA-RAFT，耗时最高。",
+    "preset": "快速适合预览；均衡适合日常成片；高质量以更强的后处理提升细节，耗时更高。",
     "scale": "输出宽高倍率。例如 480p 到 720p 通常填 1.5。",
     "quality": "自动会根据倍率选择 XeSS 档位。倍率 1.0 时可选 6 做原尺寸抗锯齿。",
-    "flow_mode": "一般保持“跟随处理档位”。SEA-RAFT 遮挡边缘更稳，但明显更慢。",
+    "flow_mode": "一般保持“跟随处理档位”。遮挡增强用双向 DIS 换取更稳的边缘，明显更慢。",
     "mv_path": "一般保持“跟随处理档位”。高质量预设会自动使用深度辅助路径。",
     "responsive_mask": "减少细线、字幕和快速变化区域的时序拖影。",
     "temporal_fusion": "0 为关闭；建议从 0.20～0.35 开始。会增加少量耗时。",
@@ -285,121 +282,27 @@ def _load_engine_module(engine: pathlib.Path, module_name: str):
     return module
 
 
-def _xpu_probe(python: str, engine: pathlib.Path,
-               env: dict[str, str]) -> tuple[bool, str]:
-    # Match the real prepare process: OpenCV is imported by prepare_common,
-    # then SEA-RAFT initializes torch XPU, and only afterwards does the depth
-    # estimator import OpenVINO.  Importing OpenVINO before torch can select a
-    # different SYCL/Level Zero runtime on some Arc A-series installations.
-    script = (
-        "import cv2\n"
-        "import torch\n"
-        "available = bool(torch.xpu.is_available())\n"
-        "count = int(torch.xpu.device_count()) if available else 0\n"
-        "print('XPU_PROBE', torch.__version__, available, count)\n"
-        "if not available or count < 1: raise SystemExit(2)\n"
-        "probe = torch.zeros(1, device='xpu')\n"
-        "torch.xpu.synchronize()\n"
-        "import openvino\n"
-    )
-    try:
-        probe = subprocess.run(
-            [python, "-c", script], env=env, cwd=engine,
-            capture_output=True, text=True, errors="replace", timeout=45,
-            creationflags=_creation_flags(),
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, f"probe could not start: {exc}"
-    stdout = (probe.stdout or "").strip()
-    stderr = (probe.stderr or "").strip()
-    detail = f"rc={probe.returncode} stdout={stdout!r}"
-    if stderr:
-        detail += f" stderr={stderr[-1200:]!r}"
-    return probe.returncode == 0, detail
-
-
-def _inherited_xpu_environment(env: dict[str, str]) -> dict[str, str]:
-    """Restore the launcher's proven XPU environment and retain configured caches."""
-    inherited = os.environ.copy()
-    for key in _XPU_WORK_KEYS:
-        if key in env:
-            inherited[key] = env[key]
-    return inherited
-
-
-def _xpu_environment_candidates(env: dict[str, str]):
-    """Yield conservative XPU environments in recovery order."""
-    yield "node", env.copy()
-
-    inherited = _inherited_xpu_environment(env)
-    yield "inherited-main", inherited
-
-    # ONEAPI_ROOT is installed as a system variable on Windows and does not
-    # prove that setvars.bat completed.  Let the probe decide, then use the
-    # current oneAPI selector only as a fallback.
-    level_zero = inherited.copy()
-    level_zero.pop("SYCL_DEVICE_FILTER", None)
-    level_zero["ONEAPI_DEVICE_SELECTOR"] = "level_zero:*"
-    yield "level-zero", level_zero
-
-    # Older bundled SYCL runtimes may not understand ONEAPI_DEVICE_SELECTOR.
-    legacy = inherited.copy()
-    legacy.pop("ONEAPI_DEVICE_SELECTOR", None)
-    legacy["SYCL_DEVICE_FILTER"] = "level_zero:gpu"
-    yield "legacy-level-zero", legacy
-
-
-def _xpu_python(engine: pathlib.Path, flow: str, env: dict[str, str]) -> str:
-    portable = engine / "python" / "python.exe"
-    if flow != "sea-raft":
-        return os.fspath(portable)
-    current = os.path.abspath(sys.executable)
-    candidates = list(_xpu_environment_candidates(env))
-    cached = _XPU_PROBE.get(current)
-    if cached:
-        selected = next((candidate for name, candidate in candidates if name == cached), None)
-        if selected is not None:
-            env.clear()
-            env.update(selected)
-            return current
-
-    attempts: list[str] = []
-    # Compare the complete environment.  Arc launchers can supply critical
-    # Level Zero/SYCL switches without changing PATH or either device selector.
-    # Collapsing candidates on only those three values would silently skip the
-    # inherited environment that already works in ComfyUI's main process.
-    fingerprints: set[tuple[tuple[str, str], ...]] = set()
-    for name, candidate in candidates:
-        fingerprint = tuple(sorted(candidate.items()))
-        if fingerprint in fingerprints:
-            continue
-        fingerprints.add(fingerprint)
-        ok, detail = _xpu_probe(current, engine, candidate)
-        if ok:
-            env.clear()
-            env.update(candidate)
-            _XPU_PROBE[current] = name
-            print(f"[ComfyUI-XeSS] XPU subprocess environment: {name}", flush=True)
-            return current
-        attempts.append(f"{name}: {detail}")
-
-    raise XeSSNodeError(
-        "Balanced/Quality 在当前 ComfyUI Python 的子进程里无法初始化 torch.xpu。\n"
-        "已按真实导入顺序测试原节点环境、启动器原始环境和 Level Zero 回退。\n"
-        f"python={current}\n" + "\n".join(attempts)
-    )
+_MIGRATION_PRINTED = False
+_FLOW_MAPPING = {
+    "dis-fast": ("dis", False),
+    "dis-occlusion": ("dis", True),
+    # Retired SEA-RAFT choices keep old workflows running on native Fast DIS.
+    "sea-raft-single": ("dis", False),
+    "sea-raft": ("dis", False),
+}
 
 
 def _resolve_flow(preset: dict, override: str) -> tuple[str, bool]:
+    global _MIGRATION_PRINTED
     if override == "preset":
         return preset["flow"], preset["bidirectional"]
-    mapping = {
-        "dis-fast": ("dis", False),
-        "dis-occlusion": ("dis", True),
-        "sea-raft-single": ("sea-raft", False),
-        "sea-raft": ("sea-raft", True),
-    }
-    return mapping[override]
+    if override not in _FLOW_MAPPING:
+        raise XeSSNodeError(f"未知光流算法：{override}")
+    if override in ("sea-raft-single", "sea-raft") and not _MIGRATION_PRINTED:
+        print("[ComfyUI-XeSS] SEA-RAFT 已从主线退役；该工作流的光流选项已自动"
+              "迁移到原生 Fast DIS。", flush=True)
+        _MIGRATION_PRINTED = True
+    return _FLOW_MAPPING[override]
 
 
 def _quality_for(scale: float) -> int:
@@ -762,10 +665,10 @@ class XeSSSuperResolution:
         defaults = SR_PRESETS[preset]
         flow, bidirectional = _resolve_flow(defaults, flow_mode)
         resolved_mv = defaults["mv_path"] if mv_path == "preset" else mv_path
-        runtime_python = _xpu_python(engine, flow, env)
+        runtime_python = os.fspath(engine / "python" / "python.exe")
         resolved_quality = _parse_quality(quality, scale)
         resolved_transport = _transport(transport, height)
-        depth_needed = resolved_mv == "lowres-depth" or flow != "dis"
+        depth_needed = resolved_mv == "lowres-depth"
         prepare = [
             runtime_python, os.fspath(engine / "prepare_sr.py"),
             "--in-w", str(width), "--in-h", str(height), "--frames", str(frame_count),
@@ -776,9 +679,6 @@ class XeSSSuperResolution:
         ]
         if bidirectional:
             prepare.append("--bidirectional")
-        if flow == "sea-raft":
-            prepare.extend(("--model-dir", os.fspath(engine / "models" / "sea-raft"),
-                            "--device", "xpu"))
         if depth_needed:
             prepare.extend(("--depth-model", os.fspath(engine / "models" / "depth-anything-v2-small" /
                                                        "depth_anything_v2_small.xml"),
@@ -795,7 +695,7 @@ class XeSSSuperResolution:
         if responsive_mask:
             worker.extend(("--mask", "stream"))
         if resolved_mv == "highres":
-            worker.extend(("--mv-upsample", "bilinear" if flow == "dis" else "nearest"))
+            worker.extend(("--mv-upsample", "bilinear"))
         if device >= 0:
             worker.extend(("--device", str(device)))
         if verbose:
@@ -906,7 +806,7 @@ class XeSSFrameGeneration:
         defaults = FG_PRESETS[preset]
         flow, bidirectional = _resolve_flow(defaults, flow_mode)
         window = defaults["window"] if motion_window == "preset" else int(motion_window)
-        runtime_python = _xpu_python(engine, flow, env)
+        runtime_python = os.fspath(engine / "python" / "python.exe")
         resolved_transport = _transport(transport, height)
         mask_path = None
         try:
@@ -930,9 +830,6 @@ class XeSSFrameGeneration:
             ]
             if bidirectional:
                 prepare.append("--bidirectional")
-            if flow == "sea-raft":
-                prepare.extend(("--model-dir", os.fspath(engine / "models" / "sea-raft"),
-                                "--device", "xpu"))
             if depth_mode == "ai":
                 prepare.extend(("--depth-model", os.fspath(engine / "models" / "depth-anything-v2-small" /
                                                            "depth_anything_v2_small.xml"),
@@ -1070,7 +967,7 @@ class XeSSVideoSuperResolution:
             "video": ("VIDEO", {"display_name": "输入视频", "tooltip": "连接 ComfyUI 原生 Load Video。"}),
             "mode": (SIMPLE_MODE_CHOICES, {
                 "default": "极速模式（最低挡）", "display_name": "质量挡位",
-                "tooltip": "极速：DIS+边缘振铃保护；极致：双向 SEA-RAFT+AI 深度+五帧融合+边缘振铃保护。",
+                "tooltip": "极速：DIS 光流+边缘振铃保护；极致：DIS 光流+五帧融合+自适应锐化+边缘振铃保护。",
             }),
             "scale": ("FLOAT", {
                 "default": 1.5, "min": 1.0, "max": 4.0, "step": 0.05,
@@ -1118,7 +1015,7 @@ class XeSSVideoSuperResolution:
             artifact_guard_strength=0.75,
         )
         video_out, width, height, info = output
-        label = "极致画质：双向 SEA-RAFT + AI 深度 + 五帧融合 + 自适应锐化 + 边缘振铃保护" if high else (
+        label = "极致画质：DIS 光流 + 五帧融合 + 自适应锐化 + 边缘振铃保护" if high else (
             "极速模式：DIS 光流 + 响应遮罩 + 固定锐化 + 边缘振铃保护"
         )
         return video_out, width, height, f"{label} | {info}"
@@ -1138,7 +1035,7 @@ class XeSSVideoFrameGeneration:
                 "video": ("VIDEO", {"display_name": "输入视频", "tooltip": "自动读取帧率并保留音频。"}),
                 "mode": (SIMPLE_MODE_CHOICES, {
                     "default": "极速模式（最低挡）", "display_name": "质量挡位",
-                    "tooltip": "极速：DIS+2帧窗口；极致：双向 SEA-RAFT+AI 深度+5帧窗口。",
+                    "tooltip": "极速：DIS+2帧窗口；极致：DIS+AI 深度+5帧窗口。",
                 }),
             },
             "optional": {
@@ -1181,7 +1078,7 @@ class XeSSVideoFrameGeneration:
             ui_mask=ui_mask,
         )
         video_out, output_fps, output_count, info = output
-        label = "极致画质：双向 SEA-RAFT + AI 深度 + 5帧窗口 + 自适应锐化" if high else (
+        label = "极致画质：DIS 光流 + AI 深度 + 5帧窗口 + 自适应锐化" if high else (
             "极速模式：DIS 光流 + AI 深度 + 2帧窗口 + 固定锐化"
         )
         return video_out, output_fps, output_count, f"{label} | {info}"

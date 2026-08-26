@@ -7,6 +7,8 @@ import sys
 import cv2
 import numpy as np
 
+from stage_timer import StageTimer
+
 
 def read_exact(stream, size):
     chunks = []
@@ -34,33 +36,38 @@ def main():
         raise SystemExit("[sharpen] strengths must be in 0..1")
     frame_bytes = args.width * args.height * 3
     source, output = sys.stdin.buffer, sys.stdout.buffer
+    timer = StageTimer()
     previous_luma = None
     for index in range(args.frames):
-        data = read_exact(source, frame_bytes)
+        with timer.span("input_wait"):
+            data = read_exact(source, frame_bytes)
         if data is None:
             raise SystemExit(f"[sharpen] input ended at frame {index}")
-        frame_u8 = np.frombuffer(data, np.uint8).reshape(args.height, args.width, 3)
-        frame = frame_u8.astype(np.float32)
-        luma = cv2.cvtColor(frame_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
-        if previous_luma is None:
-            motion = np.zeros_like(luma)
-        else:
-            motion = np.clip(np.abs(luma - previous_luma) / 32.0, 0.0, 1.0)
-            motion = cv2.GaussianBlur(motion, (5, 5), 0.9)
-        local_min = cv2.erode(luma, np.ones((3, 3), np.uint8))
-        local_max = cv2.dilate(luma, np.ones((3, 3), np.uint8))
-        contrast = local_max - local_min
-        noise_guard = np.clip((contrast - 72.0) / 80.0, 0.0, 0.65)
-        strength = args.static * (1.0 - motion) + args.motion * motion
-        strength *= 1.0 - noise_guard
-        blurred = cv2.GaussianBlur(frame, (0, 0), 0.8)
-        detail = np.clip(frame - blurred, -24.0, 24.0)
-        sharpened = np.clip(frame + detail * (strength[..., None] * 1.65), 0.0, 255.0)
-        output.write(sharpened.astype(np.uint8).tobytes())
+        with timer.span("sharpen"):
+            frame_u8 = np.frombuffer(data, np.uint8).reshape(args.height, args.width, 3)
+            frame = frame_u8.astype(np.float32)
+            luma = cv2.cvtColor(frame_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
+            if previous_luma is None:
+                motion = np.zeros_like(luma)
+            else:
+                motion = np.clip(np.abs(luma - previous_luma) / 32.0, 0.0, 1.0)
+                motion = cv2.GaussianBlur(motion, (5, 5), 0.9)
+            local_min = cv2.erode(luma, np.ones((3, 3), np.uint8))
+            local_max = cv2.dilate(luma, np.ones((3, 3), np.uint8))
+            contrast = local_max - local_min
+            noise_guard = np.clip((contrast - 72.0) / 80.0, 0.0, 0.65)
+            strength = args.static * (1.0 - motion) + args.motion * motion
+            strength *= 1.0 - noise_guard
+            blurred = cv2.GaussianBlur(frame, (0, 0), 0.8)
+            detail = np.clip(frame - blurred, -24.0, 24.0)
+            sharpened = np.clip(frame + detail * (strength[..., None] * 1.65), 0.0, 255.0)
+        with timer.span("output_write"):
+            output.write(sharpened.astype(np.uint8).tobytes())
         previous_luma = luma
         if index and index % 60 == 0:
             print(f"[sharpen] {index}/{args.frames}", file=sys.stderr, flush=True)
     output.flush()
+    timer.report("sharpen")
 
 
 if __name__ == "__main__":

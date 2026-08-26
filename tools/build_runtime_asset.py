@@ -23,7 +23,8 @@ STATIC_FILES = (
     "INTEL_XESS_THIRD_PARTY_PROGRAMS.txt",
     "THIRD_PARTY_NOTICES.md",
 )
-STATIC_DIRS = ("python", "models")
+STATIC_DIRS = ("python",)
+MODEL_DIRS = ("models/depth-anything-v2-small",)
 REQUIRED_FILES = (
     "ffmpeg.exe",
     "xess-vsr.exe",
@@ -34,7 +35,6 @@ REQUIRED_FILES = (
     "python/python.exe",
     "models/depth-anything-v2-small/depth_anything_v2_small.xml",
     "models/depth-anything-v2-small/depth_anything_v2_small.bin",
-    "models/sea-raft/sea_raft_s_full.safetensors",
 )
 HASHED_FILES = REQUIRED_FILES
 
@@ -70,6 +70,16 @@ def collect(source: pathlib.Path, sdk_source: pathlib.Path | None) -> list[tuple
             relative = path.relative_to(source)
             if not excluded(relative):
                 files.append((path, relative))
+    # Runtime models are allow-listed.  Retired experiment checkpoints must
+    # not silently remain in every fixed-runtime archive just because they
+    # still exist in a maintainer's staging directory.
+    for directory in MODEL_DIRS:
+        root = source / pathlib.Path(directory)
+        if not root.is_dir():
+            raise SystemExit(f"missing fixed runtime model directory: {root}")
+        for path in root.rglob("*"):
+            if path.is_file():
+                files.append((path, path.relative_to(source)))
     if sdk_source is not None:
         for directory in ("inc", "lib"):
             root = sdk_source / directory
@@ -112,8 +122,8 @@ def main() -> int:
     build_info = {
         "runtime_version": args.runtime_version,
         "built_unix": time.time(),
-        "source": os.fspath(source),
-        "sdk_source": os.fspath(sdk_source) if sdk_source is not None else None,
+        # Do not publish maintainer-specific absolute paths in the archive.
+        "sdk_developer_files": sdk_source is not None,
     }
     with zipfile.ZipFile(partial, "w", compression=zipfile.ZIP_DEFLATED,
                          compresslevel=6, allowZip64=True) as archive:
