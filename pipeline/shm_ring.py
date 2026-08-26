@@ -235,6 +235,9 @@ class RingReader:
             self.close()
             raise SharedRingError(f"OpenEventW failed: {ctypes.get_last_error()}")
 
+    def _sequences(self) -> tuple[int, int]:
+        return struct.unpack_from("<QQ", self.mapping, 16)
+
     def read(self) -> bytes:
         deadline = time.monotonic() + self.timeout_ms / 1000.0
         while True:
@@ -242,7 +245,7 @@ class RingReader:
             if read_sequence < write_sequence:
                 slot = read_sequence % self.slots
                 offset = HEADER.size + slot * (SLOT_HEADER.size + self.slot_size)
-                (packet_size,) = SLOT_HEADER.unpack_from(self.mapping, offset)
+                packet_size, _reserved = SLOT_HEADER.unpack_from(self.mapping, offset)
                 if not packet_size or packet_size > self.slot_size:
                     raise SharedRingError(f"invalid packet size {packet_size}")
                 payload = bytes(self.mapping[offset + SLOT_HEADER.size:
