@@ -280,6 +280,18 @@ class PostProcessProcessTests(unittest.TestCase):
         stderr = result.stderr.decode("utf-8", "replace")
         self.assertIn("boom: corrupt stream", stderr)
 
+    def test_parallel_guide_failure_does_not_drop_terminal_error(self) -> None:
+        result = self._run(["--sharpen-mode", "fixed", "--static", "0.35",
+                            "--motion", "0.18", "--guard-strength", "0.75",
+                            "--video", "x", "--ffmpeg", self.fake_ffmpeg,
+                            "--in-w", str(IN_W), "--in-h", str(IN_H),
+                            "--threads", "4"],
+                           self._input_frames(), gc_fail=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        stderr = result.stderr.decode("utf-8", "replace")
+        self.assertIn("source decoder ended early", stderr)
+        self.assertIn("boom: corrupt stream", stderr)
+
     def test_stdout_closed_early_exits_without_hang(self) -> None:
         command = [sys.executable, self.POST, "--width", str(W), "--height", str(H),
                    "--frames", str(FRAMES), "--sharpen-mode", "fixed",

@@ -306,10 +306,12 @@ def main() -> None:
                         raise RuntimeError("source decoder ended early")
                     ready_put_src(sbuf)
             except BaseException as exc:
-                try:
-                    source_ready.put_nowait(exc)
-                except queue.Full:
-                    pass
+                # Never drop the terminal error merely because the ready
+                # queue is momentarily full.  If it is dropped, the consumer
+                # eventually drains all valid frames and then blocks forever
+                # in next_source().  A bounded put loop lets the consumer make
+                # room while still respecting shutdown.
+                ready_put_src(exc)
 
         producer = threading.Thread(target=produce_sources, name="source-producer")
         producer.start()
