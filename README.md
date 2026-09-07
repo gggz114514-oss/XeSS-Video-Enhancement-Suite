@@ -4,6 +4,8 @@ Windows 上的视频超分与 2× 插帧。R4 提供三个中文节点：**视�
 
 本仓库本次只发布 ComfyUI 节点与配套引擎。独立离线工具箱、实时捕获工具箱将分项目发布，不包含 OBS、桌面捕获或 HTML 前端。
 
+[R4 下载与更新说明](https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/tag/runtime-2026.09.07-r4)
+
 ## 安装
 
 关闭 ComfyUI，在 `ComfyUI/custom_nodes` 中打开终端：
