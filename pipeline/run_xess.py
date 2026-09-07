@@ -15,8 +15,12 @@ from pathlib import Path
 
 from chunked_media import concat_command, extract_lossless_command, write_concat_list
 from media_validation import MediaValidationError, validate_output
+from media_timeline import probe_cfr, rate_text
 from shm_ring import RingOwner, packet_slot_size
 from stage_timer import StageTimer, timing_requested
+from source_fanout import SourceFanout
+from offline_encoders import video_options
+import runtime_hooks
 from workdir_guard import (WorkdirError, create_workspace, estimate_sr_bytes,
                            finalize_output, partial_output_path)
 
@@ -153,6 +157,15 @@ def prep_command(args, settings, width, height, frames, *, stream,
             command.extend(("--mask-out", mask_dir))
     if debug_dir:
         command.extend(("--debug-dir", debug_dir))
+    shared_motion_dir = getattr(args, "shared_motion_dir", "")
+    if shared_motion_dir:
+        command.extend(("--shared-motion-dir", os.fspath(shared_motion_dir),
+                        "--shared-motion-slots",
+                        str(getattr(args, "shared_motion_slots", 4)),
+                        "--pts-num", str(getattr(args, "pts_num", 1)),
+                        "--pts-den", str(getattr(args, "pts_den", 1))))
+        if getattr(args, "source_pts_file", ""):
+            command.extend(("--source-pts-file", os.fspath(args.source_pts_file)))
     return command, needs_depth
 
 
@@ -191,9 +204,8 @@ def xess_command(args, settings, width, height, out_w, out_h, frames, quality, *
 
 def encoder_command(args, settings, out_w, out_h, fps, frames, partial):
     command = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y", "-f", "rawvideo",
-               "-pix_fmt", "rgb24", "-s", f"{out_w}x{out_h}", "-r", str(fps), "-i", "-",
-               "-i", args.video, "-map", "0:v", "-map", "1:a?", "-c:v", "libx264",
-               "-preset", args.encoder_preset, "-crf", str(args.crf), "-pix_fmt", "yuv420p"]
+               "-pix_fmt", "rgb24", "-s", f"{out_w}x{out_h}", "-r", rate_text(fps), "-i", "-",
+               "-i", args.video, "-map", "0:v", "-map", "1:a?"] + video_options(args)
     if (settings["sharpen_mode"] == "fixed" and settings["sharpen"] > 0 and
             args.edge_guard_strength <= 0):
         command.extend(("-vf", f"cas=strength={settings['sharpen']:.4f}"))
@@ -252,9 +264,14 @@ def run_stream(args, settings, environment, driver_environment, width, height, o
     needs_depth = settings["mv_path"] == "lowres-depth" or args.force_depth
     ring = None
     output_ring = None
+    guide_rings = []
+    guard_ring = None
+    mfsr_ring = None
+    fanout = None
     post_args = post_command(args, settings, width, height, out_w, out_h, frames)
     if settings["io_mode"] == "shared":
-        ring = RingOwner(slots=4, slot_size=packet_slot_size(
+        slots = max(2, int(getattr(settings, "get", lambda k, d=None: None)( "_slots", 0) or 0) or 4)
+        ring = RingOwner(slots=slots, slot_size=packet_slot_size(
             width, height, depth=needs_depth, mask=settings["responsive"]), prefix="xess-sr")
         # The post stage used to receive xess-vsr stdout through a small
         # anonymous pipe, which serialized the two CPU-heavy processes.  Use
@@ -265,6 +282,13 @@ def run_stream(args, settings, environment, driver_environment, width, height, o
                                     prefix="xess-sr-out")
             post_args = post_command(args, settings, width, height, out_w, out_h,
                                      frames, ring=output_ring)
+    if args.edge_guard_strength > 0:
+        guard_ring = RingOwner(slots=8, slot_size=width * height * 3, prefix="xess-sr-guide")
+        guide_rings.append(guard_ring)
+        post_args.extend([token.replace("--shm-", "--guide-shm-") for token in guard_ring.arguments()])
+    if args.five_frame_mfsr:
+        mfsr_ring = RingOwner(slots=8, slot_size=width * height * 3, prefix="xess-mfsr-guide")
+        guide_rings.append(mfsr_ring)
     prepare_command, _ = prep_command(args, settings, width, height, frames,
                                       stream=True, ring=ring)
     worker_command = xess_command(args, settings, width, height, out_w, out_h, frames, quality,
@@ -276,6 +300,9 @@ def run_stream(args, settings, environment, driver_environment, width, height, o
         decoder = subprocess.Popen(decoder_command, stdout=subprocess.PIPE, env=environment)
         processes.append(decoder)
         source_stream = decoder.stdout
+        if guide_rings:
+            fanout = SourceFanout(decoder.stdout, width * height * 3, frames, guide_rings)
+            source_stream = fanout.reader
         if args.five_frame_fusion:
             fusion_command = [PY, FUSION, "--width", str(width), "--height", str(height),
                               "--frames", str(frames), "--strength", str(args.fusion_strength)]
@@ -304,6 +331,7 @@ def run_stream(args, settings, environment, driver_environment, width, height, o
                             "--frames", str(frames), "--strength", str(args.mfsr_strength),
                             "--detail-boost", str(args.mfsr_detail_boost),
                             "--max-injection", str(args.mfsr_max_injection)]
+            mfsr_command.extend([token.replace("--shm-", "--guide-shm-") for token in mfsr_ring.arguments()])
             print(f"[run_xess] $ {command_text(mfsr_command)}")
             mfsr = subprocess.Popen(mfsr_command, stdin=video_stream,
                                     stdout=subprocess.PIPE, env=environment)
@@ -319,12 +347,32 @@ def run_stream(args, settings, environment, driver_environment, width, height, o
                 video_stream.close()
             video_stream = post.stdout
             processes.append(post)
+        if getattr(args, "preview_dir", ""):
+            tap_command = runtime_hooks.preview_tap_command(
+                PY, out_w, out_h, fps, frames,
+                os.path.abspath(args.preview_dir), FFMPEG, backend="xess",
+                preview_scale=getattr(settings, "get", lambda k, d=None: d)(
+                    "_preview_scale", 1.0))
+            print(f"[run_xess] $ preview-tap -> {args.preview_dir}")
+            tap = subprocess.Popen(tap_command, stdin=video_stream,
+                                   stdout=subprocess.PIPE, env=environment)
+            video_stream.close()
+            video_stream = tap.stdout
+            processes.append(tap)
         encode_command = encoder_command(args, settings, out_w, out_h, fps, frames, partial)
         print(f"[run_xess] $ {command_text(encode_command)}")
         encoder = subprocess.Popen(encode_command, stdin=video_stream, env=environment)
         video_stream.close()
         processes.append(encoder)
+        if fanout is not None:
+            fanout.start()
         codes = [process.wait() for process in reversed(processes)]
+        if fanout is not None:
+            fanout.join()
+            print("[source-fanout] " + json.dumps({"decoded_source_frames": fanout.frames_read,
+                  "source_decode_count": 1, "guide_consumers": len(guide_rings),
+                  "guide_rgb_copy_bytes": frames * width * height * 3 * len(guide_rings),
+                  "guide_capacity_bytes": sum(ring.slots * ring.slot_size for ring in guide_rings)}))
         if any(codes):
             die(f"stream pipeline failed; exit codes (reverse order): {codes}")
     except BaseException:
@@ -335,6 +383,10 @@ def run_stream(args, settings, environment, driver_environment, width, height, o
             ring.close()
         if output_ring is not None:
             output_ring.close()
+        if fanout is not None and fanout.thread.is_alive():
+            fanout.thread.join(timeout=35)
+        for guide_ring in guide_rings:
+            guide_ring.close()
 
 
 def run_chunked(args, settings, environment, driver_environment, workspace,
@@ -444,6 +496,12 @@ def main():
     parser.add_argument("--mfsr-max-injection", type=float, default=22.0)
     parser.add_argument("--edge-guard-strength", type=float, default=0.75,
                         help="suppress XeSS vertical edge ringing; 0 disables it")
+    parser.add_argument("--tier", default="",
+                        help="public tier: fast | quality (preset registry)")
+    parser.add_argument("--preview-dir", default="",
+                        help="streaming fMP4 preview session directory")
+    parser.add_argument("--memory-strategy", choices=("auto", "conservative"),
+                        default="auto")
     parser.add_argument("--post-threads", type=int, default=4,
                         help="parallel SR postprocess workers (default: 4)")
     parser.add_argument("--io-mode", choices=("auto", "stream", "chunked", "file"), default="auto")
@@ -455,6 +513,7 @@ def main():
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--debug-prep", action="store_true")
     parser.add_argument("--encoder-preset", default="slow")
+    parser.add_argument("--encoder", choices=("auto", "h264_qsv", "hevc_qsv", "libx264", "libx265", "ffv1"), default=None)
     parser.add_argument("--crf", type=int, default=16)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--stage-timing", action="store_true",
@@ -462,6 +521,11 @@ def main():
                              "(also enabled by XESS_STAGE_TIMING=1)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    from offline_encoders import configure_cli_encoder
+    try:
+        configure_cli_encoder(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     for path, label in ((PY, "Python"), (FFMPEG, "ffmpeg.exe"), (XESS, "xess-vsr.exe"),
                         (FLOW, "flow.py"), (PREPARE, "prepare_sr.py"), (POST, "sr_postprocess.py")):
@@ -492,18 +556,55 @@ def main():
     if not 8 <= args.chunk_frames <= 600:
         die("--chunk-frames must be in 8..600")
 
-    metadata = json.loads(run([PY, FLOW, args.video, "--probe-only"], capture_output=True,
-                              text=True).stdout)
+    try:
+        metadata = probe_cfr(args.video, FFMPEG, max_frames=args.frames)
+    except RuntimeError as exc:
+        die(str(exc))
     width, height, fps = int(metadata["width"]), int(metadata["height"]), float(metadata["fps"])
     frames = min(int(metadata["frames"]), args.frames) if args.frames > 0 else int(metadata["frames"])
     if width <= 0 or height <= 0 or fps <= 0 or frames < 2:
         die(f"invalid media metadata: {width}x{height}, {fps}, {frames}")
     out_w = int(round(width * args.scale / 16) * 16)
     out_h = int(round(height * args.scale / 16) * 16)
-    quality = args.quality if args.quality >= 0 else quality_for(args.scale)
+    _tier = runtime_hooks.tier_settings_sr(args.tier, args.scale)
+    if _tier and args.quality < 0:
+        quality = int(_tier["_quality_hint"])
+    else:
+        quality = args.quality if args.quality >= 0 else quality_for(args.scale)
     if not 0 <= quality <= 6:
         die("--quality must be in 0..6")
     settings = resolve_settings(args)
+    tier_override = _tier
+    if tier_override and hasattr(args, "edge_guard_strength")             and tier_override.get("guard_strength") is not None:
+        # the post chain reads args.edge_guard_strength; make the tier stick
+        args.edge_guard_strength = float(tier_override["guard_strength"])
+    if tier_override:
+        for key in ("mv_path", "sharpen_mode", "static", "motion"):
+            if tier_override.get(key) is not None:
+                settings[key] = tier_override[key]
+        settings["responsive"] = bool(tier_override.get("responsive", True))
+        settings["guard_strength"] = tier_override.get("guard_strength",
+                                                       settings.get("guard_strength", 0.75))
+        if tier_override.get("post_threads"):
+            args.post_threads = max(1, int(tier_override["post_threads"]))
+        print(f"[run_xess] tier {args.tier}: guard={settings['guard_strength']}, "
+              f"post-threads={args.post_threads}")
+    ok_budget, budget_report = runtime_hooks.preflight_budget(
+        os.environ.get("XESS_RT_WORK",
+                       os.path.join(ROOT, "..", "..", "..", "work")),
+        "保守" if getattr(args, "memory_strategy", "auto") == "conservative" else "自动",
+        width, height, out_w, out_h, frames, fps,
+        depth_on=settings["mv_path"] == "lowres-depth",
+        post_threads=args.post_threads,
+        extra_fixed={"output_ring_slots": 6})
+    print(f"[run_xess] memory: {budget_report['message']} "
+          f"(queue={budget_report['queue_slots']})")
+    print("[run_xess] budget: "
+      + json.dumps(budget_report.get("items", {}), ensure_ascii=False))
+    if not ok_budget:
+        die(f"资源预算不足，已拒绝启动：{budget_report['message']}")
+    settings["_slots"] = int(budget_report["queue_slots"])
+    settings["_preview_scale"] = float(budget_report.get("preview_scale", 1.0))
     settings["io_mode"] = resolve_io_mode(settings["io_mode"], height, out_h)
     if (args.five_frame_fusion or args.five_frame_mfsr) and settings["io_mode"] not in ("stream", "shared"):
         die("five-frame processing currently requires --io-mode stream/shared")
@@ -516,6 +617,8 @@ def main():
     base = os.path.splitext(os.path.basename(args.video))[0]
     fusion_suffix = "_mfsr5" if args.five_frame_mfsr else ("_5f" if args.five_frame_fusion else "")
     output = os.path.join(output_dir, f"{base}_xess_sr12_{args.preset}{fusion_suffix}_{args.scale:g}x_{out_w}x{out_h}.mp4")
+    if os.environ.get("XESS_OUTPUT_CONTAINER") == ".mkv":
+        output = str(Path(output).with_suffix(".mkv"))
     partial = partial_output_path(output)
     estimate = estimate_sr_bytes(width, height, out_w, out_h, frames,
                                  io_mode=settings["io_mode"], include_depth=needs_depth,

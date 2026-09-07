@@ -7,6 +7,7 @@ import argparse
 import contextlib
 from collections import deque
 from dataclasses import dataclass
+from fractions import Fraction
 import json
 import os
 import sys
@@ -17,7 +18,9 @@ import numpy as np
 import cv2
 import zlib
 
-from motion_core import DepthEstimator, DisFlow, FrameAnalyzer, write_debug
+from motion_core import (DepthEstimator, DisFlow, FrameAnalyzer,
+                         GpuBlockMetadataAnalyzer, write_debug)
+from shared_motion_io import HEADER as SIDECAR_HEADER, SidecarPacket, write_sidecar
 from shm_ring import RingWriter
 from stage_timer import StageTimer
 from stream_protocol import (Flags, FramePacket, MAGIC, VERSION, PIXEL_RGB24,
@@ -84,7 +87,7 @@ def add_common_arguments(parser: argparse.ArgumentParser, *, kind: str) -> None:
     parser.add_argument("--in-w", type=int, required=True)
     parser.add_argument("--in-h", type=int, required=True)
     parser.add_argument("--frames", type=int, required=True)
-    parser.add_argument("--engine", choices=("dis", "sea-raft"), default="dis",
+    parser.add_argument("--engine", choices=("dis", "sea-raft", "gpu-block"), default="dis",
                         help="'sea-raft' is accepted for old callers and runs DIS")
     parser.add_argument("--bidirectional", action="store_true")
     parser.add_argument("--depth-model", default="")
@@ -104,6 +107,13 @@ def add_common_arguments(parser: argparse.ArgumentParser, *, kind: str) -> None:
     parser.add_argument("--mask-out", default="")
     parser.add_argument("--overlay-mask", default="", help="optional static grayscale UI/subtitle mask")
     parser.add_argument("--debug-dir", default="")
+    parser.add_argument("--shared-motion-dir", default="",
+                        help="bounded sidecar directory for shared SR→FG motion")
+    parser.add_argument("--shared-motion-slots", type=int, default=4)
+    parser.add_argument("--pts-num", type=int, default=1)
+    parser.add_argument("--pts-den", type=int, default=1)
+    parser.add_argument("--source-pts-file", default="",
+                        help="verified compressed-packet PTS metadata for exact shared source timestamps")
     parser.set_defaults(kind=kind)
 
 
@@ -130,6 +140,10 @@ def validate(args: argparse.Namespace) -> None:
         raise SystemExit("[prepare] file mode requires --mv-out")
     if args.overlay_mask and not os.path.isfile(args.overlay_mask):
         raise SystemExit(f"[prepare] overlay mask not found: {args.overlay_mask}")
+    if args.shared_motion_dir and args.shared_motion_slots < 2:
+        raise SystemExit("[prepare] --shared-motion-slots must be at least 2")
+    if args.pts_den <= 0:
+        raise SystemExit("[prepare] --pts-den must be positive")
 
 
 def read_exact(stream, size: int) -> bytes:
@@ -144,6 +158,21 @@ def read_exact(stream, size: int) -> bytes:
     return b"".join(chunks)
 
 
+def shared_source_pts(args):
+    """Retain original signed packet ticks, including nonzero origins/rounding."""
+    path = getattr(args, "source_pts_file", "")
+    if not path:
+        return [index * args.pts_num for index in range(args.frames)], args.pts_den
+    metadata = json.loads(Path(path).read_text(encoding="utf-8"))
+    ticks = metadata["source_pts_ticks"]
+    time_base = Fraction(metadata["source_time_base"])
+    if time_base <= 0 or len(ticks) != args.frames or any(type(tick) is not int for tick in ticks):
+        raise ValueError("invalid shared source PTS metadata")
+    if any(current <= previous for previous, current in zip(ticks, ticks[1:])):
+        raise ValueError("shared source PTS must be strictly increasing")
+    return [tick * time_base.numerator for tick in ticks], time_base.denominator
+
+
 def frame_iterator(args: argparse.Namespace, timer: StageTimer | None = None):
     frame_bytes = args.in_w * args.in_h * 3
     if args.stream:
@@ -154,7 +183,10 @@ def frame_iterator(args: argparse.Namespace, timer: StageTimer | None = None):
                     data = read_exact(source, frame_bytes)
                 except EOFError as exc:
                     raise RuntimeError(f"decoder ended at frame {index}: {exc}") from exc
-            yield np.frombuffer(data, np.uint8).reshape(args.in_h, args.in_w, 3).copy()
+            # read_exact already returns a fresh bytes object per frame; the
+            # view keeps it alive, so the extra .copy() was pure waste
+            yield np.frombuffer(data, np.uint8).reshape(
+                args.in_h, args.in_w, 3)
         return
     available = os.path.getsize(args.raw) // frame_bytes
     if available < args.frames:
@@ -165,13 +197,18 @@ def frame_iterator(args: argparse.Namespace, timer: StageTimer | None = None):
         yield np.array(mapped[index], copy=True)
 
 
-def create_analyzer(args: argparse.Namespace) -> FrameAnalyzer:
-    engine = DisFlow(args.bidirectional)
+def create_analyzer(args: argparse.Namespace, timer=None):
     depth = DepthEstimator(args.depth_model, args.depth_device) if args.depth_model else None
+    if args.engine == "gpu-block":
+        return GpuBlockMetadataAnalyzer(
+            depth, responsive_max=args.responsive_max, timer=timer)
+    engine = DisFlow(args.bidirectional)
     return FrameAnalyzer(engine, depth, temporal=args.temporal,
                          consistency=args.consistency, dilation=args.dilate,
                          depth_edge=args.depth_edge, responsive_max=args.responsive_max,
-                         photometric_confidence=(args.kind == "fg"))
+                         photometric_confidence=(args.kind == "fg" and
+                                                 args.engine != "gpu-block"),
+                         timer=timer)
 
 
 def ensure_outputs(args: argparse.Namespace) -> None:
@@ -203,8 +240,11 @@ def run_preparer(args: argparse.Namespace) -> None:
     validate(args)
     normalize_legacy_engine(args)
     ensure_outputs(args)
+    if args.shared_motion_dir:
+        os.makedirs(args.shared_motion_dir, exist_ok=True)
+        source_pts, source_pts_den = shared_source_pts(args)
     timer = StageTimer()
-    analyzer = create_analyzer(args)
+    analyzer = create_analyzer(args, timer=timer)
     overlay_mask = None
     if args.overlay_mask:
         overlay_mask = cv2.imread(args.overlay_mask, cv2.IMREAD_GRAYSCALE)
@@ -216,10 +256,17 @@ def run_preparer(args: argparse.Namespace) -> None:
             if args.shm_name else None)
     output = ring if ring is not None else (sys.stdout.buffer if args.stream else None)
     scene_cuts: list[int] = []
+    flow_pairs_requested = 0
+    flow_pairs_computed = 0
+    transport_payload_bytes = 0
+    sidecar_bytes_written = 0
+    sidecar_peak_packet_bytes = 0
+    emitted_frames = 0
     started = time.perf_counter()
     pending: deque[PendingFrame] = deque(maxlen=5)
 
     def emit(entry: PendingFrame, window: list[PendingFrame]) -> None:
+        nonlocal transport_payload_bytes, emitted_frames
         with timer.span("packet_write"):
             result = entry.result
             if args.kind == "fg" and args.motion_window == 5:
@@ -232,9 +279,15 @@ def run_preparer(args: argparse.Namespace) -> None:
             result.flow[..., 1] = np.clip(result.flow[..., 1], -args.in_h, args.in_h)
             with timer.span("packet_encode"):
                 color = np.ascontiguousarray(entry.rgb, dtype=np.uint8)
-                flow = np.ascontiguousarray(result.flow, dtype=np.float32)
+                # GPU Block Motion writes XeFG velocity on D3D12.  A zero
+                # full-resolution flow plane would only waste pipe/ring
+                # bandwidth; a zero-length field is the explicit v1 extension
+                # understood by the opt-in worker.
+                flow = (b"" if args.engine == "gpu-block" else
+                        np.ascontiguousarray(result.flow, dtype=np.float32))
                 output_depth = result.depth
-                if output_depth is None and args.kind == "fg":
+                if (output_depth is None and args.kind == "fg" and
+                        args.engine != "gpu-block"):
                     output_depth = np.full((args.in_h, args.in_w), 0.5, np.float32)
                 depth = (np.ascontiguousarray(output_depth, dtype=np.float32)
                          if output_depth is not None else b"")
@@ -266,10 +319,13 @@ def run_preparer(args: argparse.Namespace) -> None:
                             output.write(part)
                         output.flush()
             else:
-                emit_file(args, entry.index, flow.tobytes(),
+                emit_file(args, entry.index,
+                          flow if isinstance(flow, bytes) else flow.tobytes(),
                           _part_bytes(depth), _part_bytes(mask))
             if args.debug_dir:
                 write_debug(args.debug_dir, entry.index, result)
+            transport_payload_bytes += sum(sizes)
+            emitted_frames += 1
 
     frames_iter = frame_iterator(args, timer)
     index = -1
@@ -284,13 +340,41 @@ def run_preparer(args: argparse.Namespace) -> None:
                 result = analyzer.first(rgb, args.responsive_mask)
                 flags = Flags.RESET
             else:
-                result = analyzer.next(rgb, args.responsive_mask,
-                                       dilate_highres=(args.mv_path == "highres" or args.kind == "fg"))
+                flow_pairs_requested += 1
+                flow_pairs_computed += 1
+                result = analyzer.next(
+                    rgb, args.responsive_mask,
+                    dilate_highres=((args.mv_path == "highres" or args.kind == "fg")
+                                    and args.engine != "gpu-block"))
                 flags = Flags.NONE
                 if result.scene_cut:
                     scene_cuts.append(index)
                     flags |= Flags.RESET | Flags.SCENE_CUT
         pending.append(PendingFrame(index, rgb.copy(), result, flags))
+        if args.shared_motion_dir:
+            output_depth = result.depth
+            output_mask = (np.clip(result.mask * 255.0, 0, 255).astype(np.uint8)
+                           if result.mask is not None else None)
+            # The first frame has no adjacent pair and therefore carries a
+            # zero MV/reset marker. Every later frame is the sole CPU DIS
+            # computation for that adjacent input pair.
+            path = write_sidecar(
+                args.shared_motion_dir,
+                SidecarPacket(
+                    frame_id=index, width=args.in_w, height=args.in_h,
+                    prev_pts_num=source_pts[max(0, index - 1)],
+                    current_pts_num=source_pts[index],
+                    pts_den=source_pts_den, flags=int(flags),
+                    flow=np.asarray(result.flow, np.float32),
+                    depth=output_depth, mask=output_mask,
+                    confidence=result.confidence),
+                slots=args.shared_motion_slots)
+            packet_bytes = (
+                SIDECAR_HEADER.size + result.flow.nbytes + result.confidence.nbytes +
+                (0 if output_depth is None else output_depth.nbytes) +
+                (0 if output_mask is None else output_mask.nbytes))
+            sidecar_bytes_written += packet_bytes
+            sidecar_peak_packet_bytes = max(sidecar_peak_packet_bytes, packet_bytes)
         if args.kind != "fg" or args.motion_window == 2:
             emit(pending[-1], [pending[-1]])
         elif index >= 2:
@@ -324,6 +408,42 @@ def run_preparer(args: argparse.Namespace) -> None:
                     json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         Path(args.mv_out, "reset_frames.txt").write_text(
             "".join(f"{index}\n" for index in scene_cuts), encoding="ascii")
+    counters = {
+                "flow_pairs_requested": flow_pairs_requested,
+                "flow_pairs_computed": flow_pairs_computed,
+                "source_pair_analysis_count": flow_pairs_computed,
+                "directional_dispatch_count": getattr(getattr(analyzer, "flow_engine", None), "directional_dispatch_count", None),
+                "producer_emitted_frames": emitted_frames,
+                "producer_emitted_pair_packets": max(0, emitted_frames - 1),
+                "initial_frame_count": min(1, emitted_frames),
+                "cpu_stream_payload_bytes": transport_payload_bytes,
+                "sidecar_bytes_written": sidecar_bytes_written,
+                "sidecar_capacity_bytes": sidecar_peak_packet_bytes * args.shared_motion_slots,
+                "shared_pts_source": "original compressed packet ticks" if getattr(args, "source_pts_file", "") else "configured frame period",
+                "cpu_upload_bytes": None,
+                "cpu_readback_bytes": None,
+                "gpu_copies": None,
+                "gpu_transfer_accounting": "unavailable in Python; CPU packet bytes are separately counted",
+                "backend": "gpu-block" if args.engine == "gpu-block" else "cpu-dis",
+                "expected_pairs": max(0, args.frames - 1),
+                "depth": {"model": args.depth_model, "device": args.depth_device,
+                          "cadence": 1, "cpu_arrays": True,
+                          "inference_count": emitted_frames if args.depth_model else 0},
+                "mask_computed": args.responsive_mask,
+                "scene_cut_frame_ids": scene_cuts,
+                "motion_window_applied": args.motion_window if args.kind == "fg" else 2,
+            }
+    # Producer cannot attest downstream consumption. The bridge writes those
+    # counts after receiving actual SR colors and forwarding FG packets.
+    if args.shared_motion_dir:
+        Path(args.shared_motion_dir, "motion_counters.json").write_text(
+            json.dumps(counters, ensure_ascii=False, indent=2), encoding="utf-8")
+    report_dir = os.environ.get("XESS_REPORT_DIR")
+    if report_dir:
+        Path(report_dir).mkdir(parents=True, exist_ok=True)
+        Path(report_dir, f"prepare-{args.kind}.json").write_text(
+            json.dumps(counters, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[motion-counters] {json.dumps(counters)}", file=sys.stderr, flush=True)
     if ring is not None:
         timer.observe("worker_read_wait", ring.wait_seconds)
     timer.totals["prepare_total"] = time.perf_counter() - started

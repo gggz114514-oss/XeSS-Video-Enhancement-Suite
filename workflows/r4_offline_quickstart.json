@@ -1,0 +1,34 @@
+{
+  "id": "8b8a00f7-4dd6-4e12-944d-a1f2d65adb79", "revision": 0,
+  "last_node_id": 3, "last_link_id": 2,
+  "nodes": [
+    {
+      "id": 1, "type": "LoadVideo", "pos": [30, 90], "size": [300, 300],
+      "flags": {}, "order": 0, "mode": 0,
+      "inputs": [], "outputs": [{"name": "VIDEO", "type": "VIDEO", "links": [1]}],
+      "title": "加载视频", "properties": {"Node name for S&R": "LoadVideo"},
+      "widgets_values": ["r4_demo_480p.mp4"]
+    },
+    {
+      "id": 2, "type": "XeSSR4OfflineSuperResolutionFrameGeneration",
+      "pos": [390, 90], "size": [350, 360], "flags": {}, "order": 1, "mode": 0,
+      "inputs": [{"name": "video", "type": "VIDEO", "link": 1}],
+      "outputs": [
+        {"name": "SR→2×FG 成片", "type": "VIDEO", "links": [2]},
+        {"name": "成片绝对路径", "type": "STRING", "links": null}
+      ],
+      "properties": {"Node name for S&R": "XeSSR4OfflineSuperResolutionFrameGeneration"},
+      "widgets_values": ["1.5×", 1.5, "GPU Block（快速）", "自动", "AI 深度", false, false, false]
+    },
+    {
+      "id": 3, "type": "SaveVideo", "pos": [810, 90], "size": [350, 360],
+      "flags": {}, "order": 2, "mode": 0,
+      "inputs": [{"name": "video", "type": "VIDEO", "link": 2}],
+      "outputs": [{"name": "video", "type": "VIDEO", "links": null}],
+      "title": "保存视频", "properties": {"Node name for S&R": "SaveVideo"},
+      "widgets_values": ["video/R4_试用", "auto", "auto"]
+    }
+  ],
+  "links": [[1, 1, 0, 2, 0, "VIDEO"], [2, 2, 0, 3, 0, "VIDEO"]],
+  "groups": [], "config": {}, "extra": {"ds": {"scale": 0.85, "offset": [0, 0]}}, "version": 0.4
+}

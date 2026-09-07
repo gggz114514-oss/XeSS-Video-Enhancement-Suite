@@ -14,11 +14,11 @@ SKIP_PARTS = {".git", ".runtime", "build", "dist", "work", "__pycache__"}
 FORBIDDEN_SUFFIXES = {".dll", ".exe", ".safetensors", ".raw", ".mp4", ".avi"}
 LOCAL_WORKSPACE_PATTERN = re.compile(r"(?i)[a-z]:\\[^\r\n]*(?:xess-tools|comfyui-aki)")
 REQUIRED = (
-    "__init__.py", "xess_nodes.py", "runtime_manager.py", "runtime_manifest.json",
+    "__init__.py", "comfy_offline_nodes.py", "runtime_manager.py", "runtime_manifest.json",
     "install.py", "install_runtime.ps1", "requirements.txt", "pyproject.toml",
     "pipeline/run_xess.py", "pipeline/run_fg.py", "pipeline/prepare_sr.py",
     "pipeline/prepare_fg.py", "src/xess_vsr.cpp", "src/xess_fg.cpp",
-    "src/shm_ring_win.h", "workflows/xess超分帧生成.json",
+    "src/shm_ring_win.h", "workflows/r4_offline_comfy_video.json",
 )
 
 
@@ -63,14 +63,20 @@ def main() -> int:
             if LOCAL_WORKSPACE_PATTERN.search(text):
                 errors.append(f"local workspace path leaked into: {relative}")
     try:
-        workflow = json.loads((ROOT / "workflows/xess超分帧生成.json").read_text(encoding="utf-8-sig"))
+        workflow = json.loads((ROOT / "workflows/r4_offline_comfy_video.json").read_text(encoding="utf-8-sig"))
         types = {node.get("type") for node in workflow.get("nodes", [])}
-        expected = {"XeSSVideoSuperResolution", "XeSSVideoFrameGeneration"}
+        expected = {"XeSSR4OfflineSuperResolution", "XeSSR4OfflineFrameGeneration"}
         if not expected.issubset(types):
             errors.append(f"workflow is missing nodes: {sorted(expected - types)}")
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         errors.append(f"invalid workflow JSON: {exc}")
     manifest = json.loads((ROOT / "runtime_manifest.json").read_text(encoding="utf-8"))
+    sys.path.insert(0, str(ROOT))
+    import runtime_manager
+    try:
+        runtime_manager.load_manifest()
+    except runtime_manager.RuntimeManagerError as exc:
+        errors.append(str(exc))
     if args.asset:
         asset = pathlib.Path(args.asset).resolve()
         if asset.name != manifest["asset_name"]:

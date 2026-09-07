@@ -92,11 +92,14 @@ def refine_five_frame(entries: list[object], centre: int, *,
         scale = analysis_width / width
         small_width = analysis_width
         small_height = max(2, int(round(height * scale)))
+        scale_y = small_height / height
         small_entries = []
         for entry in entries:
             result = entry.result
             small_flow = cv2.resize(result.flow, (small_width, small_height),
-                                    interpolation=cv2.INTER_AREA) * scale
+                                    interpolation=cv2.INTER_AREA)
+            small_flow[..., 0] *= scale
+            small_flow[..., 1] *= scale_y
             small_confidence = cv2.resize(result.confidence, (small_width, small_height),
                                           interpolation=cv2.INTER_AREA)
             small_depth = (cv2.resize(result.depth, (small_width, small_height),
@@ -113,7 +116,9 @@ def refine_five_frame(entries: list[object], centre: int, *,
             depth_strength=depth_strength, analysis_width=0)
         small_correction = small_refined.flow - small_current.flow
         correction = cv2.resize(small_correction, (width, height),
-                                interpolation=cv2.INTER_LINEAR) / scale
+                                interpolation=cv2.INTER_LINEAR)
+        correction[..., 0] /= scale
+        correction[..., 1] /= scale_y
         refined_flow = np.nan_to_num(current.flow + correction, nan=0.0,
                                      posinf=0.0, neginf=0.0).astype(np.float32)
         refined_depth = current.depth
@@ -126,6 +131,7 @@ def refine_five_frame(entries: list[object], centre: int, *,
         metrics = dict(current.metrics)
         metrics.update(small_refined.metrics)
         metrics["five_frame_analysis_scale"] = scale
+        metrics["five_frame_analysis_scale_y"] = scale_y
         return replace(current, flow=refined_flow, depth=refined_depth, metrics=metrics)
 
     grid_x, grid_y = _grid(height, width)

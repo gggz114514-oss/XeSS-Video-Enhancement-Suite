@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from fractions import Fraction
 
 
 class MediaValidationError(RuntimeError):
@@ -13,10 +14,28 @@ class MediaValidationError(RuntimeError):
 
 
 def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, capture_output=True, text=True, errors="replace")
+    return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
 def probe_video(python: str, flow_script: str, path: str) -> dict[str, int | float]:
+    ffprobe = os.environ.get("XESS_FFPROBE")
+    if ffprobe and os.path.isfile(ffprobe):
+        # Matroska duration can include audio padding. OpenCV estimates frame
+        # count from that duration (48 actual video frames became 49).
+        result = _run([ffprobe, "-v", "error", "-select_streams", "v:0", "-count_frames",
+                       "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate,nb_read_frames",
+                       "-of", "json", path])
+        if result.returncode:
+            raise MediaValidationError("实际视频解码计数失败：" + result.stderr[-1200:])
+        try:
+            stream = json.loads(result.stdout)["streams"][0]
+            rate = stream.get("avg_frame_rate", "0/0")
+            if rate in ("0/0", "0/1"):
+                rate = stream["r_frame_rate"]
+            return dict(width=int(stream["width"]), height=int(stream["height"]),
+                        fps=float(Fraction(rate)), frames=int(stream["nb_read_frames"]))
+        except (KeyError, IndexError, ValueError, ZeroDivisionError) as exc:
+            raise MediaValidationError("无法取得可靠的视频帧数：" + result.stdout[-1200:]) from exc
     result = _run([python, flow_script, path, "--probe-only"])
     if result.returncode:
         raise MediaValidationError(

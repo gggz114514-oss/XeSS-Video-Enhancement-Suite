@@ -124,6 +124,7 @@ class MultiFrameReconstructor:
 
 
 def main() -> None:
+    from shm_ring import RingReader
     parser = argparse.ArgumentParser(description="Five-frame sub-pixel MFSR residual injector")
     parser.add_argument("--video", required=True)
     parser.add_argument("--ffmpeg", required=True)
@@ -135,6 +136,9 @@ def main() -> None:
     parser.add_argument("--strength", type=float, default=1.80)
     parser.add_argument("--detail-boost", type=float, default=0.90)
     parser.add_argument("--max-injection", type=float, default=22.0)
+    parser.add_argument("--guide-shm-name", default="")
+    parser.add_argument("--guide-shm-slots", type=int, default=0)
+    parser.add_argument("--guide-shm-slot-size", type=int, default=0)
     args = parser.parse_args()
     if min(args.in_w, args.in_h, args.out_w, args.out_h, args.frames) <= 0:
         raise SystemExit("[mfsr] invalid dimensions/frame count")
@@ -146,8 +150,10 @@ def main() -> None:
     source_command = [args.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
                       "-i", args.video, "-an", "-f", "rawvideo", "-pix_fmt", "rgb24",
                       "-s", f"{args.in_w}x{args.in_h}", "-vframes", str(args.frames), "-"]
-    decoder = subprocess.Popen(source_command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    assert decoder.stdout is not None
+    guide_reader = (RingReader(args.guide_shm_name, args.guide_shm_slots, args.guide_shm_slot_size)
+                    if args.guide_shm_name else None)
+    decoder = (subprocess.Popen(source_command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+               if guide_reader is None else None)
     source_bytes = args.in_w * args.in_h * 3
     output_bytes = args.out_w * args.out_h * 3
     sources: OrderedDict[int, np.ndarray] = OrderedDict()
@@ -161,8 +167,8 @@ def main() -> None:
         for index in range(args.frames):
             wanted = min(args.frames - 1, index + 2)
             while next_source <= wanted:
-                payload = read_exact(decoder.stdout, source_bytes)
-                if payload is None:
+                payload = guide_reader.read() if guide_reader is not None else read_exact(decoder.stdout, source_bytes)
+                if payload is None or len(payload) != source_bytes:
                     raise RuntimeError(f"source decoder ended at frame {next_source}")
                 sources[next_source] = np.frombuffer(payload, np.uint8).reshape(
                     args.in_h, args.in_w, 3).copy()
@@ -182,18 +188,23 @@ def main() -> None:
                 print(f"[mfsr] {index + 1}/{args.frames}, {elapsed / (index + 1):.3f}s/frame",
                       file=sys.stderr, flush=True)
         sys.stdout.buffer.flush()
-        decoder.stdout.close()
-        code = decoder.wait(timeout=10)
+        if decoder is not None:
+            decoder.stdout.close()
+        code = decoder.wait(timeout=10) if decoder is not None else 0
         if code:
             raise RuntimeError(f"source decoder failed with exit code {code}")
     except BrokenPipeError:
-        decoder.terminate()
-        os._exit(1)
+        if decoder is not None:
+            decoder.terminate()
+        raise SystemExit(1)
     except Exception as exc:
-        if decoder.poll() is None:
+        if decoder is not None and decoder.poll() is None:
             decoder.terminate()
         print(f"[mfsr] error: {exc}", file=sys.stderr, flush=True)
         raise SystemExit(1) from exc
+    finally:
+        if guide_reader is not None:
+            guide_reader.close()
     print(f"[mfsr] complete: {args.frames} frames, {(time.perf_counter() - started):.2f}s",
           file=sys.stderr, flush=True)
 

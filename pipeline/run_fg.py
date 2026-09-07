@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""XeSS FG 1.2 portable runner with independent motion/depth analysis."""
+"""XeSS FG 1.2 portable runner with an optional shared-motion bridge."""
 
 from __future__ import annotations
 
@@ -14,7 +14,10 @@ from pathlib import Path
 
 from chunked_media import concat_command, extract_lossless_command, write_concat_list
 from media_validation import MediaValidationError, validate_output
+from media_timeline import probe_cfr, rate_text
 from shm_ring import RingOwner, packet_slot_size
+import runtime_hooks
+from offline_encoders import video_options
 from workdir_guard import (WorkdirError, create_workspace, estimate_fg_bytes,
                            finalize_output, partial_output_path)
 
@@ -26,14 +29,33 @@ def first_existing(*paths):
     return next((os.path.abspath(path) for path in paths if path and os.path.isfile(path)), "")
 
 
+def first_existing_dir(*paths):
+    return next((os.path.abspath(path) for path in paths if path and os.path.isdir(path)), "")
+
+
 PY = first_existing(os.environ.get("XESS_PYTHON"), os.path.join(ROOT, "python", "python.exe"), sys.executable)
 FFMPEG = first_existing(os.environ.get("XESS_FFMPEG"), os.path.join(ROOT, "ffmpeg.exe"), shutil.which("ffmpeg"))
 XESS_FG = first_existing(os.environ.get("XESS_FG"), os.path.join(ROOT, "xess-fg.exe"), os.path.join(ROOT, "build", "xess-fg.exe"))
+XESS_FG_FULL_GPU = first_existing(
+    os.environ.get("XESS_FG_FULL_GPU"),
+    os.path.join(ROOT, "xess-fg-full-gpu.exe"),
+    os.path.join(ROOT, "build", "xess-fg-full-gpu.exe"),
+    os.path.join(ROOT, "..", "build", "xess-fg-full-gpu.exe"))
 FLOW = os.path.join(ROOT, "flow.py")
 PREPARE = os.path.join(ROOT, "prepare_fg.py")
 SHARPEN = os.path.join(ROOT, "adaptive_sharpen.py")
 RAW_SLICE = os.path.join(ROOT, "raw_frame_slice.py")
 DEPTH_MODEL = os.path.join(ROOT, "models", "depth-anything-v2-small", "depth_anything_v2_small.xml")
+GPU_BLOCK_SHADERS = first_existing_dir(
+    os.environ.get("XESS_GPU_BLOCK_SHADERS"),
+    os.path.join(ROOT, "gpu-block-fg-shaders"),
+    os.path.join(ROOT, "build", "gpu-block-fg-shaders"),
+    os.path.join(ROOT, "..", "build", "gpu-block-fg-shaders"))
+FULL_GPU_SHADERS = first_existing_dir(
+    os.environ.get("XESS_FG_FULL_GPU_SHADERS"),
+    os.path.join(ROOT, "gpu-block-fg-full-gpu-shaders"),
+    os.path.join(ROOT, "build", "gpu-block-fg-full-gpu-shaders"),
+    os.path.join(ROOT, "..", "build", "gpu-block-fg-full-gpu-shaders"))
 
 # Mainline motion estimation is native Fast DIS only.  The retired SEA-RAFT
 # choices stay accepted so old workflows and scripts keep running on DIS.
@@ -92,7 +114,13 @@ def resolve_settings(args):
     mode = defaults["mode"] if args.sharpen_mode == "auto" else args.sharpen_mode
     io_mode = args.io_mode
     motion_window = defaults["window"] if args.motion_window == "auto" else int(args.motion_window)
-    return {"flow": flow, "bidirectional": bidirectional, "sharpen": sharpen,
+    motion_backend = getattr(args, "motion_backend", "cpu-dis")
+    if motion_backend == "gpu-block":
+        flow, bidirectional = "gpu-block", False
+    elif motion_backend == "gpu-dis":
+        flow, bidirectional = "gpu-dis", False
+    return {"flow": flow, "bidirectional": bidirectional,
+            "motion_backend": motion_backend, "sharpen": sharpen,
             "sharpen_mode": mode,
             "static": defaults["static"] if args.sharpen_static is None else args.sharpen_static,
             "motion": defaults["motion"] if args.sharpen_motion is None else args.sharpen_motion,
@@ -139,8 +167,9 @@ def worker_command(args, width, height, fps, frames, *, stream, raw="", mv_dir="
         if args.overlay_mask:
             command.extend(("--ui-mask", "stream"))
     else:
-        command.extend(("--frames", raw, "--mv", mv_dir, "--depth", depth_dir,
-                        "--out", generated))
+        command.extend(("--frames", raw, "--mv", mv_dir, "--out", generated))
+        if args.depth == "ai":
+            command.extend(("--depth", depth_dir))
         if args.overlay_mask:
             command.extend(("--ui-mask", mask_dir))
         if reset:
@@ -154,16 +183,19 @@ def worker_command(args, width, height, fps, frames, *, stream, raw="", mv_dir="
     command.extend(("--capture-mode", getattr(args, "capture_mode", "direct")))
     if args.allow_overlay:
         command.append("--allow-overlay")
+    if getattr(args, "motion_backend", "cpu-dis") == "gpu-block":
+        command.extend(("--gpu-block-motion", "--shader-dir",
+                        args.gpu_block_shader_dir,
+                        "--motion-repair", args.gpu_block_repair,
+                        "--motion-center-bias", str(args.gpu_block_center_bias)))
     return command
 
 
 def encoder_command(args, settings, width, height, output_fps, output_frames, partial,
                     trim_start=0):
     command = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y", "-f", "rawvideo",
-               "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(output_fps),
-               "-i", "-", "-i", args.video, "-map", "0:v", "-map", "1:a?",
-               "-c:v", "libx264", "-preset", args.encoder_preset, "-crf", str(args.crf),
-               "-pix_fmt", "yuv420p"]
+               "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", rate_text(output_fps),
+               "-i", "-", "-i", args.video, "-map", "0:v", "-map", "1:a?"] + video_options(args)
     filters = []
     if trim_start:
         filters.append(f"trim=start_frame={trim_start},setpts=PTS-STARTPTS")
@@ -216,7 +248,8 @@ def run_stream(args, settings, environment, driver_environment,
                        "-s", f"{width}x{height}", "-vframes", str(frames), "-"]
     ring = None
     if settings["io_mode"] == "shared":
-        ring = RingOwner(slots=4, slot_size=packet_slot_size(
+        _slots = max(2, int(getattr(args, "_slots", 0) or 0) or 4)
+        ring = RingOwner(slots=_slots, slot_size=packet_slot_size(
             width, height, depth=True, mask=bool(args.overlay_mask)), prefix="xess-fg")
     prepare_command = prep_command(args, settings, width, height, frames,
                                    stream=True, ring=ring)
@@ -263,6 +296,17 @@ def run_stream(args, settings, environment, driver_environment,
         encode_command = encoder_command(args, settings, width, height, fps * 2.0,
                                          output_frames, partial)
         print(f"[run_fg] $ {command_text(encode_command)}")
+        if getattr(args, "preview_dir", ""):
+            tap_command = runtime_hooks.preview_tap_command(
+                PY, width, height, fps * 2.0, output_frames,
+                os.path.abspath(args.preview_dir), FFMPEG, backend="xess",
+                preview_scale=getattr(args, "_preview_scale", 1.0))
+            print(f"[run_fg] $ preview-tap -> {args.preview_dir}")
+            tap = subprocess.Popen(tap_command, stdin=video_stream,
+                                   stdout=subprocess.PIPE, env=environment)
+            video_stream.close()
+            video_stream = tap.stdout
+            processes.append(tap)
         encoder = subprocess.Popen(encode_command, stdin=video_stream, env=environment)
         video_stream.close()
         processes.append(encoder)
@@ -348,11 +392,109 @@ def run_file(args, settings, environment, driver_environment,
                             frames * 2 - 1, partial), environment=environment, stdin=source)
 
 
+def _extract_annexb(args, environment, workspace):
+    """Demux AVC/HEVC without decoding; returns (codec, elementary_path)."""
+    attempts = (
+        ("h264", "h264_mp4toannexb", "h264"),
+        ("hevc", "hevc_mp4toannexb", "hevc"),
+    )
+    errors = []
+    for codec, bitstream_filter, muxer in attempts:
+        elementary = workspace.path(f"full-gpu-input.{muxer}")
+        command = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                   "-i", args.video, "-map", "0:v:0", "-an", "-c:v", "copy",
+                   "-bsf:v", bitstream_filter, "-f", muxer, os.fspath(elementary)]
+        print(f"[run_fg] $ {command_text(command)}", flush=True)
+        result = subprocess.run(command, env=environment, capture_output=True, text=True)
+        if result.returncode == 0 and elementary.is_file() and elementary.stat().st_size:
+            return codec, elementary
+        errors.append(result.stderr[-800:].strip())
+        if elementary.is_file():
+            elementary.unlink()
+    die("全 GPU 链目前只接受可无损解复用的 H.264/HEVC 输入；"
+        + " | ".join(item for item in errors if item))
+
+
+def run_full_gpu(args, environment, driver_environment, workspace,
+                 width, height, fps, frames, partial):
+    """Compressed demux -> QSV decode -> GPU motion/XeFG -> QSV encode."""
+    codec, elementary = _extract_annexb(args, environment, workspace)
+    encoded = workspace.path("full-gpu-output.h264")
+    report = workspace.path("full-gpu-report.json")
+    command = [XESS_FG_FULL_GPU, "--input", os.fspath(elementary),
+               "--codec", codec, "--max-frames", str(frames),
+               "--fps", str(fps), "--shader-dir", FULL_GPU_SHADERS,
+               "--qsv-out", os.fspath(encoded), "--report", os.fspath(report),
+               "--slots", str(max(4, int(getattr(args, "_slots", 4)))),
+               "--motion-backend", args.motion_backend,
+               "--motion-repair", args.gpu_block_repair,
+               "--motion-center-bias", str(args.gpu_block_center_bias)]
+    if args.device >= 0:
+        command.extend(("--adapter", str(args.device)))
+    run(command, environment=driver_environment)
+    try:
+        full_gpu_report = json.loads(report.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"全 GPU 核心没有产生有效报告：{exc}")
+    expected = frames * 2 - 1
+    reported_frames = full_gpu_report.get("frames", {})
+    reported_encode = full_gpu_report.get("encode", {})
+    reported_boundaries = full_gpu_report.get("boundaries", {})
+    report_ok = (
+        full_gpu_report.get("classification") == "FULL_GPU_FG_PASS"
+        and reported_frames.get("input") == frames
+        and reported_frames.get("output") == expected
+        and reported_frames.get("expected_output") == expected
+        and reported_encode.get("imported") == expected
+        and reported_encode.get("converted") == expected
+        and reported_encode.get("encoded") == expected
+        and reported_encode.get("pts_mismatch") == 0
+        and reported_encode.get("pts_unknown") == 0
+        and reported_boundaries.get("decoded_surface_cpu_map") is False
+        and reported_boundaries.get("full_frame_cpu_upload_bytes") == 0
+        and reported_boundaries.get("full_frame_cpu_readback_bytes") == 0
+    )
+    if not report_ok:
+        die(f"全 GPU 核心未通过：{full_gpu_report}")
+
+    output_fps = fps * 2.0
+    output_frames = expected
+    duration = output_frames / output_fps
+    # Raw Annex-B packets have no container timestamps.  First wrap video into
+    # MP4 so timestamps are materialized, then copy the original audio.  A
+    # single FFmpeg invocation exits as soon as the untimestamped H.264 frame
+    # limit is reached and silently writes zero audio packets.
+    video_only = workspace.path("full-gpu-video.mp4")
+    wrap = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y",
+            "-r", str(output_fps), "-i", os.fspath(encoded),
+            "-map", "0:v:0", "-c:v", "copy", "-frames:v", str(output_frames),
+            "-movflags", "+faststart", os.fspath(video_only)]
+    run(wrap, environment=environment)
+    mux = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y",
+           "-i", os.fspath(video_only), "-i", args.video,
+           "-map", "0:v:0", "-map", "1:a?", "-c", "copy",
+           "-t", f"{duration:.9f}", "-movflags", "+faststart",
+           os.fspath(partial)]
+    run(mux, environment=environment)
+    print("[run_fg] full-gpu: QSV decode -> D3D12 motion/XeFG -> QSV encode; "
+          "full-frame CPU upload/readback=0", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="XeSS FG 1.2 2x frame generation")
     parser.add_argument("video")
     parser.add_argument("--preset", choices=("fast", "balanced", "quality"), default="fast")
     parser.add_argument("--flow-mode", choices=("auto", "dis-fast", "dis-occlusion", "sea-raft-single", "sea-raft"), default="auto")
+    parser.add_argument("--motion-backend", choices=("cpu-dis", "gpu-block", "gpu-dis"),
+                        default="cpu-dis",
+                        help="gpu-block or strict GPU DIS computes motion in xess-fg-full-gpu")
+    parser.add_argument("--pipeline-backend", choices=("classic", "full-gpu"),
+                        default="classic",
+                        help="full-gpu keeps decoded/generated frames on Intel GPU and uses QSV")
+    parser.add_argument("--gpu-block-shader-dir", default=GPU_BLOCK_SHADERS)
+    parser.add_argument("--gpu-block-repair", choices=("off", "propagate", "refine"),
+                        default="refine")
+    parser.add_argument("--gpu-block-center-bias", type=float, default=0.002)
     parser.add_argument("--depth", choices=("ai", "constant"), default="ai")
     parser.add_argument("--depth-model", default=DEPTH_MODEL)
     parser.add_argument("--depth-device", default="GPU")
@@ -382,21 +524,57 @@ def main():
     parser.add_argument("--debug-prep", action="store_true")
     parser.add_argument("--crf", type=int, default=16)
     parser.add_argument("--encoder-preset", default="slow")
+    parser.add_argument("--encoder", choices=("auto", "h264_qsv", "hevc_qsv", "libx264", "libx265", "ffv1"), default=None)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--preview-dir", default="",
+                        help="streaming fMP4 preview session directory")
+    parser.add_argument("--memory-strategy", choices=("auto", "conservative"),
+                        default="auto")
     parser.add_argument("--capture-mode", choices=("direct", "window"), default="direct",
                         help="generated-frame capture backend; direct avoids WGC/DPI/overlay issues")
     parser.add_argument("--allow-overlay", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    from offline_encoders import configure_cli_encoder
+    try:
+        configure_cli_encoder(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    for path, label in ((PY, "Python"), (FFMPEG, "ffmpeg.exe"), (XESS_FG, "xess-fg.exe"),
-                        (FLOW, "flow.py"), (PREPARE, "prepare_fg.py")):
+    if args.pipeline_backend == "full-gpu":
+        # Full-GPU defaults to Block Motion, while an explicit gpu-dis choice
+        # selects the embedded strict GPU DIS graph. Neither launches CPU
+        # analysis beside the product path.
+        if args.motion_backend == "cpu-dis":
+            args.motion_backend = "gpu-block"
+        args.depth = "constant"
+    elif args.motion_backend == "gpu-dis":
+        die("--motion-backend gpu-dis requires --pipeline-backend full-gpu")
+
+    required = [(PY, "Python"), (FFMPEG, "ffmpeg.exe"), (FLOW, "flow.py")]
+    if args.pipeline_backend == "full-gpu":
+        required.extend(((XESS_FG_FULL_GPU, "xess-fg-full-gpu.exe"),
+                         (FULL_GPU_SHADERS, "full-GPU shader directory")))
+    else:
+        required.extend(((XESS_FG, "xess-fg.exe"), (PREPARE, "prepare_fg.py")))
+    for path, label in required:
         if not path or not os.path.isfile(path):
+            if label.endswith("directory") and path and os.path.isdir(path):
+                continue
             die(f"missing {label}: {path}")
     if not os.path.isfile(args.video):
         die(f"video not found: {args.video}")
-    if args.depth == "ai" and not os.path.isfile(args.depth_model):
+    if (args.pipeline_backend != "full-gpu" and args.depth == "ai" and
+            not os.path.isfile(args.depth_model)):
         die(f"depth model missing: {args.depth_model}")
+    if (args.pipeline_backend != "full-gpu" and args.motion_backend == "gpu-block" and
+            not os.path.isdir(args.gpu_block_shader_dir)):
+        die(f"GPU Block shader directory missing: {args.gpu_block_shader_dir}")
+    if (args.pipeline_backend == "full-gpu" and args.motion_backend == "gpu-dis" and
+            not os.path.isdir(os.path.join(FULL_GPU_SHADERS, "gpu-dis"))):
+        die(f"GPU DIS shader directory missing: {os.path.join(FULL_GPU_SHADERS, 'gpu-dis')}")
+    if args.gpu_block_center_bias < 0:
+        die("--gpu-block-center-bias must be non-negative")
     if args.overlay_mask and not os.path.isfile(args.overlay_mask):
         die(f"overlay mask not found: {args.overlay_mask}")
     if args.final_sharpen is not None and not 0 <= args.final_sharpen <= 1:
@@ -410,22 +588,50 @@ def main():
     if not 8 <= args.chunk_frames <= 600:
         die("--chunk-frames must be in 8..600")
 
-    metadata = json.loads(run([PY, FLOW, args.video, "--probe-only"],
-                              capture_output=True, text=True).stdout)
+    try:
+        metadata = probe_cfr(args.video, FFMPEG, max_frames=args.frames)
+    except RuntimeError as exc:
+        die(str(exc))
     width, height, fps = int(metadata["width"]), int(metadata["height"]), float(metadata["fps"])
     frames = min(int(metadata["frames"]), args.frames) if args.frames > 0 else int(metadata["frames"])
     if width <= 0 or height <= 0 or fps <= 0 or frames < 2:
         die(f"invalid media metadata: {width}x{height}, {fps}, {frames}")
+    ok_budget, budget_report = runtime_hooks.preflight_budget(
+        os.environ.get("XESS_RT_WORK",
+                       os.path.join(ROOT, "..", "..", "..", "..", "..", "work")),
+        "保守" if getattr(args, "memory_strategy", "auto") == "conservative" else "自动",
+        width, height, width, height, frames or 240, fps,
+        depth_on=args.depth == "ai")
+    print(f"[run_fg] memory: {budget_report['message']}")
+    print("[run_fg] budget: "
+      + json.dumps(budget_report.get("items", {}), ensure_ascii=False))
+    if not ok_budget:
+        die(f"资源预算不足，已拒绝启动：{budget_report['message']}")
+    args._slots = int(budget_report["queue_slots"])
+    args._preview_scale = float(budget_report.get("preview_scale", 1.0))
     settings = resolve_settings(args)
     if settings["io_mode"] == "auto":
         settings["io_mode"] = "shared" if height > 720 else "stream"
     output_dir = os.path.abspath(args.out_dir or os.path.dirname(os.path.abspath(args.video)))
     os.makedirs(output_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(args.video))[0]
-    output = os.path.join(output_dir, f"{base}_xess_fg12_{args.preset}_2x_{fps * 2:g}fps.mp4")
+    backend_label = (("fullgpu_dis" if args.motion_backend == "gpu-dis" else "fullgpu")
+                     if args.pipeline_backend == "full-gpu" else
+                     ("gpublock" if args.motion_backend == "gpu-block" else "dis"))
+    output = os.path.join(
+        output_dir,
+        f"{base}_xess_fg12_{args.preset}_{backend_label}_2x_{fps * 2:g}fps.mp4")
+    if os.environ.get("XESS_OUTPUT_CONTAINER") == ".mkv":
+        output = str(Path(output).with_suffix(".mkv"))
     partial = partial_output_path(output)
-    estimate = estimate_fg_bytes(width, height, frames, io_mode=settings["io_mode"],
-                                 include_depth=True, chunk_frames=args.chunk_frames)
+    if args.pipeline_backend == "full-gpu":
+        # Only compressed elementary video, QSV output and a temporary MP4
+        # wrapper touch disk.  Do not reserve raw RGB/depth-sized storage.
+        estimate = max(256 << 20, os.path.getsize(args.video) * 3)
+    else:
+        estimate = estimate_fg_bytes(
+            width, height, frames, io_mode=settings["io_mode"],
+            include_depth=True, chunk_frames=args.chunk_frames)
     try:
         workspace = create_workspace(kind="fg12", explicit_work_dir=args.work_dir,
                                      output_dir=output_dir, package_dir=ROOT, input_path=args.video,
@@ -437,7 +643,8 @@ def main():
     environment = workspace.child_environment()
     driver_environment = workspace.driver_environment(environment)
     print(f"[run_fg] {width}x{height} {fps:g}fps {frames} frames -> {fps * 2:g}fps; "
-          f"preset={args.preset}, flow={settings['flow']}, depth={args.depth}, "
+          f"preset={args.preset}, pipeline={args.pipeline_backend}, motion={args.motion_backend}, "
+          f"flow={settings['flow']}, depth={args.depth}, "
           f"motion-window={settings['motion_window']}, io={settings['io_mode']}, "
           f"sharpen={settings['sharpen_mode']}")
     succeeded = False
@@ -446,7 +653,10 @@ def main():
             print("[run_fg] dry-run complete; no media processing started")
             succeeded = True
             return
-        if settings["io_mode"] in ("stream", "shared"):
+        if args.pipeline_backend == "full-gpu":
+            run_full_gpu(args, environment, driver_environment, workspace,
+                         width, height, fps, frames, partial)
+        elif settings["io_mode"] in ("stream", "shared"):
             run_stream(args, settings, environment, driver_environment,
                        width, height, fps, frames, partial)
         elif settings["io_mode"] == "chunked":

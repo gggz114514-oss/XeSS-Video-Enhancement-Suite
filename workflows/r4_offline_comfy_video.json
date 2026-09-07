@@ -1,0 +1,164 @@
+{
+  "id": "r4-offline-comfy-video",
+  "revision": 0,
+  "last_node_id": 7,
+  "last_link_id": 6,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "pos": [40, 220],
+      "size": [280, 230],
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {"name": "file", "type": "COMBO", "widget": {"name": "file"}, "link": null},
+        {"name": "upload", "type": "IMAGEUPLOAD", "widget": {"name": "upload"}, "link": null}
+      ],
+      "outputs": [{"name": "VIDEO", "type": "VIDEO", "links": [1, 3, 5]}],
+      "title": "输入视频（文件型 VIDEO）",
+      "properties": {"Node name for S&R": "LoadVideo"},
+      "widgets_values": ["10s_480p.mp4", "image"]
+    },
+    {
+      "id": 2,
+      "type": "XeSSR4OfflineSuperResolution",
+      "pos": [410, 40],
+      "size": [300, 280],
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {"name": "video", "type": "VIDEO", "link": 1},
+        {"name": "scale", "type": "COMBO", "widget": {"name": "scale"}, "link": null},
+        {"name": "custom_scale", "type": "FLOAT", "widget": {"name": "custom_scale"}, "link": null},
+        {"name": "backend", "type": "COMBO", "widget": {"name": "backend"}, "link": null},
+        {"name": "encoder", "type": "COMBO", "widget": {"name": "encoder"}, "link": null},
+        {"name": "depth", "type": "COMBO", "widget": {"name": "depth"}, "link": null},
+        {"name": "sharpen", "type": "BOOLEAN", "widget": {"name": "sharpen"}, "link": null},
+        {"name": "five_frame", "type": "BOOLEAN", "widget": {"name": "five_frame"}, "link": null},
+        {"name": "anti_stripe", "type": "BOOLEAN", "widget": {"name": "anti_stripe"}, "link": null}
+      ],
+      "outputs": [
+        {"name": "超分后视频", "type": "VIDEO", "links": [2]},
+        {"name": "成片绝对路径", "type": "STRING", "links": null}
+      ],
+      "title": "R4 独立离线超分",
+      "properties": {"Node name for S&R": "XeSSR4OfflineSuperResolution"},
+      "widgets_values": ["1.5×", 1.5, "GPU Block（快速）", "自动", "AI 深度", false, false, false]
+    },
+    {
+      "id": 3,
+      "type": "SaveVideo",
+      "pos": [760, 60],
+      "size": [280, 250],
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {"name": "video", "type": "VIDEO", "link": 2},
+        {"name": "filename_prefix", "type": "STRING", "widget": {"name": "filename_prefix"}, "link": null},
+        {"name": "format", "type": "COMBO", "widget": {"name": "format"}, "link": null},
+        {"name": "codec", "type": "COMFY_DYNAMICCOMBO_V3", "widget": {"name": "codec"}, "link": null}
+      ],
+      "outputs": [{"name": "video", "type": "VIDEO", "links": null}],
+      "title": "保存 SR 成片",
+      "properties": {"Node name for S&R": "SaveVideo"},
+      "widgets_values": ["video/r4_offline_sr", "auto", "auto"]
+    },
+    {
+      "id": 4,
+      "type": "XeSSR4OfflineFrameGeneration",
+      "pos": [410, 390],
+      "size": [300, 250],
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {"name": "video", "type": "VIDEO", "link": 3},
+        {"name": "backend", "type": "COMBO", "widget": {"name": "backend"}, "link": null},
+        {"name": "encoder", "type": "COMBO", "widget": {"name": "encoder"}, "link": null},
+        {"name": "depth", "type": "COMBO", "widget": {"name": "depth"}, "link": null},
+        {"name": "sharpen", "type": "BOOLEAN", "widget": {"name": "sharpen"}, "link": null}
+      ],
+      "outputs": [
+        {"name": "2× 插帧后视频", "type": "VIDEO", "links": [4]},
+        {"name": "成片绝对路径", "type": "STRING", "links": null}
+      ],
+      "title": "R4 独立离线 2× 插帧",
+      "properties": {"Node name for S&R": "XeSSR4OfflineFrameGeneration"},
+      "widgets_values": ["GPU Block（快速）", "自动", "AI 深度", false]
+    },
+    {
+      "id": 5,
+      "type": "XeSSR4OfflineSuperResolutionFrameGeneration",
+      "pos": [410, 720],
+      "size": [300, 280],
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {"name": "video", "type": "VIDEO", "link": 5},
+        {"name": "scale", "type": "COMBO", "widget": {"name": "scale"}, "link": null},
+        {"name": "custom_scale", "type": "FLOAT", "widget": {"name": "custom_scale"}, "link": null},
+        {"name": "backend", "type": "COMBO", "widget": {"name": "backend"}, "link": null},
+        {"name": "encoder", "type": "COMBO", "widget": {"name": "encoder"}, "link": null},
+        {"name": "depth", "type": "COMBO", "widget": {"name": "depth"}, "link": null},
+        {"name": "sharpen", "type": "BOOLEAN", "widget": {"name": "sharpen"}, "link": null},
+        {"name": "five_frame", "type": "BOOLEAN", "widget": {"name": "five_frame"}, "link": null},
+        {"name": "anti_stripe", "type": "BOOLEAN", "widget": {"name": "anti_stripe"}, "link": null}
+      ],
+      "outputs": [
+        {"name": "SR→2×FG 成片", "type": "VIDEO", "links": [6]},
+        {"name": "成片绝对路径", "type": "STRING", "links": null}
+      ],
+      "title": "R4 组合离线 SR→2×FG",
+      "properties": {"Node name for S&R": "XeSSR4OfflineSuperResolutionFrameGeneration"},
+      "widgets_values": ["1.5×", 1.5, "GPU Block（快速）", "自动", "AI 深度", false, false, false]
+    },
+    {
+      "id": 6,
+      "type": "SaveVideo",
+      "pos": [760, 410],
+      "size": [280, 250],
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {"name": "video", "type": "VIDEO", "link": 4},
+        {"name": "filename_prefix", "type": "STRING", "widget": {"name": "filename_prefix"}, "link": null},
+        {"name": "format", "type": "COMBO", "widget": {"name": "format"}, "link": null},
+        {"name": "codec", "type": "COMFY_DYNAMICCOMBO_V3", "widget": {"name": "codec"}, "link": null}
+      ],
+      "outputs": [{"name": "video", "type": "VIDEO", "links": null}],
+      "title": "保存 FG 成片",
+      "properties": {"Node name for S&R": "SaveVideo"},
+      "widgets_values": ["video/r4_offline_fg", "auto", "auto"]
+    },
+    {
+      "id": 7,
+      "type": "SaveVideo",
+      "pos": [760, 740],
+      "size": [280, 250],
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {"name": "video", "type": "VIDEO", "link": 6},
+        {"name": "filename_prefix", "type": "STRING", "widget": {"name": "filename_prefix"}, "link": null},
+        {"name": "format", "type": "COMBO", "widget": {"name": "format"}, "link": null},
+        {"name": "codec", "type": "COMFY_DYNAMICCOMBO_V3", "widget": {"name": "codec"}, "link": null}
+      ],
+      "outputs": [{"name": "video", "type": "VIDEO", "links": null}],
+      "title": "保存组合成片",
+      "properties": {"Node name for S&R": "SaveVideo"},
+      "widgets_values": ["video/r4_offline_sr_fg", "auto", "auto"]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 2, 0, "VIDEO"],
+    [2, 2, 0, 3, 0, "VIDEO"],
+    [3, 1, 0, 4, 0, "VIDEO"],
+    [4, 4, 0, 6, 0, "VIDEO"],
+    [5, 1, 0, 5, 0, "VIDEO"],
+    [6, 5, 0, 7, 0, "VIDEO"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {"ds": {"scale": 0.8, "offset": [0, 0]}},
+  "version": 0.4
+}

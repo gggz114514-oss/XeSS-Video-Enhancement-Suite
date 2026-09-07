@@ -12,14 +12,14 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, os.fspath(ROOT / "tools"))
 
-import build_runtime_asset  # noqa: E402
+import build_comfy_runtime as build_runtime_asset
 
 
 class RuntimeAssetCollectionTests(unittest.TestCase):
     def test_collect_excludes_retired_sea_raft_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             source = pathlib.Path(temp)
-            for relative in build_runtime_asset.REQUIRED_FILES:
+            for relative in build_runtime_asset.REQUIRED:
                 path = source / pathlib.Path(relative)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"required")
@@ -30,10 +30,7 @@ class RuntimeAssetCollectionTests(unittest.TestCase):
             retired.parent.mkdir(parents=True, exist_ok=True)
             retired.write_bytes(b"retired")
 
-            relatives = {
-                relative.as_posix()
-                for _, relative in build_runtime_asset.collect(source, None)
-            }
+            relatives = set(build_runtime_asset.collect(source))
 
             self.assertIn("python/python.exe", relatives)
             self.assertIn("python/Lib/site-packages/keep.txt", relatives)
