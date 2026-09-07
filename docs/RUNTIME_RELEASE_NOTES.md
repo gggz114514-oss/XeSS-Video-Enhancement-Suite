@@ -1,4 +1,33 @@
-# Runtime 2026.08.28-r3
+# ComfyUI R4 / Source 1.4.0 / Runtime 2026.09.07-r4
+
+仅发布 ComfyUI 视频节点及其共享离线引擎。独立工具箱和实时工具箱不在此包中。
+
+## 更新
+
+- 三个新节点：超分、2× 插帧、超分后 2× 插帧。
+- GPU Block（默认）、CPU DIS、Intel 视频接口、GPU DIS/AMD 光流（实验）。
+- QSV H.264/HEVC、x264/x265、FFV1 无损，按模式联动的锐化/五帧/抗竖纹开关。
+- git pull 后重启自动安装匹配运行时，不安装/替换 ComfyUI 的 Python 包。
+- **旧 R3 节点不再注册，旧工作流需要手动替换节点。** 原有输出和 R3 engine 保留。
+
+## 资产
+
+- `xess-comfy-runtime-windows-x64-2026.09.07-r4.zip`
+- 同名 `.zip.sha256`
+
+ZIP SHA256：`f9012e3e2eaf5d9caa83dc6957e4bae147bd7aa06804bba7edae83df90165bda`。
+ZIP 369,083,229 字节，解包文件合计 834,548,629 字节。自动安装额外预留 512 MiB，
+不会为了腾空间删除旧引擎或用户视频。源码、节点、工作流在 Git，二进制/模型在 ZIP。
+
+只在 Windows / Intel Arc B580 上验收；A770 及其他厂商不作本版完整支持承诺。
+AMD 光流是算法名称。离线 2×，不包含实时 3×/4×。SDR 8bit/CFR 是本版 GPU 输入合同。
+
+详细安装、升级、参数限制见仓库 README；发布验收见
+`docs/reports/COMFY_R4_RELEASE_ACCEPTANCE.md`。实验路线不保证优于 CPU DIS。
+
+---
+
+# 历史：Runtime 2026.08.28-r3
 
 Fixed Windows/Intel Arc runtime for XeSS Video Enhancement Suite source release 1.3.x.
 
