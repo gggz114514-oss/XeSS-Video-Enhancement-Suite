@@ -52,7 +52,12 @@ b21142e 不变，旧节点按用户要求移除。独立 HTML/WPF、WGC/OBS 工�
 - 本地 clone 发现开发仓库存有不兼容 Windows 文件名的历史实验 tag；测试 clone
   使用 --no-tags。已核验公开 origin 没有该 tag，发布只推本分支，绝不推所有 tags。
 
-公开 Release 网络下载验证仍待上传；不能用离线资产安装测试冒充网络下载成功。
+清洁 PATH 补测：去掉 oneAPI/Comfy Python/开发 SDK 目录与相关环境变量，
+五路线各 8 帧 SRFG 均通过。仅保留系统目录与独立运行时，未依赖开发机 setvars。
+
+GitHub 服务端资产已上传并核对大小 369083229 与 SHA256
+f9012e3e2eaf5d9caa83dc6957e4bae147bd7aa06804bba7edae83df90165bda。
+CI 在 9965d3c 的 push 与 PR 两轮成功；公开下载与最终主线合并待收尾。
 
 ## 边界
 

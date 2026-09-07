@@ -4,7 +4,7 @@
   "layout": "comfy-r4-nested-v1",
   "runtime_version": "2026.09.07-r4",
   "release_tag": "runtime-2026.09.07-r4",
-  "release_status": "not-published",
+  "release_status": "published",
   "asset_name": "xess-comfy-runtime-windows-x64-2026.09.07-r4.zip",
   "archive_root": "xess-comfy-runtime",
   "download_url": "https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/download/runtime-2026.09.07-r4/xess-comfy-runtime-windows-x64-2026.09.07-r4.zip",
