@@ -15,3 +15,21 @@ work/
 *.mp4
 *.avi
 
+# GPU DIS is distributed as compiled runtime only; implementation stays private.
+src/**/gpu_dis_fg_impl.cpp
+src/**/native_strict_dis_provider.*
+src/**/strict_dis_main.cpp
+src/**/dis_*.hlsl
+src/**/dis_*.hlsli
+src/**/shaders/gpu_dis/
+src/**/shaders/gpu-dis/
+src/**/xve_gpu_block_core.h
+src/**/vpl_gpu_full_fg.cpp
+src/**/vpl_gpu_full_chain_probe.cpp
+src/**/shaders/motion_*.hlsl
+src/**/shaders/surface_gpu_motion*.hlsl
+src/**/shaders/surface_gpu_pyramid*.hlsl
+src/**/shaders/surface_gpu_lite*.hlsl
+src/**/shaders/surface_gpu_velocity.hlsl
+src/**/shaders/surface_gpu_mask.hlsl
+

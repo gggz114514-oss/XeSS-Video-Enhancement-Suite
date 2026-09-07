@@ -9,6 +9,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from runtime_manager import sha256_file
+from tools.publication_policy import is_private_gpu_source
 
 REQUIRED = (
     'bin/gpu-block-native.exe', 'bin/gpu-dis-native.exe', 'bin/amd-of-native.exe',
@@ -34,6 +35,8 @@ def collect(runtime, supplement=None):
             if not file.is_file():
                 continue
             rel = file.relative_to(base)
+            if is_private_gpu_source(rel):
+                raise ValueError('发布包不得包含 GPU DIS / GPU Block 源码：' + str(rel))
             if rel.parts[0] not in ('bin', 'media', 'probe', 'python', 'models', 'shaders', 'licenses'):
                 continue
             if '__pycache__' in rel.parts or file.suffix.lower() in ('.pyc', '.pyo', '.log', '.pdb', '.obj', '.blob', '.partial'):

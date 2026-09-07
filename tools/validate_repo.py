@@ -10,6 +10,8 @@ import sys
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from tools.publication_policy import is_private_gpu_source
 SKIP_PARTS = {".git", ".runtime", "build", "dist", "work", "__pycache__"}
 FORBIDDEN_SUFFIXES = {".dll", ".exe", ".safetensors", ".raw", ".mp4", ".avi"}
 LOCAL_WORKSPACE_PATTERN = re.compile(r"(?i)[a-z]:\\[^\r\n]*(?:xess-tools|comfyui-aki)")
@@ -46,6 +48,8 @@ def main() -> int:
             errors.append(f"missing repository file: {name}")
     for path in source_files():
         relative = path.relative_to(ROOT)
+        if is_private_gpu_source(relative):
+            errors.append(f"GPU DIS / GPU Block source must not be published: {relative}")
         if path.stat().st_size > 10 * 1024 * 1024:
             errors.append(f"file larger than 10 MiB belongs in Releases: {relative}")
         if path.suffix.casefold() in FORBIDDEN_SUFFIXES:

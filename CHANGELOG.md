@@ -1,5 +1,11 @@
 # Changelog
 
+## R4 源码分发调整 - 2026-09-07
+
+- GPU DIS / GPU Block 改为仅分发编译运行库，当前源码树移除对应算法及内嵌实现。
+- 两个档位和配套 Runtime 不变；已安装 R4 用户无需重新下载运行库。
+- 公共构建边界和历史可见性见 docs/GPU_DIS_BINARY_DISTRIBUTION.md；旧 Git 历史未清除。
+
 ## 1.4.0 - 2026-09-07 — ComfyUI R4
 
 - 本次仅发布 ComfyUI 节点和共享离线引擎，独立离线/实时工具箱另行发布。

@@ -1,3 +1,6 @@
+#if !__has_include("vpl_gpu_full_fg.cpp")
+#error AMD worker entry requires the private native host; use the published R4 binary.
+#else
 #define XESS_NATIVE_GPU_CORE_LIBRARY
 #include "vpl_gpu_full_fg.cpp"
 #include "amd_of_provider.h"
@@ -48,3 +51,4 @@ int main(int argc,char** argv){
     }
     return result;
 }
+#endif

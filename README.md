@@ -6,6 +6,8 @@ Windows 上的视频超分与 2× 插帧。R4 提供三个中文节点：**视�
 
 [R4 下载与更新说明](https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/tag/runtime-2026.09.07-r4)
 
+GPU DIS 与 GPU Block 仅提供运行库中的编译版，当前源码目录不再包含其 C++ / HLSL 实现；节点功能与安装方式不变。构建边界见 [GPU 算法发布说明](docs/GPU_DIS_BINARY_DISTRIBUTION.md)。
+
 ## 安装
 
 关闭 ComfyUI，在 `ComfyUI/custom_nodes` 中打开终端：

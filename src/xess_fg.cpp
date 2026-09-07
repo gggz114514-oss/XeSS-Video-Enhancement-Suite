@@ -1100,7 +1100,6 @@ struct Runtime {
 };
 
 
-
 struct WindowCapture {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
