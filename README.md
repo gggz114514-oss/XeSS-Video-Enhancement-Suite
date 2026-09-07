@@ -40,6 +40,8 @@ git pull --ff-only
 
 如果 `git pull` 提示有本地修改，先备份或提交修改；不要强制覆盖。回退步骤见 [升级与回退](docs/COMFY_R4_UPGRADE.md)。
 
+**2026-09-07 R4 历史清理提醒：** 如果已经安装过当天清理前的 R4，`git pull --ff-only` 可能提示历史分叉。请关闭 ComfyUI，把旧节点目录备份到 `custom_nodes` 外，再重新克隆；可将备份中的 `.runtime` 拷回新节点目录，由程序重新校验。不要合并或推送旧 R4 历史。R3 及更早正常更新不受影响。
+
 ## 使用
 
 加载 [最小组合工作流](workflows/r4_offline_quickstart.json)，或者搜索菜单 `XeSS R4 离线视频`：
