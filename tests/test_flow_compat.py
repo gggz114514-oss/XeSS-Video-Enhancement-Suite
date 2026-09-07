@@ -19,59 +19,9 @@ sys.path.insert(0, os.fspath(ROOT))
 sys.path.insert(0, os.fspath(ROOT / "pipeline"))
 
 
-def _install_torch_stub_if_needed() -> None:
-    """Let the dependency-light CI run import xess_nodes without torch.
-
-    xess_nodes only touches torch inside function bodies; a minimal symbol
-    module is enough to satisfy the top-level import.
-    """
-    try:
-        import torch  # noqa: F401
-    except ImportError:
-        torch_stub = types.ModuleType("torch")
-        torch_stub.Tensor = type("Tensor", (), {})
-        torch_stub.is_tensor = lambda value: False
-        sys.modules["torch"] = torch_stub
-
-
-_install_torch_stub_if_needed()
-
-import xess_nodes  # noqa: E402
-import run_fg  # noqa: E402
-import run_xess  # noqa: E402
-import prepare_common  # noqa: E402
-
-
-class NodeFlowCompatTests(unittest.TestCase):
-    def setUp(self) -> None:
-        xess_nodes._MIGRATION_PRINTED = False
-
-    def test_presets_no_longer_reference_sea_raft(self) -> None:
-        for presets in (xess_nodes.SR_PRESETS, xess_nodes.FG_PRESETS):
-            for preset in presets.values():
-                self.assertEqual(preset["flow"], "dis")
-                self.assertFalse(preset["bidirectional"])
-
-    def test_legacy_flow_values_migrate_to_dis_fast_with_notice(self) -> None:
-        preset = {"flow": "dis", "bidirectional": False}
-        stderr = io.StringIO()
-        with contextlib.redirect_stdout(stderr):
-            flow, bidirectional = xess_nodes._resolve_flow(preset, "sea-raft")
-        self.assertEqual((flow, bidirectional), ("dis", False))
-        self.assertIn("SEA-RAFT", stderr.getvalue())
-        # The migration notice is printed once per process.
-        with contextlib.redirect_stdout(io.StringIO()):
-            again, _ = xess_nodes._resolve_flow(preset, "sea-raft-single")
-        self.assertEqual(again, "dis")
-
-    def test_canonical_maps_chinese_legacy_labels_for_old_workflows(self) -> None:
-        self.assertEqual(xess_nodes._canonical("SEA-RAFT 双向", xess_nodes.FLOW_VALUES), "sea-raft")
-        self.assertEqual(xess_nodes._canonical("sea-raft-single", xess_nodes.FLOW_VALUES),
-                         "sea-raft-single")
-        self.assertEqual(xess_nodes._canonical("DIS 极速", xess_nodes.FLOW_VALUES), "dis-fast")
-
-    def test_ui_choices_no_longer_offer_sea_raft(self) -> None:
-        self.assertFalse(any("SEA-RAFT" in choice for choice in xess_nodes.FLOW_CHOICES))
+import run_fg
+import run_xess
+import prepare_common
 
 
 def _driver_args(module, *, preset="quality", flow_mode="auto"):

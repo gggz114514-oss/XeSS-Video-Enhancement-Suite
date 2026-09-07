@@ -21,6 +21,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <d3d11.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
@@ -48,6 +49,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -207,6 +209,21 @@ struct Args {
     bool allow_overlay = false;
     bool stream = false;
     bool direct_capture = true;
+    bool gpu_block_motion = false;
+    // Library-only product path: decoded pixels arrive as a shared NV12 GPU
+    // surface and encoded pixels leave through QSV.  The legacy CLI never
+    // enables this flag, so its resource contract is unchanged.
+    bool full_gpu = false;
+    // Full-GPU XeFG uses one descriptor range per in-flight frame slot.
+    // Legacy callers leave this at one and retain the original 48-entry heap.
+    uint32_t motion_descriptor_slots = 1;
+    std::string shader_dir;
+    std::string motion_repair = "refine";
+    float motion_center_bias = 0.002f;
+    // Full-GPU FG diagnostic: skip motion estimation and clear the tagged
+    // velocity resource.  This is deliberately opt-in and is not a product
+    // quality mode.
+    bool zero_mv_motion = false;
 };
 
 bool parse_args(int argc, char** argv, Args& args) {
@@ -233,6 +250,20 @@ bool parse_args(int argc, char** argv, Args& args) {
         else if (!strcmp(key, "--ui-mask")) args.ui_mask_dir = next();
         else if (!strcmp(key, "--verbose")) args.verbose = true;
         else if (!strcmp(key, "--allow-overlay")) args.allow_overlay = true;
+        else if (!strcmp(key, "--gpu-block-motion")) {
+            fprintf(stderr, "[args] GPU Block is available only in the published R4 runtime.\n");
+            return false;
+        }
+        else if (!strcmp(key, "--shader-dir")) {
+            const char* v = next(); if (!v) return false; args.shader_dir = v;
+        }
+        else if (!strcmp(key, "--motion-repair")) {
+            const char* v = next(); if (!v) return false; args.motion_repair = v;
+        }
+        else if (!strcmp(key, "--motion-center-bias")) {
+            const char* v = next(); if (!v) return false;
+            args.motion_center_bias = static_cast<float>(atof(v));
+        }
         else if (!strcmp(key, "--capture-mode")) {
             const char* v = next();
             if (!v) return false;
@@ -256,11 +287,15 @@ bool parse_args(int argc, char** argv, Args& args) {
             return false;
         }
     }
-    const bool io = args.stream || (args.frames && args.mv_dir && args.output);
+    const bool io = args.stream ||
+        (args.frames && args.output && (args.gpu_block_motion || args.mv_dir));
     const bool shm_ok = !args.shm_name ||
         (args.shm_slots >= 2 && args.shm_slot_size >= sizeof(StreamHeader));
+    const bool motion_ok = args.motion_repair == "off" ||
+        args.motion_repair == "propagate" || args.motion_repair == "refine";
     return io && shm_ok && args.width > 0 && args.height > 0 &&
-           args.frame_count > 1 && args.fps > 0.0;
+           args.frame_count > 1 && args.fps > 0.0 && motion_ok &&
+           args.motion_center_bias >= 0.0f;
 }
 
 bool process_running(const wchar_t* executable_name) {
@@ -332,17 +367,337 @@ ComPtr<IDXGIAdapter1> pick_adapter(IDXGIFactory4* factory, int requested) {
     return requested < 0 ? best : nullptr;
 }
 
+// Full-GPU mode needs the generated texture before Present invalidates the
+// contents of a flip-discard back buffer. XeSS-FG does not expose that texture,
+// but it does create the native chain through our factory. This transparent
+// swap-chain proxy copies the current native back buffer on the application
+// queue immediately before each native Present call. XeSS-FG's second native
+// Present is the generated frame, so the final captured texture after the outer
+// proxy Present is the generated image.
+class PresentCaptureSwapChain final : public IDXGISwapChain4 {
+public:
+    PresentCaptureSwapChain(IDXGISwapChain1* inner, ID3D12CommandQueue* queue,
+                            UINT capture_slots = 4)
+        : inner_(inner), queue_(queue),
+          capture_slots_(std::max<UINT>(4, std::min<UINT>(8, capture_slots))) {
+        if (inner_) inner_.As(&inner4_);
+        if (queue_) queue_->GetDevice(IID_PPV_ARGS(&device_));
+        captures_.resize(capture_slots_);
+    }
+
+    ID3D12Resource* captured_resource() const {
+        return latest_capture_ < captures_.size()
+            ? captures_[latest_capture_].resource.Get() : nullptr;
+    }
+    UINT latest_capture_slot() const { return latest_capture_; }
+    UINT64 latest_capture_fence() const {
+        return latest_capture_ < captures_.size()
+            ? captures_[latest_capture_].fence_value : 0;
+    }
+    uint64_t captured_presents() const { return captured_presents_; }
+    bool capture_healthy() const { return capture_healthy_; }
+    uint64_t capture_wait_count() const { return capture_wait_count_; }
+    double capture_wait_seconds() const { return capture_wait_seconds_; }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) ||
+            riid == __uuidof(IDXGIDeviceSubObject) ||
+            riid == __uuidof(IDXGISwapChain) || riid == __uuidof(IDXGISwapChain1) ||
+            riid == __uuidof(IDXGISwapChain2) || riid == __uuidof(IDXGISwapChain3) ||
+            riid == __uuidof(IDXGISwapChain4)) {
+            *object = static_cast<IDXGISwapChain4*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return inner_ ? inner_->QueryInterface(riid, object) : E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&references_));
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG value = static_cast<ULONG>(InterlockedDecrement(&references_));
+        if (!value) delete this;
+        return value;
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID n, UINT s, const void* d) override {
+        return inner_->SetPrivateData(n, s, d);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID n, const IUnknown* u) override {
+        return inner_->SetPrivateDataInterface(n, u);
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID n, UINT* s, void* d) override {
+        return inner_->GetPrivateData(n, s, d);
+    }
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID r, void** p) override {
+        return inner_->GetParent(r, p);
+    }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID r, void** d) override {
+        return inner_->GetDevice(r, d);
+    }
+    HRESULT STDMETHODCALLTYPE Present(UINT sync, UINT flags) override {
+        capture();
+        return inner_->Present(sync, flags);
+    }
+    HRESULT STDMETHODCALLTYPE GetBuffer(UINT i, REFIID r, void** p) override {
+        return inner_->GetBuffer(i, r, p);
+    }
+    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL f, IDXGIOutput* o) override {
+        return inner_->SetFullscreenState(f, o);
+    }
+    HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* f, IDXGIOutput** o) override {
+        return inner_->GetFullscreenState(f, o);
+    }
+    HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC* d) override {
+        return inner_->GetDesc(d);
+    }
+    HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT c, UINT w, UINT h, DXGI_FORMAT f,
+                                             UINT flags) override {
+        for (auto& capture : captures_) {
+            capture.resource.Reset();
+            capture.allocator.Reset();
+            capture.list.Reset();
+            capture.fence.Reset();
+            if (capture.event) {
+                CloseHandle(capture.event);
+                capture.event = nullptr;
+            }
+            capture.fence_value = 0;
+        }
+        return inner_->ResizeBuffers(c, w, h, f, flags);
+    }
+    HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC* d) override {
+        return inner_->ResizeTarget(d);
+    }
+    HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput** o) override {
+        return inner_->GetContainingOutput(o);
+    }
+    HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* s) override {
+        return inner_->GetFrameStatistics(s);
+    }
+    HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT* c) override {
+        return inner_->GetLastPresentCount(c);
+    }
+    HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_SWAP_CHAIN_DESC1* d) override {
+        return inner4_->GetDesc1(d);
+    }
+    HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* d) override {
+        return inner4_->GetFullscreenDesc(d);
+    }
+    HRESULT STDMETHODCALLTYPE GetHwnd(HWND* w) override { return inner4_->GetHwnd(w); }
+    HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID r, void** w) override {
+        return inner4_->GetCoreWindow(r, w);
+    }
+    HRESULT STDMETHODCALLTYPE Present1(UINT sync, UINT flags,
+                                       const DXGI_PRESENT_PARAMETERS* p) override {
+        capture();
+        return inner4_->Present1(sync, flags, p);
+    }
+    BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override {
+        return inner4_->IsTemporaryMonoSupported();
+    }
+    HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput** o) override {
+        return inner4_->GetRestrictToOutput(o);
+    }
+    HRESULT STDMETHODCALLTYPE SetBackgroundColor(const DXGI_RGBA* c) override {
+        return inner4_->SetBackgroundColor(c);
+    }
+    HRESULT STDMETHODCALLTYPE GetBackgroundColor(DXGI_RGBA* c) override {
+        return inner4_->GetBackgroundColor(c);
+    }
+    HRESULT STDMETHODCALLTYPE SetRotation(DXGI_MODE_ROTATION r) override {
+        return inner4_->SetRotation(r);
+    }
+    HRESULT STDMETHODCALLTYPE GetRotation(DXGI_MODE_ROTATION* r) override {
+        return inner4_->GetRotation(r);
+    }
+    HRESULT STDMETHODCALLTYPE SetSourceSize(UINT w, UINT h) override {
+        return inner4_->SetSourceSize(w, h);
+    }
+    HRESULT STDMETHODCALLTYPE GetSourceSize(UINT* w, UINT* h) override {
+        return inner4_->GetSourceSize(w, h);
+    }
+    HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT l) override {
+        return inner4_->SetMaximumFrameLatency(l);
+    }
+    HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* l) override {
+        return inner4_->GetMaximumFrameLatency(l);
+    }
+    HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override {
+        return inner4_->GetFrameLatencyWaitableObject();
+    }
+    HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F* m) override {
+        return inner4_->SetMatrixTransform(m);
+    }
+    HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F* m) override {
+        return inner4_->GetMatrixTransform(m);
+    }
+    UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override {
+        return inner4_->GetCurrentBackBufferIndex();
+    }
+    HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE c,
+                                                      UINT* s) override {
+        return inner4_->CheckColorSpaceSupport(c, s);
+    }
+    HRESULT STDMETHODCALLTYPE SetColorSpace1(DXGI_COLOR_SPACE_TYPE c) override {
+        return inner4_->SetColorSpace1(c);
+    }
+    HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT c, UINT w, UINT h, DXGI_FORMAT f,
+                                              UINT flags, const UINT* masks,
+                                              IUnknown* const* queues) override {
+        for (auto& capture : captures_) {
+            capture.resource.Reset();
+            capture.allocator.Reset();
+            capture.list.Reset();
+            capture.fence.Reset();
+            if (capture.event) {
+                CloseHandle(capture.event);
+                capture.event = nullptr;
+            }
+            capture.fence_value = 0;
+        }
+        return inner4_->ResizeBuffers1(c, w, h, f, flags, masks, queues);
+    }
+    HRESULT STDMETHODCALLTYPE SetHDRMetaData(DXGI_HDR_METADATA_TYPE t, UINT s,
+                                              void* m) override {
+        return inner4_->SetHDRMetaData(t, s, m);
+    }
+
+private:
+    struct CaptureSlot {
+        ComPtr<ID3D12Resource> resource;
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        ComPtr<ID3D12Fence> fence;
+        HANDLE event = nullptr;
+        UINT64 fence_value = 0;
+    };
+
+    ~PresentCaptureSwapChain() {
+        for (auto& capture : captures_)
+            if (capture.event) CloseHandle(capture.event);
+    }
+
+    bool ensure_capture_resource(CaptureSlot& capture, ID3D12Resource* source) {
+        if (capture.resource) {
+            const D3D12_RESOURCE_DESC have = capture.resource->GetDesc();
+            const D3D12_RESOURCE_DESC want = source->GetDesc();
+            if (have.Width == want.Width && have.Height == want.Height &&
+                have.Format == want.Format) return true;
+            capture.resource.Reset();
+        }
+        if (!device_ || !queue_) return false;
+        D3D12_RESOURCE_DESC desc = source->GetDesc();
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(device_->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                IID_PPV_ARGS(&capture.resource)))) return false;
+        if (!capture.allocator && FAILED(device_->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&capture.allocator)))) return false;
+        if (!capture.list && FAILED(device_->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, capture.allocator.Get(), nullptr,
+                IID_PPV_ARGS(&capture.list)))) return false;
+        if (capture.list) capture.list->Close();
+        if (!capture.fence && FAILED(device_->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&capture.fence)))) return false;
+        if (!capture.event) capture.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        return capture.event != nullptr;
+    }
+
+    void capture() {
+        if (!inner4_ || !queue_) return;
+        if (std::getenv("XESS_FG_TEST_CAPTURE_FAILURE")) {
+            capture_healthy_ = false;
+            return;
+        }
+        CaptureSlot& capture = captures_[next_capture_];
+        if (capture.fence_value &&
+            capture.fence->GetCompletedValue() < capture.fence_value) {
+            const auto wait_start = std::chrono::steady_clock::now();
+            ++capture_wait_count_;
+            bool completed = SUCCEEDED(capture.fence->SetEventOnCompletion(
+                capture.fence_value, capture.event)) &&
+                WaitForSingleObject(capture.event, 15000) == WAIT_OBJECT_0;
+            capture_wait_seconds_ += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - wait_start).count();
+            if (!completed) {
+                capture_healthy_ = false;
+                return;
+            }
+        }
+        const UINT index = inner4_->GetCurrentBackBufferIndex();
+        ComPtr<ID3D12Resource> source;
+        if (FAILED(inner4_->GetBuffer(index, IID_PPV_ARGS(&source))) ||
+            !ensure_capture_resource(capture, source.Get()) ||
+            FAILED(capture.allocator->Reset()) ||
+            FAILED(capture.list->Reset(capture.allocator.Get(), nullptr))) {
+            capture_healthy_ = false;
+            return;
+        }
+        D3D12_RESOURCE_BARRIER barriers[2]{};
+        barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[0].Transition.pResource = source.Get();
+        barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[1].Transition.pResource = capture.resource.Get();
+        barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        capture.list->ResourceBarrier(2, barriers);
+        capture.list->CopyResource(capture.resource.Get(), source.Get());
+        std::swap(barriers[0].Transition.StateBefore,
+                  barriers[0].Transition.StateAfter);
+        std::swap(barriers[1].Transition.StateBefore,
+                  barriers[1].Transition.StateAfter);
+        capture.list->ResourceBarrier(2, barriers);
+        if (FAILED(capture.list->Close())) { capture_healthy_ = false; return; }
+        ID3D12CommandList* lists[] = {capture.list.Get()};
+        queue_->ExecuteCommandLists(1, lists);
+        const UINT64 value = ++capture.fence_value;
+        if (FAILED(queue_->Signal(capture.fence.Get(), value))) {
+            capture_healthy_ = false;
+            return;
+        }
+        latest_capture_ = next_capture_;
+        next_capture_ = (next_capture_ + 1) % static_cast<UINT>(captures_.size());
+        ++captured_presents_;
+    }
+
+    volatile LONG references_ = 1;
+    ComPtr<IDXGISwapChain1> inner_;
+    ComPtr<IDXGISwapChain4> inner4_;
+    ComPtr<ID3D12CommandQueue> queue_;
+    ComPtr<ID3D12Device> device_;
+    std::vector<CaptureSlot> captures_;
+    UINT capture_slots_ = 4;
+    UINT next_capture_ = 0;
+    UINT latest_capture_ = 0;
+    uint64_t captured_presents_ = 0;
+    bool capture_healthy_ = true;
+    uint64_t capture_wait_count_ = 0;
+    double capture_wait_seconds_ = 0.0;
+};
+
 // XeSS-FG's documented descriptor initialization creates a native DXGI swap
 // chain through the factory supplied by the application, then returns only its
-// proxy. This forwarding factory records the created native object without
-// changing its reference count or ownership while initialization is in flight.
-// Once initialization completes, the caller obtains its own reference through
-// QueryInterface and can read the native presented buffers directly.
+// proxy. This forwarding factory records the native object and, in full-GPU
+// mode, gives XeSS-FG the pre-Present capture proxy above.
 class RecordingFactory final : public IDXGIFactory2 {
 public:
-    explicit RecordingFactory(IDXGIFactory2* inner) : inner_(inner) {}
+    RecordingFactory(IDXGIFactory2* inner, ID3D12CommandQueue* queue,
+                     bool capture_before_present, UINT capture_slots = 4)
+        : inner_(inner), queue_(queue),
+          capture_before_present_(capture_before_present),
+          capture_slots_(capture_slots) {}
 
     IDXGISwapChain1* captured_swapchain() const { return captured_swapchain_; }
+    PresentCaptureSwapChain* capture_proxy() const { return capture_proxy_; }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
         if (!object) return E_POINTER;
@@ -411,7 +766,16 @@ public:
         IDXGIOutput* restrict_to_output, IDXGISwapChain1** swapchain) override {
         HRESULT hr = inner_->CreateSwapChainForHwnd(
             device, window, desc, fullscreen_desc, restrict_to_output, swapchain);
-        if (SUCCEEDED(hr) && swapchain && *swapchain) captured_swapchain_ = *swapchain;
+        if (SUCCEEDED(hr) && swapchain && *swapchain) {
+            captured_swapchain_ = *swapchain;
+            if (capture_before_present_) {
+                PresentCaptureSwapChain* wrapper =
+                    new PresentCaptureSwapChain(*swapchain, queue_.Get(), capture_slots_);
+                capture_proxy_ = wrapper;
+                (*swapchain)->Release();
+                *swapchain = wrapper;
+            }
+        }
         return hr;
     }
     HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(
@@ -456,12 +820,17 @@ private:
     ~RecordingFactory() = default;
     volatile LONG references_ = 1;
     ComPtr<IDXGIFactory2> inner_;
+    ComPtr<ID3D12CommandQueue> queue_;
     IDXGISwapChain1* captured_swapchain_ = nullptr; // Non-owning during init.
+    PresentCaptureSwapChain* capture_proxy_ = nullptr; // Owned by XeSS-FG.
+    bool capture_before_present_ = false;
+    UINT capture_slots_ = 4;
 };
 
 ComPtr<ID3D12Resource> create_texture(ID3D12Device* device, UINT width, UINT height,
                                       DXGI_FORMAT format, D3D12_RESOURCE_STATES initial_state,
-                                      const wchar_t* name) {
+                                      const wchar_t* name,
+                                      D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = width;
@@ -471,6 +840,7 @@ ComPtr<ID3D12Resource> create_texture(ID3D12Device* device, UINT width, UINT hei
     desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = flags;
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     ComPtr<ID3D12Resource> resource;
@@ -512,6 +882,100 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
     list->ResourceBarrier(1, &barrier);
 }
 
+D3D12_CPU_DESCRIPTOR_HANDLE cpu_descriptor(ID3D12DescriptorHeap* heap, UINT index,
+                                            UINT stride) {
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = heap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(index) * stride;
+    return handle;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE gpu_descriptor(ID3D12DescriptorHeap* heap, UINT index,
+                                            UINT stride) {
+    D3D12_GPU_DESCRIPTOR_HANDLE handle = heap->GetGPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<UINT64>(index) * stride;
+    return handle;
+}
+
+void create_srv(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT index,
+                UINT stride, ID3D12Resource* resource, DXGI_FORMAT format,
+                UINT plane = 0) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = format;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2D.MipLevels = 1;
+    view.Texture2D.PlaneSlice = plane;
+    device->CreateShaderResourceView(resource, &view,
+                                     cpu_descriptor(heap, index, stride));
+}
+
+void create_uav(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT index,
+                UINT stride, ID3D12Resource* resource, DXGI_FORMAT format) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.Format = format;
+    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(resource, nullptr, &view,
+                                      cpu_descriptor(heap, index, stride));
+}
+
+bool create_motion_root(ID3D12Device* device, ComPtr<ID3D12RootSignature>& root) {
+    D3D12_DESCRIPTOR_RANGE srv{};
+    srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srv.NumDescriptors = 5;
+    srv.BaseShaderRegister = 0;
+    D3D12_DESCRIPTOR_RANGE uav{};
+    uav.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uav.NumDescriptors = 2;
+    uav.BaseShaderRegister = 0;
+    D3D12_ROOT_PARAMETER params[3]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable.NumDescriptorRanges = 1;
+    params[0].DescriptorTable.pDescriptorRanges = &srv;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges = &uav;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[2].Constants.Num32BitValues = 8;
+    params[2].Constants.ShaderRegister = 0;
+    D3D12_ROOT_SIGNATURE_DESC desc{};
+    desc.NumParameters = static_cast<UINT>(std::size(params));
+    desc.pParameters = params;
+    ComPtr<ID3DBlob> serialized;
+    ComPtr<ID3DBlob> errors;
+    HRESULT hr = D3D12SerializeRootSignature(
+        &desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
+    if (FAILED(hr)) {
+        if (errors) fprintf(stderr, "[gpu-block] root signature: %s\n",
+                            static_cast<const char*>(errors->GetBufferPointer()));
+        return hr_ok(hr, "D3D12SerializeRootSignature(gpu-block)");
+    }
+    return hr_ok(device->CreateRootSignature(
+                     0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                     IID_PPV_ARGS(&root)), "CreateRootSignature(gpu-block)");
+}
+
+bool load_motion_pipeline(ID3D12Device* device, const std::string& shader_dir,
+                          const char* name, ID3D12RootSignature* root,
+                          ComPtr<ID3D12PipelineState>& pipeline) {
+    const std::string path = shader_dir + "\\" + name + ".dxil";
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input) {
+        fprintf(stderr, "[gpu-block] shader not found: %s\n", path.c_str());
+        return false;
+    }
+    const std::streamoff size = input.tellg();
+    if (size <= 0) return false;
+    std::vector<uint8_t> bytes(static_cast<size_t>(size));
+    input.seekg(0, std::ios::beg);
+    input.read(reinterpret_cast<char*>(bytes.data()), size);
+    if (!input) return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = root;
+    desc.CS = {bytes.data(), bytes.size()};
+    return hr_ok(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline)),
+                 name);
+}
+
 struct Runtime {
     HWND hwnd = nullptr;
     ComPtr<IDXGIFactory4> factory;
@@ -530,12 +994,40 @@ struct Runtime {
     std::vector<ComPtr<ID3D12Resource>> backbuffers;
     ComPtr<IDXGISwapChain4> native_swapchain;
     std::vector<ComPtr<ID3D12Resource>> native_backbuffers;
+    // Non-owning. The XeFG-owned native swap-chain wrapper outlives the proxy
+    // swap chain and is released when the XeFG context is destroyed.
+    PresentCaptureSwapChain* present_capture = nullptr;
 
     ComPtr<ID3D12Resource> velocity;
     ComPtr<ID3D12Resource> depth;
     ComPtr<ID3D12Resource> ui;
     ComPtr<ID3D12Resource> upload;
     ComPtr<ID3D12Resource> readback;
+
+    // Optional self-developed GPU Block Motion path.  It consumes the
+    // application back buffer, keeps two luma frames resident, and writes
+    // XeFG's current->previous R16G16F velocity texture directly.
+    ComPtr<ID3D12DescriptorHeap> motion_heap;
+    UINT motion_descriptor_stride = 0;
+    ComPtr<ID3D12RootSignature> motion_root;
+    ComPtr<ID3D12PipelineState> rgba_luma_pso;
+    ComPtr<ID3D12PipelineState> block_motion_pso;
+    ComPtr<ID3D12PipelineState> repair_pso;
+    ComPtr<ID3D12PipelineState> velocity_pso;
+    ComPtr<ID3D12PipelineState> nv12_color_pso;
+    ComPtr<ID3D12Resource> decoded_color;
+    ComPtr<ID3D12Resource> luma[2];
+    ComPtr<ID3D12Resource> forward_flow;
+    ComPtr<ID3D12Resource> backward_flow;
+    ComPtr<ID3D12Resource> motion_confidence;
+    ComPtr<ID3D12Resource> repaired_flow;
+    D3D12_RESOURCE_STATES luma_state[2] = {
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    bool motion_outputs_are_srv = false;
+    bool gpu_block_motion = false;
+    UINT motion_repair_mode = 2;
+    float motion_center_bias = 0.002f;
     uint32_t color_pitch = 0;
     uint32_t velocity_pitch = 0;
     uint32_t depth_pitch = 0;
@@ -546,7 +1038,17 @@ struct Runtime {
     uint64_t ui_offset = 0;
 
     ~Runtime() {
-        if (queue && fence) wait_gpu();
+        // Destruction is the last safety net for callers that leave work in
+        // flight.  Keep it bounded: a removed device or a broken queue must
+        // not turn an error path into an unbounded process hang.  The normal
+        // full-GPU path drains its per-slot fences before this destructor is
+        // entered; legacy callers still get a final queue-wide wait.
+        if (queue && fence) {
+            uint64_t value = 0;
+            bool timed_out = false;
+            if (signal_queue(&value) && !wait_fence(value, 30000, &timed_out) && timed_out)
+                fprintf(stderr, "[fg] bounded runtime drain timed out after 30s\n");
+        }
         backbuffers.clear();
         swapchain.Reset();
         native_backbuffers.clear();
@@ -562,13 +1064,26 @@ struct Runtime {
     }
 
     bool wait_gpu() {
+        uint64_t value = 0;
+        return signal_queue(&value) && wait_fence(value, INFINITE);
+    }
+
+    bool signal_queue(uint64_t* value_out = nullptr) {
         const uint64_t value = ++fence_value;
         if (FAILED(queue->Signal(fence.Get(), value))) return false;
-        if (fence->GetCompletedValue() < value) {
-            if (FAILED(fence->SetEventOnCompletion(value, fence_event))) return false;
-            if (WaitForSingleObject(fence_event, INFINITE) != WAIT_OBJECT_0) return false;
-        }
+        if (value_out) *value_out = value;
         return true;
+    }
+
+    bool wait_fence(uint64_t value, DWORD timeout_ms = INFINITE,
+                    bool* timed_out = nullptr) {
+        if (timed_out) *timed_out = false;
+        if (!value || fence->GetCompletedValue() >= value) return true;
+        if (FAILED(fence->SetEventOnCompletion(value, fence_event))) return false;
+        const DWORD result = WaitForSingleObject(fence_event, timeout_ms);
+        if (result == WAIT_OBJECT_0) return true;
+        if (result == WAIT_TIMEOUT && timed_out) *timed_out = true;
+        return false;
     }
 
     bool reset_list() {
@@ -583,6 +1098,8 @@ struct Runtime {
         return true;
     }
 };
+
+
 
 struct WindowCapture {
     ComPtr<ID3D11Device> device;
@@ -829,7 +1346,9 @@ bool init_runtime(const Args& args, Runtime& runtime) {
     ComPtr<IDXGIFactory2> init_factory;
     RecordingFactory* recording_factory = nullptr;
     if (args.direct_capture) {
-        recording_factory = new RecordingFactory(runtime.factory.Get());
+        recording_factory = new RecordingFactory(
+            runtime.factory.Get(), runtime.queue.Get(), args.full_gpu,
+            std::max<uint32_t>(1, std::min<uint32_t>(8, args.motion_descriptor_slots)));
         init_factory.Attach(recording_factory);
     } else if (!hr_ok(runtime.factory.As(&init_factory), "Query IDXGIFactory2")) {
         return false;
@@ -845,6 +1364,11 @@ bool init_runtime(const Args& args, Runtime& runtime) {
         }
         if (!hr_ok(captured->QueryInterface(IID_PPV_ARGS(&runtime.native_swapchain)),
                    "Query native IDXGISwapChain4")) return false;
+        runtime.present_capture = recording_factory->capture_proxy();
+        if (args.full_gpu && !runtime.present_capture) {
+            fprintf(stderr, "[capture] pre-Present proxy was not installed\n");
+            return false;
+        }
     }
     init_factory.Reset();
     if (!fg_ok(xefgSwapChainD3D12GetSwapChainPtr(runtime.xefg,
@@ -880,17 +1404,54 @@ bool init_runtime(const Args& args, Runtime& runtime) {
         }
     }
 
-    runtime.velocity = create_texture(runtime.device.Get(), args.width, args.height,
-                                      DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST,
-                                      L"XeSS-FG velocity");
-    runtime.depth = create_texture(runtime.device.Get(), args.width, args.height,
-                                   DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST,
-                                   L"XeSS-FG depth");
+    runtime.velocity = create_texture(
+        runtime.device.Get(), args.width, args.height, DXGI_FORMAT_R16G16_FLOAT,
+        args.gpu_block_motion ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                              : D3D12_RESOURCE_STATE_COPY_DEST,
+        L"XeSS-FG velocity",
+        args.gpu_block_motion ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                              : D3D12_RESOURCE_FLAG_NONE);
+    runtime.depth = create_texture(
+        runtime.device.Get(), args.width, args.height, DXGI_FORMAT_R32_FLOAT,
+        args.full_gpu ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                      : D3D12_RESOURCE_STATE_COPY_DEST,
+        L"XeSS-FG depth",
+        args.full_gpu ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                      : D3D12_RESOURCE_FLAG_NONE);
     if (args.ui_mask_dir)
         runtime.ui = create_texture(runtime.device.Get(), args.width, args.height,
                                     DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COPY_DEST,
                                     L"XeSS-FG UI texture");
     if (!runtime.velocity || !runtime.depth || (args.ui_mask_dir && !runtime.ui)) return false;
+    if (args.gpu_block_motion) {
+        fprintf(stderr, "[gpu-block] Use the published native runtime; no public-source fallback.\n");
+        return false;
+    }
+    if (args.full_gpu) {
+        // Constant depth belongs to the GPU-resident fast path.  Clear it on
+        // D3D12 once instead of uploading an R32 plane for every frame.
+        create_uav(runtime.device.Get(), runtime.motion_heap.Get(), 47,
+                   runtime.motion_descriptor_stride, runtime.depth.Get(),
+                   DXGI_FORMAT_R32_FLOAT);
+        if (!runtime.reset_list()) return false;
+        ID3D12DescriptorHeap* heaps[] = {runtime.motion_heap.Get()};
+        runtime.list->SetDescriptorHeaps(1, heaps);
+        const float constant_depth[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+        runtime.list->ClearUnorderedAccessViewFloat(
+            gpu_descriptor(runtime.motion_heap.Get(), 47,
+                           runtime.motion_descriptor_stride),
+            cpu_descriptor(runtime.motion_heap.Get(), 47,
+                           runtime.motion_descriptor_stride),
+            runtime.depth.Get(), constant_depth, 0, nullptr);
+        transition(runtime.list.Get(), runtime.depth.Get(),
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (!runtime.execute_list() || !runtime.wait_gpu()) return false;
+        // Product full-GPU mode never maps RGB/depth upload or readback
+        // buffers.  Do not even allocate them, so accidental fallback to a
+        // CPU pixel path fails loudly instead of silently regressing.
+        return true;
+    }
 
     runtime.color_pitch = align_up(static_cast<uint32_t>(args.width) * 4,
                                    D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
@@ -921,7 +1482,8 @@ bool init_runtime(const Args& args, Runtime& runtime) {
 
 bool upload_frame(Runtime& runtime, const Args& args, const uint8_t* rgb, const float* motion,
                   const float* depth_input, const uint8_t* ui_mask,
-                  ID3D12Resource* backbuffer, bool first_frame) {
+                  ID3D12Resource* backbuffer, int frame_index) {
+    const bool first_frame = frame_index == 0;
     void* mapped = nullptr;
     if (!hr_ok(runtime.upload->Map(0, nullptr, &mapped), "upload Map")) return false;
     auto* bytes = static_cast<uint8_t*>(mapped);
@@ -950,11 +1512,14 @@ bool upload_frame(Runtime& runtime, const Args& args, const uint8_t* rgb, const 
             }
         }
     }
-    for (int y = 0; y < args.height; ++y) {
-        auto* dst = reinterpret_cast<uint16_t*>(bytes + runtime.velocity_offset +
-                                               static_cast<size_t>(y) * runtime.velocity_pitch);
-        const float* src = motion + static_cast<size_t>(y) * args.width * 2;
-        for (int x = 0; x < args.width * 2; ++x) dst[x] = f32_to_f16(src[x]);
+    if (!args.gpu_block_motion) {
+        if (!motion) { runtime.upload->Unmap(0, nullptr); return false; }
+        for (int y = 0; y < args.height; ++y) {
+            auto* dst = reinterpret_cast<uint16_t*>(bytes + runtime.velocity_offset +
+                                                   static_cast<size_t>(y) * runtime.velocity_pitch);
+            const float* src = motion + static_cast<size_t>(y) * args.width * 2;
+            for (int x = 0; x < args.width * 2; ++x) dst[x] = f32_to_f16(src[x]);
+        }
     }
     for (int y = 0; y < args.height; ++y) {
         auto* dst = reinterpret_cast<float*>(bytes + runtime.depth_offset +
@@ -972,9 +1537,10 @@ bool upload_frame(Runtime& runtime, const Args& args, const uint8_t* rgb, const 
     transition(runtime.list.Get(), backbuffer, D3D12_RESOURCE_STATE_PRESENT,
                D3D12_RESOURCE_STATE_COPY_DEST);
     if (!first_frame) {
-        transition(runtime.list.Get(), runtime.velocity.Get(),
-                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                   D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!args.gpu_block_motion)
+            transition(runtime.list.Get(), runtime.velocity.Get(),
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_COPY_DEST);
         transition(runtime.list.Get(), runtime.depth.Get(),
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1008,11 +1574,13 @@ bool upload_frame(Runtime& runtime, const Args& args, const uint8_t* rgb, const 
         runtime.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
 
-    src.PlacedFootprint.Offset = runtime.velocity_offset;
-    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16_FLOAT;
-    src.PlacedFootprint.Footprint.RowPitch = runtime.velocity_pitch;
-    dst.pResource = runtime.velocity.Get();
-    runtime.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    if (!args.gpu_block_motion) {
+        src.PlacedFootprint.Offset = runtime.velocity_offset;
+        src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16_FLOAT;
+        src.PlacedFootprint.Footprint.RowPitch = runtime.velocity_pitch;
+        dst.pResource = runtime.velocity.Get();
+        runtime.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
 
     src.PlacedFootprint.Offset = runtime.depth_offset;
     src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
@@ -1020,10 +1588,16 @@ bool upload_frame(Runtime& runtime, const Args& args, const uint8_t* rgb, const 
     dst.pResource = runtime.depth.Get();
     runtime.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
-    transition(runtime.list.Get(), backbuffer, D3D12_RESOURCE_STATE_COPY_DEST,
-               D3D12_RESOURCE_STATE_PRESENT);
-    transition(runtime.list.Get(), runtime.velocity.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (args.gpu_block_motion) {
+        transition(runtime.list.Get(), backbuffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        return false; // GPU Block implementation is private; never substitute CPU/zero motion.
+    } else {
+        transition(runtime.list.Get(), backbuffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_PRESENT);
+        transition(runtime.list.Get(), runtime.velocity.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     transition(runtime.list.Get(), runtime.depth.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (args.ui_mask_dir)
@@ -1128,8 +1702,9 @@ int read_stream_frame(FILE* input, XessSharedRingReader* ring, const Args& args,
         header.width != static_cast<uint32_t>(args.width) ||
         header.height != static_cast<uint32_t>(args.height) || header.pixel_format != 1 ||
         header.color_bytes != pixels * 3 ||
-        header.motion_bytes != pixels * 2 * sizeof(float) ||
-        header.depth_bytes != pixels * sizeof(float) ||
+        header.motion_bytes != (args.gpu_block_motion ? 0 :
+                                pixels * 2 * sizeof(float)) ||
+        (header.depth_bytes != 0 && header.depth_bytes != pixels * sizeof(float)) ||
         (args.ui_mask_dir ? header.mask_bytes != pixels : header.mask_bytes != 0)) {
         fprintf(stderr, "[stream] metadata/payload mismatch at frame %d\n", expected_index);
         return -1;
@@ -1152,11 +1727,17 @@ int read_stream_frame(FILE* input, XessSharedRingReader* ring, const Args& args,
     size_t offset = 0;
     frame.color.assign(payload.begin(), payload.begin() + header.color_bytes);
     offset += header.color_bytes;
-    frame.motion.resize(pixels * 2);
-    memcpy(frame.motion.data(), payload.data() + offset, header.motion_bytes);
+    frame.motion.clear();
+    if (header.motion_bytes) {
+        frame.motion.resize(pixels * 2);
+        memcpy(frame.motion.data(), payload.data() + offset, header.motion_bytes);
+    }
     offset += header.motion_bytes;
-    frame.depth.resize(pixels);
-    memcpy(frame.depth.data(), payload.data() + offset, header.depth_bytes);
+    frame.depth.clear();
+    if (header.depth_bytes) {
+        frame.depth.resize(pixels);
+        memcpy(frame.depth.data(), payload.data() + offset, header.depth_bytes);
+    }
     offset += header.depth_bytes;
     frame.ui_mask.clear();
     if (header.mask_bytes)
@@ -1167,6 +1748,7 @@ int read_stream_frame(FILE* input, XessSharedRingReader* ring, const Args& args,
 
 } // namespace
 
+#ifndef XESS_FG_LIBRARY
 int main(int argc, char** argv) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
@@ -1177,7 +1759,9 @@ int main(int argc, char** argv) {
                 "| --frames in.raw --mv mvs --out generated.raw] "
                 "--width W --height H --frames-count N --fps FPS "
                 "[--depth depths] [--device N] [--verbose] [--dump-buffers DIR] "
-                "[--capture-mode direct|window] [--allow-overlay]\n");
+                "[--capture-mode direct|window] [--allow-overlay] "
+                "[--gpu-block-motion --shader-dir DIR "
+                "--motion-repair off|propagate|refine --motion-center-bias F]\n");
         return 2;
     }
     if (args.stream) {
@@ -1195,6 +1779,8 @@ int main(int argc, char** argv) {
 
     Runtime runtime;
     if (!init_runtime(args, runtime)) return 1;
+    fprintf(stderr, "[motion] source=%s\n",
+            args.gpu_block_motion ? "gpu-block" : "stream/cpu");
     WindowCapture capture;
     if (args.direct_capture) {
         fprintf(stderr, "[capture] mode=direct (native swap-chain readback)\n");
@@ -1270,9 +1856,9 @@ int main(int argc, char** argv) {
                 break;
             }
             rgb = stream_frame.color;
-            motion = stream_frame.motion;
+            if (!args.gpu_block_motion) motion = stream_frame.motion;
             depth_values = stream_frame.depth;
-            depth_input = depth_values.data();
+            depth_input = depth_values.empty() ? nullptr : depth_values.data();
             if (args.ui_mask_dir) ui_mask = stream_frame.ui_mask;
             reset = (stream_frame.flags & (kStreamFlagReset | kStreamFlagSceneCut)) != 0;
         } else {
@@ -1281,16 +1867,18 @@ int main(int argc, char** argv) {
                 failed = true;
                 break;
             }
-            char mv_path[1024];
-            snprintf(mv_path, sizeof(mv_path), "%s\\mv_%06d.bin", args.mv_dir, frame);
-            FILE* mv_file = fopen(mv_path, "rb");
-            if (!mv_file || !read_exact(mv_file, motion.data(), motion.size() * sizeof(float))) {
-                fprintf(stderr, "[io] motion-vector file is missing or incomplete: %s\n", mv_path);
-                if (mv_file) fclose(mv_file);
-                failed = true;
-                break;
+            if (!args.gpu_block_motion) {
+                char mv_path[1024];
+                snprintf(mv_path, sizeof(mv_path), "%s\\mv_%06d.bin", args.mv_dir, frame);
+                FILE* mv_file = fopen(mv_path, "rb");
+                if (!mv_file || !read_exact(mv_file, motion.data(), motion.size() * sizeof(float))) {
+                    fprintf(stderr, "[io] motion-vector file is missing or incomplete: %s\n", mv_path);
+                    if (mv_file) fclose(mv_file);
+                    failed = true;
+                    break;
+                }
+                fclose(mv_file);
             }
-            fclose(mv_file);
         }
 
         if (!args.stream && args.depth_dir) {
@@ -1334,7 +1922,7 @@ int main(int argc, char** argv) {
         if (buffer_index >= runtime.backbuffers.size() ||
             !upload_frame(runtime, args, rgb.data(), motion.data(), depth_input,
                           args.ui_mask_dir ? ui_mask.data() : nullptr,
-                          runtime.backbuffers[buffer_index].Get(), frame == 0)) {
+                          runtime.backbuffers[buffer_index].Get(), frame)) {
             failed = true;
             break;
         }
@@ -1529,3 +2117,4 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[xefg] wrote %d generated-frame candidates\n", generated_count);
     return failed ? 1 : 0;
 }
+#endif

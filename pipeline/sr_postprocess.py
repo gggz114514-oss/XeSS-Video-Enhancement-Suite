@@ -22,6 +22,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -197,8 +198,13 @@ def main() -> None:
     parser.add_argument("--shm-name", default="", help="read frames from a shared ring instead of stdin")
     parser.add_argument("--shm-slots", type=int, default=0)
     parser.add_argument("--shm-slot-size", type=int, default=0)
+    parser.add_argument("--guide-shm-name", default="")
+    parser.add_argument("--guide-shm-slots", type=int, default=0)
+    parser.add_argument("--guide-shm-slot-size", type=int, default=0)
     parser.add_argument("--threads", type=int, default=1,
                         help="frames processed concurrently (order preserved; default 1 = r2 path)")
+    parser.add_argument("--flush-each-frame", action="store_true",
+                        help="lockstep intermediate stage for bounded feedback pipelines")
     args = parser.parse_args()
     if args.width <= 0 or args.height <= 0 or args.frames <= 0:
         raise SystemExit("[post] invalid dimensions/frame count")
@@ -206,14 +212,17 @@ def main() -> None:
         raise SystemExit("[post] strengths must be in 0..1")
     guard = args.guard_strength > 0
     if guard:
-        if not args.video or not args.ffmpeg or min(args.in_w, args.in_h) <= 0:
+        if ((not args.guide_shm_name and (not args.video or not args.ffmpeg)) or
+                min(args.in_w, args.in_h) <= 0):
             parser.error("guard requires --video/--ffmpeg/--in-w/--in-h")
         if not 0.0 <= args.guard_strength <= 1.0:
             parser.error("--guard-strength must be in 0..1")
 
     decoder = None
     decoder_errors = None
-    if guard:
+    guide_reader = (RingReader(args.guide_shm_name, args.guide_shm_slots, args.guide_shm_slot_size)
+                    if guard and args.guide_shm_name else None)
+    if guard and guide_reader is None:
         # --ffmpeg 通常是一个可执行文件路径；允许空格分隔的多 token 命令
         # （如 "<python> <shim>"），便于在不安装 ffmpeg 的测试环境注入假解码器。
         if " " in args.ffmpeg and not os.path.isfile(args.ffmpeg):
@@ -232,7 +241,7 @@ def main() -> None:
     frame_bytes = args.width * args.height * 3
     source_bytes = args.in_w * args.in_h * 3
     timer = StageTimer()
-    threads = max(1, args.threads)
+    threads = 1 if args.flush_each_frame else max(1, args.threads)
     worker_ctx = [_SharpenBuffers(args.height, args.width) for _ in range(threads)]
     worker_guides = [_GuideBuffers(args.height, args.width) for _ in range(threads)]
     worker_timers = [StageTimer() for _ in range(threads)]
@@ -302,7 +311,12 @@ def main() -> None:
                             continue
                     if stop_event.is_set():
                         return
-                    if not read_exact(decoder.stdout, source_bytes, sbuf):
+                    if guide_reader is not None:
+                        payload = guide_reader.read()
+                        if len(payload) != source_bytes:
+                            raise RuntimeError("source guide ring frame size mismatch")
+                        sbuf[:] = payload
+                    elif not read_exact(decoder.stdout, source_bytes, sbuf):
                         raise RuntimeError("source decoder ended early")
                     ready_put_src(sbuf)
             except BaseException as exc:
@@ -329,6 +343,7 @@ def main() -> None:
         raise SystemExit(f"[post] cannot open shared ring: {exc}")
     try:
         from concurrent.futures import ThreadPoolExecutor
+        post_wall_start = time.perf_counter()
         executor = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="post")
         pending: dict[int, tuple] = {}   # index -> (future, frame_buf, source_buf)
         next_out = 0
@@ -366,6 +381,21 @@ def main() -> None:
                     future.add_done_callback(
                         lambda done: source_pool.put(done.result()[1]))
                 pending[index] = (future, frame_buf, sbuf)
+                if args.flush_each_frame:
+                    future.result()
+                # 按序排水：已完成的下一个 future 立即写出；ring 模式下
+                # 首帧不再被推到整个队列的最后（首块延迟 = 首帧处理时间，
+                # 而不是总时长）。字节流顺序不变（next_out 递增）。
+                while next_out in pending and pending[next_out][0].done():
+                    idx = next_out
+                    fut, used_buf, used_sbuf = pending.pop(idx)
+                    out_bytes, returned_sbuf = fut.result()
+                    sys.stdout.buffer.write(out_bytes)
+                    if args.flush_each_frame:
+                        sys.stdout.buffer.flush()
+                    if ring_reader is None:
+                        free_buffers.append(used_buf)
+                    next_out += 1
                 if index and index % 60 == 0:
                     print(f"[post] {index}/{args.frames}", file=sys.stderr, flush=True)
         executor.shutdown(wait=True)
@@ -400,11 +430,20 @@ def main() -> None:
             decoder.stdout.close()
         if ring_reader is not None:
             ring_reader.close()
+        if guide_reader is not None:
+            guide_reader.close()
     for wt in worker_timers:
+        # worker timers accumulate per-thread CPU time across `threads`
+        # workers; name them *_cpu_work (report adds the _s suffix) so
+        # nobody divides them by the wall clock as if they were a serial
+        # stage.  post_total_wall is the real end-to-end wall time.
         for name, seconds in wt.totals.items():
-            timer.totals[name] = timer.totals.get(name, 0.0) + seconds
+            timer.totals[f"{name}_cpu_work"] = \
+                timer.totals.get(f"{name}_cpu_work", 0.0) + seconds
         for name, calls in wt.counts.items():
             timer.counts[name] = timer.counts.get(name, 0) + calls
+    timer.totals["post_total_wall"] = \
+        time.perf_counter() - post_wall_start
     timer.report("sr-post")
 
 

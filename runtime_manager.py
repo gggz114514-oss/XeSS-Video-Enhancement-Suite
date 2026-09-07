@@ -1,393 +1,337 @@
+"""Pinned isolated R4 runtime. No pip or Comfy changes; R3 engine is untouched."""
 from __future__ import annotations
-
 import argparse
 import contextlib
 import hashlib
 import json
 import os
-import pathlib
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
 import shutil
+import stat
 import sys
+import threading
 import time
 import urllib.request
+import uuid
 import zipfile
 
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent
 MANIFEST_PATH = REPO_ROOT / "runtime_manifest.json"
-OVERLAY_ROOT = REPO_ROOT / "pipeline"
-STATE_NAME = ".runtime-state.json"
 RUNTIME_ENV = "COMFYUI_XESS_RUNTIME"
 ASSET_ENV = "COMFYUI_XESS_RUNTIME_ASSET"
+STATE_NAME = ".runtime-state.json"
+_thread = None
+_thread_lock = threading.Lock()
 
 
 class RuntimeManagerError(RuntimeError):
     pass
 
 
-def _load_json(path: pathlib.Path) -> dict:
+def _load_json(path):
     try:
-        # Windows PowerShell 5 writes `Set-Content -Encoding UTF8` with a BOM,
-        # while PowerShell 7 and Python normally do not.  Accept both forms so
-        # a runtime installed by install_runtime.bat is immediately readable.
-        return json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise RuntimeManagerError(f"cannot read {path}: {exc}") from exc
+        return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeManagerError(f"无法读取运行时清单：{path}：{exc}") from exc
 
 
-def load_manifest() -> dict:
-    manifest = _load_json(MANIFEST_PATH)
-    required = (
-        "schema_version", "runtime_version", "asset_name", "download_url",
-        "sha256", "archive_root", "required_files", "file_hashes",
-    )
-    missing = [name for name in required if name not in manifest]
-    if missing:
-        raise RuntimeManagerError(f"runtime manifest is missing: {', '.join(missing)}")
-    if manifest["schema_version"] != 1:
-        raise RuntimeManagerError(
-            f"unsupported runtime manifest schema: {manifest['schema_version']}"
-        )
-    return manifest
+def _relative(value):
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise RuntimeManagerError(f"不安全的包内路径：{value!r}")
+    p = PurePosixPath(value)
+    if p.is_absolute() or PureWindowsPath(value).drive or any(
+        s in ("", ".", "..") or s.endswith((".", " ")) or
+        any(c in s for c in ':<>"|?*') or _reserved_windows_name(s)
+        for s in value.split("/")
+    ):
+        raise RuntimeManagerError(f"不安全的包内路径：{value!r}")
+    return Path(*p.parts)
 
 
-def runtime_base() -> pathlib.Path:
-    configured = os.environ.get(RUNTIME_ENV, "").strip()
-    if configured:
-        path = pathlib.Path(os.path.expandvars(os.path.expanduser(configured)))
-        if path.name.casefold() == "engine":
-            return path.resolve().parent
-        return path.resolve()
-    return (REPO_ROOT / ".runtime").resolve()
+def _reserved_windows_name(value):
+    # Python 3.13 deprecates PurePath.is_reserved; retain older hosts too.
+    if hasattr(os.path, "isreserved"):
+        return os.path.isreserved(value)
+    stem = value.split(".", 1)[0].upper()
+    return stem in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} or bool(
+        re.fullmatch(r"(COM|LPT)[1-9¹²³]", stem))
 
 
-def default_engine() -> pathlib.Path:
-    return runtime_base() / "engine"
+def load_manifest():
+    m = _load_json(MANIFEST_PATH)
+    if m.get("schema_version") != 2 or m.get("layout") != "comfy-r4-nested-v1":
+        raise RuntimeManagerError("运行时清单版本不匹配，请完整更新本节点目录。")
+    for name in ("runtime_version", "asset_name", "archive_root"):
+        _relative(m.get(name))
+        if "/" in m[name]:
+            raise RuntimeManagerError("运行时标识不能包含子目录。")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", m.get("sha256", "")):
+        raise RuntimeManagerError("运行时尚未封包：缺少有效 SHA256，不能下载。")
+    if not m.get("file_hashes") or not m.get("required_files"):
+        raise RuntimeManagerError("运行时文件校验清单为空。")
+    for path, digest in m["file_hashes"].items():
+        _relative(path)
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            raise RuntimeManagerError("文件哈希无效：" + path)
+    if not set(m["required_files"]).issubset(m["file_hashes"]):
+        raise RuntimeManagerError("必需文件没有全部纳入哈希校验。")
+    if m.get("archive_size", 0) <= 0 or m.get("installed_size", 0) <= 0:
+        raise RuntimeManagerError("运行时大小缺失，无法做空间检查。")
+    if not re.fullmatch(r"https://github\.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/download/[^/]+/[^/]+", m.get("download_url", "")):
+        raise RuntimeManagerError("下载地址必须是本仓库的固定 Release 资产。")
+    return m
 
 
-def sha256_file(path: pathlib.Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def runtime_base():
+    value = os.environ.get(RUNTIME_ENV, "").strip()
+    if value:
+        p = Path(os.path.expandvars(os.path.expanduser(value))).resolve()
+        return p.parent if p.name.casefold() == "engine" else p
+    return REPO_ROOT / ".runtime"
 
 
-def _relative(path: str) -> pathlib.Path:
-    candidate = pathlib.PurePosixPath(path.replace("\\", "/"))
-    if candidate.is_absolute() or ".." in candidate.parts:
-        raise RuntimeManagerError(f"unsafe relative path in manifest: {path}")
-    return pathlib.Path(*candidate.parts)
+def default_engine(manifest=None):
+    m = manifest or load_manifest()
+    return runtime_base() / "versions" / (m["runtime_version"] + "-" + m["sha256"][:16])
 
 
-def engine_compatible(engine: os.PathLike[str] | str, manifest: dict | None = None) -> bool:
-    engine_path = pathlib.Path(engine)
-    manifest = manifest or load_manifest()
-    if not engine_path.is_dir():
-        return False
-    for name in manifest["required_files"]:
-        if not (engine_path / _relative(name)).is_file():
-            return False
-    state_path = engine_path / STATE_NAME
-    if state_path.is_file():
-        try:
-            state = _load_json(state_path)
-            if (state.get("runtime_version") == manifest["runtime_version"] and
-                    str(state.get("asset_sha256", "")).casefold() ==
-                    str(manifest["sha256"]).casefold()):
-                return True
-        except RuntimeManagerError:
-            pass
-    for name, expected in manifest["file_hashes"].items():
-        path = engine_path / _relative(name)
-        if not path.is_file() or sha256_file(path).casefold() != str(expected).casefold():
-            return False
-    return True
+def sha256_file(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for block in iter(lambda: f.read(4 * 1024**2), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
-def prepare_existing_engine(engine: os.PathLike[str] | str) -> bool:
-    engine_path = pathlib.Path(engine).resolve()
-    manifest = load_manifest()
-    if not engine_compatible(engine_path, manifest):
-        return False
-    sync_overlay(engine_path)
-    _write_state(engine_path, manifest)
-    return True
+def _fingerprints(engine, m):
+    result = {}
+    for name in m["file_hashes"]:
+        f = Path(engine) / _relative(name)
+        if not f.is_file() or f.is_symlink():
+            return None
+        s = f.stat()
+        result[name] = [s.st_size, s.st_mtime_ns]
+    return result
 
 
-def _same_file(source: pathlib.Path, destination: pathlib.Path) -> bool:
-    if not destination.is_file() or source.stat().st_size != destination.stat().st_size:
-        return False
-    return sha256_file(source) == sha256_file(destination)
-
-
-def sync_overlay(engine: os.PathLike[str] | str) -> int:
-    engine_path = pathlib.Path(engine).resolve()
-    if not engine_path.is_dir():
-        raise RuntimeManagerError(f"runtime engine does not exist: {engine_path}")
-    if not OVERLAY_ROOT.is_dir():
-        raise RuntimeManagerError(f"pipeline source is missing: {OVERLAY_ROOT}")
-    copied = 0
-    for source in sorted(OVERLAY_ROOT.rglob("*")):
-        if not source.is_file() or source.suffix.casefold() in {".pyc", ".pyo"}:
-            continue
-        if "__pycache__" in source.parts:
-            continue
-        destination = engine_path / source.relative_to(OVERLAY_ROOT)
-        if _same_file(source, destination):
-            continue
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(destination.name + ".sync-partial")
-        shutil.copy2(source, temporary)
-        os.replace(temporary, destination)
-        copied += 1
-    return copied
-
-
-def _safe_remove(path: pathlib.Path, root: pathlib.Path) -> None:
-    root = root.resolve()
-    candidate = path.resolve()
+def engine_compatible(engine, manifest=None, *, full=False):
+    m = manifest or load_manifest()
     try:
-        candidate.relative_to(root)
-    except ValueError as exc:
-        raise RuntimeManagerError(f"refusing to remove path outside runtime root: {candidate}") from exc
-    if candidate == root:
-        raise RuntimeManagerError(f"refusing to remove runtime root: {candidate}")
-    if candidate.is_dir():
-        shutil.rmtree(candidate)
-    elif candidate.exists():
-        candidate.unlink()
+        fingerprints = _fingerprints(engine, m)
+        if fingerprints is None:
+            return False
+        if not full:
+            try:
+                state = _load_json(Path(engine) / STATE_NAME)
+                if state.get("asset_sha256") == m["sha256"] and state.get("files") == fingerprints:
+                    return True
+            except RuntimeManagerError:
+                pass
+        return all(sha256_file(Path(engine) / _relative(n)).lower() == h.lower()
+                   for n, h in m["file_hashes"].items())
+    except OSError:
+        return False
+
+
+def _write_state(engine, m):
+    data = dict(asset_sha256=m["sha256"], runtime_version=m["runtime_version"],
+                installed_unix=time.time(), files=_fingerprints(engine, m))
+    temporary = Path(engine) / (STATE_NAME + ".partial")
+    temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporary, Path(engine) / STATE_NAME)
 
 
 @contextlib.contextmanager
-def _install_lock(root: pathlib.Path):
+def _install_lock(root, timeout=1200):
     root.mkdir(parents=True, exist_ok=True)
-    lock = root / "install.lock"
-    deadline = time.monotonic() + 20 * 60
-    descriptor = None
-    while descriptor is None:
-        try:
-            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(descriptor, f"pid={os.getpid()} time={time.time()}\n".encode("ascii"))
-        except FileExistsError:
+    # OS lock releases on crash; no unsafe stale PID/mtime heuristics.
+    with (root / "install.lock").open("a+b") as f:
+        # Windows permits locking beyond EOF. Do not write an initialization
+        # byte: another process may have acquired its lock on the empty file.
+        deadline = time.monotonic() + timeout
+        while True:
             try:
-                stale = time.time() - lock.stat().st_mtime > 60 * 60
+                f.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
             except OSError:
-                stale = False
-            if stale:
-                lock.unlink(missing_ok=True)
-                continue
-            if time.monotonic() >= deadline:
-                raise RuntimeManagerError(f"timed out waiting for runtime installer: {lock}")
-            time.sleep(1.0)
-    try:
-        yield
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        lock.unlink(missing_ok=True)
+                if time.monotonic() >= deadline:
+                    raise RuntimeManagerError("等待其他运行时安装进程超时，请稍后重试。")
+                time.sleep(.2)
+        try:
+            yield
+        finally:
+            f.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def _check_space(root: pathlib.Path, manifest: dict) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    archive = int(manifest.get("archive_size", 0))
-    installed = int(manifest.get("installed_size", 0))
-    required = archive + installed + 512 * 1024 * 1024
+def _safe_remove(path, root):
+    p, r = Path(path).resolve(), Path(root).resolve()
+    if p == r or r not in p.parents or Path(path).is_symlink():
+        raise RuntimeManagerError("拒绝清理工作目录外的路径：" + str(path))
+    if p.is_dir():
+        shutil.rmtree(p)
+    elif p.exists():
+        p.unlink()
+
+
+def _check_space(root, m):
+    required = m["archive_size"] + m["installed_size"] + 512 * 1024**2
     free = shutil.disk_usage(root).free
     if free < required:
-        raise RuntimeManagerError(
-            f"not enough free space at {root}: need about {required / 1024**3:.2f} GiB, "
-            f"free {free / 1024**3:.2f} GiB"
-        )
+        raise RuntimeManagerError(f"运行时安装盘空间不足：需要 {required/1024**3:.2f} GiB，剩余 {free/1024**3:.2f} GiB。路径：{root}")
 
 
-def _download(url: str, destination: pathlib.Path) -> None:
-    partial = destination.with_suffix(destination.suffix + ".partial")
-    offset = partial.stat().st_size if partial.is_file() else 0
-    headers = {"User-Agent": "ComfyUI-XeSS-Runtime/1.1"}
-    if offset:
-        headers["Range"] = f"bytes={offset}-"
-    request = urllib.request.Request(url, headers=headers)
-    print(f"[XeSS runtime] downloading {url}", flush=True)
-    with urllib.request.urlopen(request, timeout=60) as response:
-        append = offset > 0 and getattr(response, "status", None) == 206
-        mode = "ab" if append else "wb"
-        if not append:
-            offset = 0
-        received = offset
-        last_report = time.monotonic()
-        with partial.open(mode) as output:
+def _download(url, destination, expected_size):
+    part = destination.with_suffix(".zip.partial")
+    print("[XeSS R4] 正在下载配套运行时；无需重装 ComfyUI：" + url, flush=True)
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-XeSS-R4"})
+        with urllib.request.urlopen(request, timeout=30) as response, part.open("wb") as out:
+            size, last = 0, time.monotonic()
             while True:
-                block = response.read(4 * 1024 * 1024)
+                block = response.read(1024**2)
                 if not block:
                     break
-                output.write(block)
-                received += len(block)
-                if time.monotonic() - last_report >= 5:
-                    print(f"[XeSS runtime] received {received / 1024**2:.1f} MiB", flush=True)
-                    last_report = time.monotonic()
-    os.replace(partial, destination)
+                size += len(block)
+                if size > expected_size:
+                    raise RuntimeManagerError("下载大小超过清单，已拒绝该文件。")
+                out.write(block)
+                if time.monotonic() - last >= 5:
+                    print(f"[XeSS R4] 下载 {size/1024**2:.0f}/{expected_size/1024**2:.0f} MiB", flush=True)
+                    last = time.monotonic()
+            if size != expected_size:
+                raise RuntimeManagerError("下载提前结束，请检查网络后重新执行节点。")
+        os.replace(part, destination)
+    finally:
+        part.unlink(missing_ok=True)
 
 
-def _extract_archive(archive: pathlib.Path, root: pathlib.Path, manifest: dict) -> pathlib.Path:
-    staging = root / f"installing-{os.getpid()}-{int(time.time())}"
-    if staging.exists():
-        _safe_remove(staging, root)
-    staging.mkdir(parents=True)
-    archive_root = str(manifest["archive_root"]).strip("/\\")
-    limit = max(int(manifest.get("installed_size", 0)) * 2, 1024 * 1024 * 1024)
-    extracted = 0
+def _extract_archive(archive, root, m):
+    staging = root / ("installing-" + uuid.uuid4().hex)
+    staging.mkdir()
+    seen, size = set(), 0
     try:
-        with zipfile.ZipFile(archive, "r") as package:
-            for member in package.infolist():
-                pure = pathlib.PurePosixPath(member.filename.replace("\\", "/"))
-                if not pure.parts or pure.parts[0] != archive_root:
-                    raise RuntimeManagerError(f"unexpected archive entry: {member.filename}")
-                if pure.is_absolute() or ".." in pure.parts:
-                    raise RuntimeManagerError(f"unsafe archive entry: {member.filename}")
-                extracted += member.file_size
-                if extracted > limit:
-                    raise RuntimeManagerError("runtime archive expands beyond the manifest safety limit")
-                target = staging.joinpath(*pure.parts)
-                resolved = target.resolve()
-                try:
-                    resolved.relative_to(staging.resolve())
-                except ValueError as exc:
-                    raise RuntimeManagerError(f"unsafe archive target: {resolved}") from exc
+        with zipfile.ZipFile(archive) as z:
+            for member in z.infolist():
+                relative = _relative(member.filename.rstrip("/"))
+                if relative.parts[0] != m["archive_root"]:
+                    raise RuntimeManagerError("压缩包根目录不匹配。")
+                if stat.S_ISLNK(member.external_attr >> 16):
+                    raise RuntimeManagerError("不允许压缩包中的符号链接。")
                 if member.is_dir():
-                    target.mkdir(parents=True, exist_ok=True)
                     continue
+                child = Path(*relative.parts[1:]).as_posix()
+                key = child.casefold()
+                if key in seen or child not in m["file_hashes"]:
+                    raise RuntimeManagerError("压缩包包含重复或未声明的文件：" + child)
+                seen.add(key)
+                size += member.file_size
+                if size > m["installed_size"]:
+                    raise RuntimeManagerError("解压大小超过清单。")
+                target = staging / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with package.open(member, "r") as source, target.open("wb") as output:
-                    shutil.copyfileobj(source, output, 4 * 1024 * 1024)
-        candidate = staging / archive_root
-        if not engine_compatible(candidate, manifest):
-            raise RuntimeManagerError("extracted runtime failed file/hash validation")
+                with z.open(member) as source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output, 1024**2)
+        candidate = staging / m["archive_root"]
+        if len(seen) != len(m["file_hashes"]) or size != m["installed_size"] or not engine_compatible(candidate, m, full=True):
+            raise RuntimeManagerError("运行时解压校验失败，原有版本未改动。")
         return candidate
     except BaseException:
         _safe_remove(staging, root)
         raise
 
 
-def _write_state(engine: pathlib.Path, manifest: dict) -> None:
-    state = {
-        "runtime_version": manifest["runtime_version"],
-        "asset_name": manifest["asset_name"],
-        "asset_sha256": manifest["sha256"],
-        "installed_unix": time.time(),
-    }
-    temporary = engine / (STATE_NAME + ".partial")
-    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, engine / STATE_NAME)
-
-
-def _activate(candidate: pathlib.Path, root: pathlib.Path, engine: pathlib.Path) -> None:
-    backup = root / f"engine-backup-{os.getpid()}"
-    if backup.exists():
-        _safe_remove(backup, root)
-    had_previous = engine.exists()
-    if had_previous:
-        engine.rename(backup)
+def ensure_runtime(*, force=False, asset=None):
+    m = load_manifest()
+    override = asset or os.environ.get(ASSET_ENV, "").strip()
+    if m.get("release_status") != "published" and not override:
+        raise RuntimeManagerError("配套运行时尚未发布；不会下载占位文件。")
+    root, engine = runtime_base(), default_engine(m)
+    if not force and engine_compatible(engine, m):
+        return engine
     try:
-        candidate.rename(engine)
-    except BaseException:
-        if had_previous and backup.exists() and not engine.exists():
-            backup.rename(engine)
+        with _install_lock(root):
+            if engine_compatible(engine, m, full=force):
+                return engine
+            if not override and os.environ.get("COMFYUI_XESS_SKIP_RUNTIME_DOWNLOAD") == "1":
+                raise RuntimeManagerError("自动下载已关闭，请先手动安装本版本运行时。")
+            _check_space(root, m)
+            archive = Path(override).expanduser().resolve() if override else root / m["asset_name"]
+            candidate = None
+            try:
+                if not override:
+                    _download(m["download_url"], archive, m["archive_size"])
+                if archive.stat().st_size != m["archive_size"] or sha256_file(archive).lower() != m["sha256"].lower():
+                    raise RuntimeManagerError("运行时 SHA256/大小校验失败；原有版本保留，请重新下载。")
+                candidate = _extract_archive(archive, root, m)
+                _write_state(candidate, m)
+                engine.parent.mkdir(parents=True, exist_ok=True)
+                backup = None
+                if engine.exists():
+                    backup = root / ("repair-backup-" + uuid.uuid4().hex)
+                    engine.rename(backup)
+                try:
+                    candidate.rename(engine)
+                except BaseException:
+                    if backup is not None:
+                        backup.rename(engine)
+                    raise
+                print("[XeSS R4] 运行时校验通过：" + str(engine), flush=True)
+                return engine
+            finally:
+                if candidate is not None and candidate.parent.exists():
+                    _safe_remove(candidate.parent, root)
+                if not override:
+                    archive.unlink(missing_ok=True)
+    except RuntimeManagerError:
         raise
-    if backup.exists():
-        _safe_remove(backup, root)
-    staging = candidate.parent
-    if staging.exists():
-        _safe_remove(staging, root)
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise RuntimeManagerError(f"运行时安装失败，原有版本未覆盖。检查网络、空间和文件占用后重试：{exc}") from exc
 
 
-def ensure_runtime(*, force: bool = False, asset: str | None = None) -> pathlib.Path:
-    manifest = load_manifest()
-    root = runtime_base()
-    engine = root / "engine"
-    if not force and engine_compatible(engine, manifest):
-        copied = sync_overlay(engine)
-        _write_state(engine, manifest)
-        if copied:
-            print(f"[XeSS runtime] synchronized {copied} updated pipeline files", flush=True)
-        return engine
-
-    with _install_lock(root):
-        if not force and engine_compatible(engine, manifest):
-            sync_overlay(engine)
-            _write_state(engine, manifest)
-            return engine
-        _check_space(root, manifest)
-        override = asset or os.environ.get(ASSET_ENV, "").strip()
-        downloaded = False
-        if override:
-            archive = pathlib.Path(os.path.expandvars(os.path.expanduser(override))).resolve()
-            if not archive.is_file():
-                raise RuntimeManagerError(f"runtime asset does not exist: {archive}")
-        else:
-            downloads = root / "downloads"
-            downloads.mkdir(parents=True, exist_ok=True)
-            archive = downloads / manifest["asset_name"]
-            if not archive.is_file() or sha256_file(archive).casefold() != manifest["sha256"].casefold():
-                _download(manifest["download_url"], archive)
-                downloaded = True
-        actual = sha256_file(archive)
-        if actual.casefold() != manifest["sha256"].casefold():
-            if downloaded:
-                archive.unlink(missing_ok=True)
-            raise RuntimeManagerError(
-                f"runtime SHA256 mismatch: expected {manifest['sha256']}, got {actual}"
-            )
-        candidate = None
-        try:
-            candidate = _extract_archive(archive, root, manifest)
-            sync_overlay(candidate)
-            _write_state(candidate, manifest)
-            _activate(candidate, root, engine)
-        finally:
-            if candidate is not None and candidate.parent.exists():
-                _safe_remove(candidate.parent, root)
-            if downloaded:
-                archive.unlink(missing_ok=True)
-        print(f"[XeSS runtime] ready: {engine}", flush=True)
-        return engine
+def start_background_update():
+    global _thread
+    if os.environ.get("XESS_RUNTIME_ROOT") or os.environ.get("COMFYUI_XESS_SKIP_RUNTIME_DOWNLOAD") == "1":
+        return
+    with _thread_lock:
+        if _thread is not None:
+            return
+        def update():
+            try:
+                ensure_runtime()
+            except Exception as exc:
+                print("[XeSS R4] " + str(exc) + "；节点仍可加载，执行时可重试。", file=sys.stderr)
+        _thread = threading.Thread(target=update, name="XeSS-runtime-install", daemon=True)
+        _thread.start()
 
 
-def _status(engine: pathlib.Path) -> int:
-    manifest = load_manifest()
-    compatible = engine_compatible(engine, manifest)
-    print(json.dumps({
-        "engine": os.fspath(engine),
-        "runtime_version": manifest["runtime_version"],
-        "compatible": compatible,
-        "state": _load_json(engine / STATE_NAME) if (engine / STATE_NAME).is_file() else None,
-    }, ensure_ascii=False, indent=2))
-    return 0 if compatible else 1
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Install and synchronize the XeSS fixed runtime")
-    sub = parser.add_subparsers(dest="command", required=True)
-    install = sub.add_parser("ensure")
-    install.add_argument("--force", action="store_true")
-    install.add_argument("--asset", default="")
-    status = sub.add_parser("status")
-    status.add_argument("--engine", default="")
-    sync = sub.add_parser("sync")
-    sync.add_argument("--engine", default="")
+def main():
+    parser = argparse.ArgumentParser(description="XeSS R4 运行时：不修改 ComfyUI Python")
+    parser.add_argument("command", choices=("ensure", "status"))
+    parser.add_argument("--asset")
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "ensure":
-            ensure_runtime(force=args.force, asset=args.asset or None)
+            print(ensure_runtime(force=args.force, asset=args.asset))
             return 0
-        engine = pathlib.Path(args.engine).resolve() if args.engine else default_engine()
-        if args.command == "status":
-            return _status(engine)
-        copied = sync_overlay(engine)
-        print(f"[XeSS runtime] synchronized {copied} pipeline files")
-        return 0
+        m = load_manifest()
+        engine = default_engine(m)
+        ok = engine_compatible(engine, m, full=args.force)
+        print(json.dumps(dict(engine=str(engine), runtime_version=m["runtime_version"], compatible=ok), ensure_ascii=False))
+        return 0 if ok else 1
     except RuntimeManagerError as exc:
-        print(f"[XeSS runtime] error: {exc}", file=sys.stderr)
+        print("[XeSS R4] " + str(exc), file=sys.stderr)
         return 1
 
 

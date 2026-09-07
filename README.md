@@ -1,269 +1,105 @@
-# XeSS 视频增强工具箱 / XeSS Video Enhancement Suite
+# XeSS 视频增强节点 / XeSS Video Enhancement for ComfyUI
 
-面向 Windows 与 Intel Arc 的视频超分、抗锯齿和 2× 帧生成工具，同时提供独立命令行入口与中文 ComfyUI 原生 `VIDEO → VIDEO` 节点。
+Windows 上的视频超分与 2× 插帧。R4 提供三个中文节点：**视频超分、视频插帧、超分后插帧**。
 
-当前版本：源码/节点 `1.3.0`，SR `1.2`，FG `1.2`，固定运行时 `2026.08.28-r3`。
+本仓库本次只发布 ComfyUI 节点与配套引擎。独立离线工具箱、实时捕获工具箱将分项目发布，不包含 OBS、桌面捕获或 HTML 前端。
 
-> 这是社区项目，不是 Intel 官方产品。实机验证平台为 Windows 11 与 Intel Arc B580。
-> ## 实测环境基线
+[R4 下载与更新说明](https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/tag/runtime-2026.09.07-r4)
 
-以下是项目当前实际测试环境，不代表唯一支持版本。
+## 安装
 
-| 项目 | 当前实测值 |
-|---|---|
-| 整合包 | ComfyUI-aki-v3-IntelArc_20260722 |
-| ComfyUI 核心 | 0.33.1 |
-| Python | 3.13.11 |
-| PyTorch | 2.13.0+xpu |
-| XPU 状态 | `torch.xpu.is_available() = True` |
-| XPU 设备数 | 1 |
-| OpenVINO | 2025.4.1 |
-| 显卡 | Intel Arc B580 |
-| XeSS 节点版本 | `1.3.0` |
-| XeSS Runtime | `2026.08.28-r3` |
-| 操作系统 | Windows 11 |
+关闭 ComfyUI，在 `ComfyUI/custom_nodes` 中打开终端：
 
-### 依赖说明
-
-- 所有模式统一使用 OpenCV DIS 光流，不再依赖 PyTorch XPU 或 `safetensors`；
-  SEA-RAFT 已从主线退役（实验代码归档于 `experiment/sea-raft-xpu` 分支）。
-- 旧工作流中的 SEA-RAFT 选项会自动迁移到原生 Fast DIS，并在日志提示一次。
-- `.runtime/engine` 是 XeSS 固定运行时，不是 ComfyUI 的 Python 依赖环境。
-
-### 反馈问题时请提供
-
-请同时提供以下信息：
-
-1. ComfyUI 核心版本；
-2. Python 版本；
-3. PyTorch 版本；
-4. `torch.xpu.is_available()` 的结果；
-5. OpenVINO 版本；
-6. XeSS 节点 Git 提交或目录版本；
-7. XeSS Runtime 版本；
-8. 完整的 ComfyUI 控制台日志；
-9. 使用的节点挡位和光流模式。
-
-## 本次版本重点：SR 流水线提速
-
-1.3.0 不改变默认画面算法，重点减少 SR 管线中 CPU 搬运和串行等待：
-
-- XeSS 输出到锐化/护边阶段改用第二组共享内存环形缓冲；
-- 后处理默认使用 4 个工作线程，并保持输出帧序不变；
-- 运动矢量上采样加入 AVX2 路径，旧 CPU 自动回退标量实现；
-- DIS 分析复用采样网格并删除冗余复制。
-
-B580 同会话交错三次中位数复测（不含编码）：480p→720p、243 帧由
-15.488 秒降至 7.683 秒（快 50.4%）；1080×1920→1440×2560、300 帧由
-57.702 秒降至 46.117 秒（快 20.1%）。两组输出原始 RGB SHA256 均与 1.2.0
-完全相同。A770 尚未真机复测，因此不宣称相同提升幅度。
-
-## XeFG：直接拦截交换链
-
-这一版不再把窗口画面当成帧生成结果。`xess-fg.exe` 在 XeFG 初始化期间包装 DXGI 工厂，记录 XeFG 内部创建的原生交换链；每次代理交换链完成 Present 后，程序直接从最后呈现的 D3D12 后缓冲回读生成帧，再送入流式编码管线。
-
-```text
-输入帧 + 光流/深度
-        ↓
-XeFG 代理交换链 Present
-        ↓
-DXGI 工厂包装器记录原生交换链
-        ↓
-回读最后呈现的 D3D12 后缓冲
-        ↓
-f0, G1, f1, G2 ... → 2× fps 视频
-```
-
-因此默认 `direct` 模式具有这些特性：
-
-- 拿到的是 XeFG 实际生成帧，而不是帧复制或普通光流合成结果；
-- 不依赖 Windows Graphics Capture，不需要录制桌面或裁剪隐藏窗口；
-- 不受 Windows 高 DPI 坐标缩放、窗口遮挡、最小化和黄色捕获边框影响；
-- RTSS/MSI Afterburner 的桌面 OSD 不会混进输出视频；
-- 独立版和 ComfyUI 节点使用同一套拦截式 FG 执行链路。
-
-旧的 `window` 后端仅保留给开发者诊断，不建议普通用户启用。
-
-## 这次为什么改成 Git + Release
-
-仓库现在按“经常更新的代码”和“很少变化的大资源”拆分：
-
-| 位置 | 内容 | 更新方式 |
-|---|---|---|
-| Git 仓库 | ComfyUI 节点、Python 管线、C++ 源码、工作流、安装器和文档 | 秋叶启动器/ComfyUI Manager/Git pull |
-| GitHub Release | XeSS/XeFG/XeLL 二进制、ffmpeg、便携 Python、OpenVINO 与模型 | 仅在 `runtime_manifest.json` 指向新版本时下载 |
-| `.runtime/` | 本机已安装的固定运行时 | 被 `.gitignore` 忽略，源码更新不会删除或重复下载 |
-
-普通代码更新只拉取几十个小文件。每次运行前会把最新 `pipeline/` 同步到本机运行时，通常不到一秒；只有 exe、DLL、模型或便携 Python 确实变化时，才需要发布并下载新的 Runtime 资产。
-
-## 一、秋叶启动器 / ComfyUI 安装
-
-在秋叶启动器的自定义节点管理中选择“通过 Git URL 安装”，填写：
-
-```text
-https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite.git
-```
-
-安装过程会：
-
-1. 克隆本仓库到 `ComfyUI/custom_nodes`；
-2. 安装缺失的 NumPy/OpenCV 基础依赖；
-3. 执行 `install.py`；
-4. 从固定 Release 下载一次约 272 MiB 的运行时；
-5. 校验 SHA256 后解压到节点目录的 `.runtime/engine`。
-
-安装完成后重启 ComfyUI，搜索 `XeSS`。以后在秋叶启动器点击“更新”即可，不需要重新安装节点，也不会重复下载未变化的运行时。
-
-首次安装需要能够访问 GitHub Release。源码更新和固定 Runtime 是分开的：更新节点通常只下载少量文本文件，只有清单中的 Runtime 版本变化时才会重新下载大文件。
-
-### 手动 Git 安装
-
-```bat
-cd /d "你的ComfyUI目录\custom_nodes"
+```powershell
 git clone https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite.git
-cd XeSS-Video-Enhancement-Suite
-install_runtime.bat
 ```
 
-然后重启 ComfyUI。没有 D/E 盘也能安装；运行时、缓存和输出路径都按仓库实际位置或用户配置计算，不写死盘符。
+然后正常启动 ComfyUI。节点自动下载**与当前源码匹配**的运行时，校验成功后可用；首次需要联网及足够磁盘空间。无需手动装 PyTorch、OpenVINO、oneAPI 或改 ComfyUI 的 Python 包。运行时位于本节点目录 `.runtime/versions/`。
 
-### 从旧整包迁移
+无法访问 GitHub 时，从本版本 Release 下载 `xess-comfy-runtime-*.zip`，在节点目录运行：
 
-旧版 `ComfyUI-XeSS` 是普通复制目录，秋叶启动器无法对它执行 Git 更新。迁移到本仓库只需做一次：
-
-1. 关闭 ComfyUI；
-2. 备份旧 `ComfyUI/custom_nodes/ComfyUI-XeSS` 中的 `xess_config.json`；
-3. 将旧目录改名为 `ComfyUI-XeSS.old`；
-4. 用秋叶启动器通过上面的 Git URL 安装；
-5. 通常保持 `engine_path=auto`、`work_dir=auto` 即可；如有特殊工作盘设置，再复制旧配置。
-
-完成这一次迁移后，后续版本只需点“更新”。
-
-## 二、ComfyUI 节点
-
-普通用户主要使用：
-
-- `XeSS 视频超分（两挡自动）`
-- `XeSS 视频插帧（两挡自动）`
-
-两者都接受原生 `VIDEO`，自动读取帧率并保留音频。推荐工作流：
-
-```text
-Load Video → XeSS 视频超分（两挡自动） → XeSS 视频插帧（两挡自动） → Save Video
+```powershell
+.\install_runtime.bat -AssetPath "D:\Downloads\xess-comfy-runtime-windows-x64-2026.09.07-r4.zip"
 ```
 
-主档位只有两套：
+盘符只是示例，可以安装在任意可写目录。脚本未找到 Python 时，用 `-Python "你的ComfyUI Python完整路径"` 指定。**不要把运行时压缩包覆盖到 ComfyUI 根目录。**
 
-- `极速模式（最低挡）`：DIS 光流 + 固定锐化，速度优先；
-- `极致画质（最高挡）`：DIS 光流 + 五帧融合与自适应锐化，适合复杂运动。
+## 从 R3 升级
 
-需要逐项调节时使用 `XeSS 视频处理/专家` 分类。完整参数方案见 [EXPERT_GUIDE.md](EXPERT_GUIDE.md)，示例工作流位于 [workflows/xess超分帧生成.json](workflows/xess超分帧生成.json)。
+在已有 `custom_nodes/XeSS-Video-Enhancement-Suite` 目录执行：
 
-## 三、独立版
-
-克隆仓库后双击一次 `install_runtime.bat`。它只把固定运行时安装到当前仓库的 `.runtime`，不要求系统 Python。
-
-480p 放大到 720p：
-
-```bat
-run_xess.bat "C:\Videos\input.mp4" 1.5 --preset fast
+```powershell
+git pull --ff-only
 ```
 
-24fps 插帧到 48fps：
+重新启动 ComfyUI、刷新浏览器。程序自动检查并下载 R4 配套运行时；纯源码更新不会重复下载相同运行时。网络失败会显示中文错误，修复网络后重新执行节点即可重试。
 
-```bat
-run_fg.bat "C:\Videos\input.mp4" --preset fast
-```
+**R4 不保留旧节点。旧工作流里的 R3 节点需要替换为新节点**，不能承诺旧工作流原样运行。原有视频、模型、ComfyUI 配置与 R3 `.runtime/engine` 不会删除。以前安装过本地试用版 `XeSS-R4-Offline-Local` 的用户，关闭 ComfyUI 后先将该试用插件移出 `custom_nodes`，避免同名节点重复注册。
 
-先超分、再插帧：
+如果 `git pull` 提示有本地修改，先备份或提交修改；不要强制覆盖。回退步骤见 [升级与回退](docs/COMFY_R4_UPGRADE.md)。
 
-```bat
-run_pipeline.bat "C:\Videos\input.mp4" --scale 1.5 --sr-preset fast --fg-preset fast
-```
+## 使用
 
-入口脚本每次启动会先检查 Runtime 清单并同步 Git 中的新管线代码。Runtime 版本没变时不会联网下载。
+加载 [最小组合工作流](workflows/r4_offline_quickstart.json)，或者搜索菜单 `XeSS R4 离线视频`：
 
-## 四、交换链拦截式帧生成
+| 节点 | 输入 → 输出 |
+| --- | --- |
+| R4 离线视频超分 | VIDEO → 放大后 VIDEO |
+| R4 离线视频 2× 插帧 | VIDEO → 同分辨率、2× 帧率 VIDEO |
+| R4 离线视频超分→2×插帧 | VIDEO → 放大并插帧 VIDEO |
 
-FG 默认并强制从上层管线选择 `direct` 后端：通过 DXGI 工厂包装器记录 XeFG 创建的原生交换链，等待代理 Present 完成后直接回读实际生成帧。
+使用 ComfyUI 原生加载视频节点输入**文件型 VIDEO**，输出接保存视频节点。保存时建议格式/编码器保持 auto，避免再次压缩。三个节点也返回成片路径。纯 IMAGE 批次和第三方特殊 VIDEO 类型不是本版输入合同。
 
-- 不使用 Windows Graphics Capture；
-- 不受高 DPI、窗口遮挡、最小化或黄色捕获边框影响；
-- RTSS/MSI Afterburner 的桌面 OSD 不会进入输出；
-- 命令行仍保留 `--capture-mode window` 作为旧版诊断回退。
+超分倍率：1.33×、1.5×、2×、自定义（1–4）；尺寸按后端要求对齐到 16 的倍数，实际尺寸以成片为准。独立插帧不改变分辨率。
 
-N 个输入帧严格输出 `2N-1` 帧，顺序为 `f0,G1,f1,G2...`，输出帧率为输入的两倍。
+### 算法
 
-运行时日志出现下面一行，表示正在使用交换链拦截路径：
+| 档位 | 定位与边界 |
+| --- | --- |
+| **GPU Block（默认）** | 自研 GPU 光流，快速路线；不是保证所有素材画质最好的档位 |
+| CPU DIS | 传统光流，稳定兜底；CPU 计算光流，XeSS/XeFG 仍使用 GPU |
+| Intel 视频接口 | Intel 原生 AI 视频处理，不是 XeSS；速度优先，受硬件、尺寸和颜色格式限制 |
+| GPU DIS（实验） | GPU 迁移路线，允许使用，但不保证与 CPU DIS 输出完全相同或更快 |
+| AMD 光流（实验） | 使用 FidelityFX Optical Flow 算法；**不代表整条视频链已支持 AMD 显卡** |
 
-```text
-[capture] mode=direct (native swap-chain readback)
-```
+显式选择的后端失败时会报错，不会悄悄切换算法。GPU Block/DIS/AMD 路线目前必须使用 AI 深度；CPU DIS 可选固定深度。界面随算法切换隐藏不支持的选项。
 
-如日志显示 `window`，说明手动传入了旧诊断参数；删除 `--capture-mode window` 即可恢复默认模式。ComfyUI 普通节点不需要设置该参数。
+### 增强开关
 
-## 五、过程文件和磁盘保护
+- **末尾锐化**：默认关闭；同时超分和插帧时建议只在最后锐化一次。
+- **五帧融合**：适合静态画面，动态可能出现反效果。GPU 路线使用当前帧和前四帧；CPU DIS 仅独立超分支持前后各两帧融合。
+- **抗竖纹**：减轻 XeSS 在脸部等区域的竖纹，可能减少局部细节并增加耗时；默认关闭。支持 CPU DIS/GPU Block/GPU DIS/AMD 光流的超分与组合节点。
 
-- 默认使用流式管道或共享内存，不落地整段 RGB raw、光流或深度序列；
-- 每个任务使用独立工作目录，结束后清理临时数据；
-- 输出先写 `.partial.mp4`，通过分辨率、帧数和帧率验证后再原子改名；
-- 非系统盘默认保留至少 5 GiB，系统盘默认保留至少 25 GiB；
-- `.runtime` 固定资源约 591 MiB，只在 Runtime 版本变化时更新；
-- `--keep` 与 `--io-mode file` 只用于调试，可能产生大量文件。
+独立插帧只有锐化开关，没有五帧融合或抗竖纹。Intel 视频接口不提供这三个增强开关。
 
-如需指定工作盘：
+### 编码器
 
-```bat
-run_fg.bat "C:\Videos\input.mp4" --work-dir "F:\XeSS-Work"
-```
+支持自动（H.264 QSV）、H.264 QSV、HEVC QSV、libx264、libx265、FFV1。
 
-## 六、Runtime 版本与校验
+QSV 使用 Intel 硬件编码；x264/x265/FFV1 为软件编码，会回读最终画面并增加 CPU 耗时。**FFV1 使用 MKV，编码本身无损，但不能恢复输入视频已丢失的细节。**音频在处理链中保留；封装不支持原音频格式时可能转换。
 
-当前固定资产：
+## 环境与限制
 
-```text
-Tag: runtime-2026.08.28-r3
-Asset: xess-runtime-windows-x64-2026.08.28-r3.zip
-SHA256: ff5ed90119adb51a00f215a39602896c4f8e0ca86de855987b2676fc7cb8db18
-Archive: 271.72 MiB
-Installed: 590.55 MiB
-```
+- 本轮目标：Windows x64、支持 DirectX 12 的 Intel Arc 与可用的视频驱动；**B580 真机验收，A770 未真机覆盖本次完整矩阵**。不宣称 NVIDIA/AMD 已支持全部路线。
+- ComfyUI 需要有原生 `VIDEO` 和 `comfy_api.latest.InputImpl.VideoFromFile`。开发使用 `ComfyUI-aki-v3-IntelArc` 20260722 整合包，当前本地内核已更新为 **ComfyUI 0.33.1 / Python 3.13.11**；整合包初始 0.28.0 不等于本次实测版本。不要求用户更换整合包。
+- 配套 OpenCV/OpenVINO/Python 使用独立运行时，与 Comfy 的 torch/XPU 环境隔离。无需 SEA-RAFT。
+- 当前 GPU 入口：8-bit、有限范围 SDR、恒定帧率 H.264/HEVC 4:2:0、偶数宽高、方形像素；不支持 HDR/P010、VFR 或只靠旋转元数据的输入，不会静默裁切或降质。
+- XeFG 2× 输出 `2N−1` 帧；Intel 插帧输出 `2N` 帧。离线版不提供 3×/4×。
+- 请关闭 RTSS 等可能注入视频工作进程的叠加层；实时捕获功能不在本仓库本次发布范围。
 
-下载地址和逐文件兼容哈希由 [runtime_manifest.json](runtime_manifest.json) 固定。安装器拒绝 SHA256 不匹配、路径穿越或超出清单安全上限的压缩包。
+## 故障与磁盘
 
-手动检查：
+首次运行时下载日志显示在 ComfyUI 控制台；失败不会覆盖已安装版本。任务日志保留在 ComfyUI 输出目录 `.xess-work/`，报错会包含子进程根因，不只显示 EOF。
 
-```bat
-.runtime\engine\python\python.exe runtime_manager.py status
-```
+- 缺 DLL：重新执行运行时安装脚本，加 `-Force` 完整校验；不要从第三方网站单独下载 DLL。
+- 提示不支持格式/尺寸：按提示调整输入，或明确选择 CPU DIS；不会自动使用低质量替代。
+- 内存/磁盘不足：缩短测试视频、降低倍率或释放空间。FFV1 成片可能很大，注意**最终输出盘**也需要空间。
+- 安装不修改 ComfyUI 配置和依赖；取消处理会结束该任务的子进程，不结束其他用户程序。
 
-强制重新安装：
+提交问题请附：算法、模式、倍率、编码器、GPU/驱动版本、输入视频信息和报错前后的日志。不要只截最后一行。
 
-```bat
-install_runtime.bat -Force
-```
+## 开发与许可
 
-## 七、源码构建
+源码与固定资产分开：Git 保存节点、控制层、C++/HLSL；Release 保存经哈希校验的 EXE/DLL、模型和独立 Python。`src/realtime` 是历史目录名，其中本版编译的是共用离线 GPU 工作器，不是实时工具箱。
 
-C++ 源码位于 `src/`。固定 Runtime 已包含 Intel XeSS SDK 2.1 的开发头文件和导入库；另外需要 Visual Studio 2022 Build Tools 与 Windows SDK。
-
-安装 Runtime 后直接运行 `build.bat`。如需使用另一套 SDK，可将 `XESS_SDK_ROOT` 指向包含 `inc`、`lib` 和 `bin` 的目录：
-
-```bat
-set "XESS_SDK_ROOT=C:\SDK\XeSS"
-build.bat
-```
-
-构建产物写入本仓库 `build/`，不会写入系统临时盘。
-
-## 八、维护者发布规则
-
-- 只改节点/Python/C++源码/文档：更新 Git 即可，不创建 Runtime Release；
-- 改 exe、DLL、模型、ffmpeg 或便携 Python：构建新 Runtime 资产，发布新 `runtime-*` 标签，并提交更新后的 `runtime_manifest.json`；
-- 不把 `.runtime`、模型、DLL、exe、视频或 raw 提交到 Git；CI 会拒绝超过 10 MiB 的固定资产。
-
-详细流程见 [docs/MAINTAINER_RELEASE.md](docs/MAINTAINER_RELEASE.md)。
-
-## 许可与声明
-
-Intel XeSS/XeLL 与其他第三方组件保留各自许可。相关文本见 [licenses/](licenses/) 和 [THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md)。本项目不宣称获得 Intel 官方隶属或背书。
+第三方组件及源码入口见 [第三方说明](licenses/THIRD_PARTY_NOTICES.md)。各 SDK、模型与工具遵守各自许可证；本项目不修改第三方条款，也不作全链跨显卡支持保证。

@@ -1,3 +1,2 @@
-numpy
-opencv-python
-
+# No additional packages are installed into ComfyUI.
+# OpenCV, NumPy and OpenVINO are isolated in the pinned Release runtime.
