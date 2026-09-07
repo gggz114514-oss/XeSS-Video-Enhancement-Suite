@@ -1,6 +1,8 @@
 # ComfyUI R4 发布验收
 
-状态：本地发布门通过。公开上传/下载及主线合并状态将在最终发布记录补齐。
+验收判定：**PASS（仅 ComfyUI R4 发布范围）**。
+公开资产：[Runtime R4](https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/tag/runtime-2026.09.07-r4)；
+主线集成记录：[PR #9](https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/pull/9)。
 
 ## 范围
 
@@ -55,9 +57,15 @@ b21142e 不变，旧节点按用户要求移除。独立 HTML/WPF、WGC/OBS 工�
 清洁 PATH 补测：去掉 oneAPI/Comfy Python/开发 SDK 目录与相关环境变量，
 五路线各 8 帧 SRFG 均通过。仅保留系统目录与独立运行时，未依赖开发机 setvars。
 
+额外四帧合成 3840×2160 输入的独立 FG，五路线均通过帧数/音轨检查：
+XeFG 7 帧、Intel FI 8 帧。它只是高分辨率功能冒烟，不是原生 4K 画质评测。
+
 GitHub 服务端资产已上传并核对大小 369083229 与 SHA256
 f9012e3e2eaf5d9caa83dc6957e4bae147bd7aa06804bba7edae83df90165bda。
-CI 在 9965d3c 的 push 与 PR 两轮成功；公开下载与最终主线合并待收尾。
+公开 Release 固定 URL 下载到全新 runtime 根目录，全量解压/逐文件哈希通过；
+独立 self_test 通过，第二次 ensure 复用已校验版本且不再次下载，无 .partial 残留。
+CI 在 9965d3c 和 aec923a 的 push/PR/tag 各触发轮成功。最终 main/PR 的 CI
+结果以 GitHub 对应提交为准，不把本地单测代替云端检查。
 
 ## 边界
 
@@ -68,5 +76,6 @@ B580 实测，其他显卡未测；单机短矩阵不是所有素材画质保证
 原始证据位于维护者工作目录 r4-comfy-release-20260907（不随 Git 发布媒体）：
 matrix75/results.json、effects4k/results.json、fg4k/results.json、unit-latest.log、
 full243-fixed/results.json、long1000-cfr/results.json、encoder-faults/results.json、
-comfy-real/result.json、comfy-server.log；
+comfy-real/result.json、comfy-server.log、clean-env/cases/results.json、
+fg-actual4k/results.json、public-install.log、public-self-test.log、public-reuse.log；
 错误轮 full243 保留，不覆盖为成功轮。
