@@ -2,9 +2,9 @@ Intel® Video Processing Library (Intel® VPL)
 
 This file contains the list of third party software (“third party programs”) contained in the Intel software and their required notices and/or license terms. This third party software, even if included with the distribution of the Intel software, may be governed by separate license terms, including without limitation, third party license terms, other Intel software license terms, and open source software license terms. These separate license terms govern your use of the third party programs as set forth in the “third-party-programs.txt” or other similarly-named text file.
 
-Third party programs and their corresponding required notices and/or license terms are listed below. 
+Third party programs and their corresponding required notices and/or license terms are listed below.
 
------------------------------------------------------------------------------------------------ 
+-----------------------------------------------------------------------------------------------
 
 1. Googletest
    Copyright 2008, Google Inc.
@@ -41,11 +41,11 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ----------------------------------------------------------------------------------------------
 2. OpenVINO(TM) Toolkit - Open Model Zoo
     Copyright (c) 2019-2024 Intel Corporation
-    
-   OpenVINO(TM) Toolkit
-    Copyright (C) 2018-2024 Intel Corporation  
 
-   
+   OpenVINO(TM) Toolkit
+    Copyright (C) 2018-2024 Intel Corporation
+
+
                                  Apache License
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/
@@ -248,6 +248,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
    See the License for the specific language governing permissions and
    limitations under the License.
 
------------------------------------------------------------------------------------------------ 
+-----------------------------------------------------------------------------------------------
 
-Other names and brands may be claimed as the property of others. 
+Other names and brands may be claimed as the property of others.

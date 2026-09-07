@@ -1132,7 +1132,7 @@ int main(int argc, char **argv) {
         const UINT prev_slot = (s + slot_count - 1) % slot_count;
         const bool first_frame = processed == 0;
         const auto t_frame_start = std::chrono::steady_clock::now();
-        
+
         mfxFrameSurface1 *surface = nullptr;
         mfxSyncPoint sync = nullptr;
         const mfxBitstream *input =
@@ -1223,7 +1223,7 @@ int main(int argc, char **argv) {
                          std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - t_sync0).count());
         slot.pending_import = imported;
-        
+
         // Advance the shared-texture mutex for this slot before recording.
         if (!encoder.begin_frame(s)) {
             result.block = encoder.error;
