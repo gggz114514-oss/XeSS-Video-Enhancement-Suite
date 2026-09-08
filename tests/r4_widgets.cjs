@@ -35,7 +35,9 @@ for(const effect of ['sharpen','five_frame','anti_stripe']) {
 w.backend.value='GPU DIS（实验）'; w.backend.callback();
 assert.equal(w.anti_stripe.type,'combo');
 assert.equal(w.five_frame.type,'combo');
-assert.equal(w.arc_a_compat.type,'converted-widget');
+assert.equal(w.arc_a_compat.type,'combo');
+w.backend.value='AMD 光流（实验）'; w.backend.callback();
+assert.equal(w.arc_a_compat.type,'combo');
 assert.equal(w.encoder.value,'FFV1（无损）');
 assert.equal(n.widgets,widgets); // never rebuilt, serialized order unchanged
 w.scale.value='自定义'; w.scale.callback(); assert.equal(w.custom_scale.type,'combo');

@@ -22,8 +22,8 @@ class ArcACompatibilityTests(unittest.TestCase):
         self.source.write_bytes(b'test fixture')
         self.request = dict(input=str(self.source), output=str(self.root / 'out.mp4'))
 
-    def command(self, mode, enabled=None):
-        r = dict(self.request, mode=mode)
+    def command(self, mode, enabled=None, backend='gpu-block'):
+        r = dict(self.request, mode=mode, backend=backend)
         if enabled is not None:
             r['arc_a_compat'] = enabled
         r = box.validate_request(r)
@@ -45,9 +45,18 @@ class ArcACompatibilityTests(unittest.TestCase):
             self.assertEqual(cmd[cmd.index('--gpu-anti-stripe') + 1], 'off')
 
     def test_other_backends_explicitly_rejected(self):
-        for backend in ('cpu-dis', 'gpu-dis', 'amd-of', 'intel-vpl-ai'):
+        for backend in ('cpu-dis', 'intel-vpl-ai'):
             with self.subTest(backend=backend), self.assertRaisesRegex(box.OfflineError, '仅支持 GPU Block'):
                 box.validate_request(dict(self.request, backend=backend, arc_a_compat=True))
+
+    def test_all_shared_gpu_routes_forward_all_modes(self):
+        for backend in ('gpu-block', 'gpu-dis', 'amd-of'):
+            for mode in box.MODES:
+                with self.subTest(backend=backend, mode=mode):
+                    command = self.command(mode, True, backend)
+                    self.assertEqual(command[command.index('--decode-share')+1], 'rgba-d3d11')
+                    self.assertEqual(command[command.index('--motion-backend')+1], backend)
+                    self.assertNotIn('--decode-share', self.command(mode, False, backend))
 
     def test_boolean_validation_not_truthy_string(self):
         for value in ('false', 'true', 1, None):
@@ -58,6 +67,14 @@ class ArcACompatibilityTests(unittest.TestCase):
         with patch.object(box, 'missing_runtime', return_value=[]):
             with self.assertRaisesRegex(box.OfflineError, 'native_rgba_share.cso'):
                 box.plan(dict(self.request, arc_a_compat=True), self.root)
+
+    def test_dis_integer_gray_shader_is_checked_before_native_launch(self):
+        paths = box.runtime_paths(self.root)
+        missing = box.missing_runtime(paths, 'gpu-dis')
+        self.assertIn(str(paths['dis_shaders'] / 'dis_native_rgba_gray.dxil'), missing)
+        for backend in ('gpu-block', 'amd-of', 'cpu-dis', 'intel-vpl-ai'):
+            self.assertNotIn(str(paths['dis_shaders'] / 'dis_native_rgba_gray.dxil'),
+                             box.missing_runtime(paths, backend))
 
     def test_optional_widget_and_old_api_defaults_all_nodes(self):
         with patch.object(nodes, '_capabilities', return_value=box.capabilities()):

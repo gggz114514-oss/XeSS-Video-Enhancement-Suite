@@ -1,16 +1,16 @@
 {
   "schema_version": 2,
-  "source_version": "1.4.1",
+  "source_version": "1.4.2",
   "layout": "comfy-r4-nested-v1",
-  "runtime_version": "2026.09.08-r4.1",
-  "release_tag": "runtime-2026.09.08-r4.1",
+  "runtime_version": "2026.09.08-r4.2",
+  "release_tag": "runtime-2026.09.08-r4.2",
   "release_status": "published",
-  "asset_name": "xess-comfy-runtime-windows-x64-2026.09.08-r4.1.zip",
+  "asset_name": "xess-comfy-runtime-windows-x64-2026.09.08-r4.2.zip",
   "archive_root": "xess-comfy-runtime",
-  "download_url": "https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/download/runtime-2026.09.08-r4.1/xess-comfy-runtime-windows-x64-2026.09.08-r4.1.zip",
-  "sha256": "fe35350cdc56f49763f14ac452e7d0221681f1482e50dd7ea52875a6cb8591cd",
-  "archive_size": 369066597,
-  "installed_size": 834467041,
+  "download_url": "https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/download/runtime-2026.09.08-r4.2/xess-comfy-runtime-windows-x64-2026.09.08-r4.2.zip",
+  "sha256": "bc8e9616dcdc9ab3cd1d572443bedd5a3aaf23551c4d693e3d453b6ba4d332dc",
+  "archive_size": 369081205,
+  "installed_size": 834497521,
   "required_files": [
     "bin/gpu-block-native.exe",
     "bin/gpu-dis-native.exe",
@@ -38,12 +38,13 @@
     "licenses/INTEL_XESS_SDK_LICENSE.txt",
     "licenses/THIRD_PARTY_NOTICES.md",
     "shaders/common/native_rgba_share.cso",
-    "shaders/common/native_rgba_ingress.dxil"
+    "shaders/common/native_rgba_ingress.dxil",
+    "shaders/dis/dis_native_rgba_gray.dxil"
   ],
   "file_hashes": {
-    "bin/amd-of-native.exe": "9606e4ed91579dfa491f92f92f317da3e911ce3f69c89673f64cc3c5ed1759a3",
+    "bin/amd-of-native.exe": "0d7a26586e15f8f1e328bd6e88dff57aa0bc98e2f1a6dc05cbee99197e2c58eb",
     "bin/gpu-block-native.exe": "d5838aeba4285c28656faa11713c9b56eca6be2e6195ca7670f7b1fbe57ae304",
-    "bin/gpu-dis-native.exe": "f86cadb2ed2c43cc472ca99d74c8beaf3849ed7b138134757c4e2264c4c8de90",
+    "bin/gpu-dis-native.exe": "126a8c524a002ab2175cfd01fb230281a1655c43cda8325e11ca03897298b61a",
     "bin/libvpl.dll": "332ca20c3d6b0d97fb3d07f5d531597ae20f0042c938b6559ae721d77eded764",
     "bin/libxell.dll": "5ce63652eee5720203e0e41cc97eb45ee541c499c8a51d4bdb1e8fe4eaef4890",
     "bin/libxess.dll": "a49f487f15a815c1242b659182cc9365b6aff2d94051d25d5379316bdb11a2dd",
@@ -4490,6 +4491,7 @@
     "python/Lib/site-packages/packaging-26.3.dist-info/RECORD": "e68f52e5c9ab16884fad78c2576eeb1a0d13092557d1dd34e70233e7d4d04cf5",
     "python/Lib/site-packages/packaging-26.3.dist-info/WHEEL": "1b68144734c4b66791f27add5d425f3620775585718a03d0f9b110ba3a4d88db",
     "shaders/common/native_rgba_share.cso": "3926086acfb48a4f3a6376de36cb057441017e6008edc9a22bde3ccc54fea3f8",
-    "shaders/common/native_rgba_ingress.dxil": "33cd08d455ae7bfa0791e9cea6232e5f7277b79d7b915774591b8c5ed45657b6"
+    "shaders/common/native_rgba_ingress.dxil": "33cd08d455ae7bfa0791e9cea6232e5f7277b79d7b915774591b8c5ed45657b6",
+    "shaders/dis/dis_native_rgba_gray.dxil": "0a3baf87b81a609871c8a2f817292f8c470c5930167c0c78b1abd18685879139"
   }
 }

@@ -614,7 +614,7 @@ class _OfflineNodeBase:
         # Append optional widgets: existing R4 workflows retain widget order.
         return {"arc_a_compat": ("BOOLEAN", {
             "default": False, "display_name": "Arc A 系列兼容模式",
-            "tooltip": "仅 GPU Block：出现绿/紫色竖条时开启。改为 GPU 转 RGBA 后共享；不是抗竖纹滤镜。正常画面保持关闭。",
+            "tooltip": "GPU Block、GPU DIS、AMD 光流：Arc A 显卡出现绿/紫色竖条时开启。改为 GPU 转 RGBA 后共享；不是抗竖纹滤镜。正常画面保持关闭。",
         })}
 
     @classmethod
@@ -664,8 +664,8 @@ class _OfflineNodeBase:
         resolved_backend = _canonical_backend(backend or BACKEND_LABELS["auto"])
         if not isinstance(arc_a_compat, bool):
             return "Arc A 系列兼容模式必须是布尔开关。"
-        if arc_a_compat and resolved_backend not in ("gpu-block", "auto"):
-            return "Arc A 系列兼容模式目前仅支持 GPU Block。"
+        if arc_a_compat and resolved_backend not in ("gpu-block", "gpu-dis", "amd-of", "auto"):
+            return "Arc A 系列兼容模式仅支持 GPU Block、GPU DIS、AMD 光流。"
         if resolved_backend in ("gpu-block", "gpu-dis", "amd-of") and depth is not None and _canonical_depth(depth) != "ai":
             return "此 GPU 路线需要 AI 深度，请选择「AI 深度」。"
         if resolved_backend == "auto":

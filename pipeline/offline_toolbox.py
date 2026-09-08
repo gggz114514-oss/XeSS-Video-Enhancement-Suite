@@ -57,7 +57,7 @@ def capability(backend):
                         "five_frame": ["sr", "sr-fg"] if gpu_effects else ["sr"] if cpu else [],
                         "anti_stripe": ["sr", "sr-fg"] if cpu or gpu_effects else []},
             "depth": [] if intel else ["ai", "constant"] if cpu else ["ai"],
-            "arc_a_compat": backend == "gpu-block",
+            "arc_a_compat": gpu_effects,
             "frame_semantics": "2N" if intel else "2N-1"}
 
 
@@ -84,6 +84,7 @@ def missing_runtime(paths, backend, mode="sr", depth="ai"):
                   paths["bin"] / "libvpl.dll", paths["bin"] / "openvino_intel_gpu_plugin.dll"]
     if backend == "gpu-dis":
         files.append(paths["dis_shaders"] / "dis_native_gray.dxil")
+        files.append(paths["dis_shaders"] / "dis_native_rgba_gray.dxil")
     if backend == "amd-of":
         files.append(paths["shaders"] / "native_amd_dense.dxil")
     return [str(p) for p in files if not p.is_file()]
@@ -117,7 +118,7 @@ def validate_request(request):
     if not isinstance(r["arc_a_compat"], bool):
         raise OfflineError("Arc A 系列兼容模式必须是布尔开关。")
     if r["arc_a_compat"] and not cap["arc_a_compat"]:
-        raise OfflineError("Arc A 系列兼容模式目前仅支持 GPU Block，请关闭该项或切换后端。")
+        raise OfflineError("Arc A 系列兼容模式仅支持 GPU Block、GPU DIS、AMD 光流，请关闭该项或切换后端。")
     if isinstance(r["scale"], bool) or not isinstance(r["scale"], (int, float)) or not math.isfinite(r["scale"]) or not 1 <= r["scale"] <= 4:
         raise OfflineError("超分倍率必须为 1 到 4 之间的有限数值。")
     if r["depth"] not in ("ai", "constant"):

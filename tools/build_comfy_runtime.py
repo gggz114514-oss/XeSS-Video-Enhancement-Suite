@@ -22,7 +22,7 @@ REQUIRED = (
     'models/depth-anything-v2-small/depth_anything_v2_small.bin',
     'shaders/common/native_sr_effects.dxil', 'shaders/common/native_depth_rgb.cso',
     'shaders/common/native_rgba_share.cso', 'shaders/common/native_rgba_ingress.dxil',
-    'shaders/dis/dis_native_gray.dxil',
+    'shaders/dis/dis_native_gray.dxil', 'shaders/dis/dis_native_rgba_gray.dxil',
     'licenses/INTEL_XESS_SDK_LICENSE.txt', 'licenses/THIRD_PARTY_NOTICES.md',
 )
 
@@ -53,7 +53,7 @@ def collect(runtime, supplement=None):
     return records
 
 
-def build(runtime, output, version, supplement=None, source_version='1.4.1'):
+def build(runtime, output, version, supplement=None, source_version='1.4.2'):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     asset_name = f'xess-comfy-runtime-windows-x64-{version}.zip'
@@ -89,7 +89,7 @@ if __name__ == '__main__':
     p.add_argument('--runtime', required=True)
     p.add_argument('--output', required=True)
     p.add_argument('--supplement')
-    p.add_argument('--version', default='2026.09.08-r4.1')
-    p.add_argument('--source-version', default='1.4.1')
+    p.add_argument('--version', default='2026.09.08-r4.2')
+    p.add_argument('--source-version', default='1.4.2')
     a = p.parse_args()
     build(a.runtime, a.output, a.version, a.supplement, a.source_version)
