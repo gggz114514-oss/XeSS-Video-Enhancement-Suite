@@ -10,7 +10,7 @@ vm.runInContext(source, context);
 function make(type) {
     function Node() {
         this.comfyClass=type; this.size=[340,600];
-        this.widgets=['backend','depth','scale','custom_scale','encoder','sharpen','five_frame','anti_stripe'].map(name=>({
+        this.widgets=['backend','depth','scale','custom_scale','encoder','sharpen','five_frame','anti_stripe','arc_a_compat'].map(name=>({
             name, value: name==='backend'?'GPU Block（快速）':name==='scale'?'1.5×':name==='encoder'?'FFV1（无损）':true,
             type:'combo', computeSize(){return [300,24];},
         }));
@@ -25,13 +25,17 @@ const widgets=n.widgets;
 const w=Object.fromEntries(widgets.map(x=>[x.name,x]));
 assert.equal(w.depth.value,'AI 深度');
 assert.equal(w.depth.type,'converted-widget');
+assert.equal(w.arc_a_compat.type,'combo');
 w.backend.value='Intel 视频接口'; w.backend.callback();
+assert.equal(w.arc_a_compat.type,'converted-widget');
+assert.equal(w.arc_a_compat.value,false);
 for(const effect of ['sharpen','five_frame','anti_stripe']) {
     assert.equal(w[effect].type,'converted-widget'); assert.equal(w[effect].value,false);
 }
 w.backend.value='GPU DIS（实验）'; w.backend.callback();
 assert.equal(w.anti_stripe.type,'combo');
 assert.equal(w.five_frame.type,'combo');
+assert.equal(w.arc_a_compat.type,'converted-widget');
 assert.equal(w.encoder.value,'FFV1（无损）');
 assert.equal(n.widgets,widgets); // never rebuilt, serialized order unchanged
 w.scale.value='自定义'; w.scale.callback(); assert.equal(w.custom_scale.type,'combo');
@@ -40,4 +44,5 @@ assert.equal(w.depth.type,'combo'); assert.equal(w.five_frame.type,'converted-wi
 const fg=make('XeSSR4OfflineFrameGeneration');
 assert.equal(fg.widgets.find(x=>x.name==='anti_stripe').type,'converted-widget');
 assert.equal(fg.widgets.find(x=>x.name==='sharpen').type,'combo');
+assert.equal(fg.widgets.find(x=>x.name==='arc_a_compat').type,'combo');
 console.log('R4 widget visibility/state regression passed');

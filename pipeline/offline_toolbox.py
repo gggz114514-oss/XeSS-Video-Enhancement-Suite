@@ -57,6 +57,7 @@ def capability(backend):
                         "five_frame": ["sr", "sr-fg"] if gpu_effects else ["sr"] if cpu else [],
                         "anti_stripe": ["sr", "sr-fg"] if cpu or gpu_effects else []},
             "depth": [] if intel else ["ai", "constant"] if cpu else ["ai"],
+            "arc_a_compat": backend == "gpu-block",
             "frame_semantics": "2N" if intel else "2N-1"}
 
 
@@ -112,6 +113,11 @@ def validate_request(request):
     if r["backend"] not in LABELS or r["mode"] not in MODES:
         raise OfflineError("未知算法或处理类型。")
     cap = capability(r["backend"])
+    r.setdefault("arc_a_compat", False)
+    if not isinstance(r["arc_a_compat"], bool):
+        raise OfflineError("Arc A 系列兼容模式必须是布尔开关。")
+    if r["arc_a_compat"] and not cap["arc_a_compat"]:
+        raise OfflineError("Arc A 系列兼容模式目前仅支持 GPU Block，请关闭该项或切换后端。")
     if isinstance(r["scale"], bool) or not isinstance(r["scale"], (int, float)) or not math.isfinite(r["scale"]) or not 1 <= r["scale"] <= 4:
         raise OfflineError("超分倍率必须为 1 到 4 之间的有限数值。")
     if r["depth"] not in ("ai", "constant"):
@@ -148,6 +154,10 @@ def plan(request, runtime):
     r = validate_request(request)
     paths = runtime_paths(runtime)
     missing = missing_runtime(paths, r["backend"], r["mode"], r["depth"])
+    if r["arc_a_compat"]:
+        for name in ("native_rgba_share.cso", "native_rgba_ingress.dxil"):
+            if not (paths["shaders"] / name).is_file():
+                missing.append(str(paths["shaders"] / name))
     if r["backend"] in ("gpu-block", "gpu-dis", "amd-of") and (r["five_frame"] or r["anti_stripe"]):
         effect_shader = paths["shaders"] / "native_sr_effects.dxil"
         if not effect_shader.is_file():
@@ -249,6 +259,8 @@ def native_command(p, paths, job, cancel_file):
                "--motion-repair", "refine" if backend == "gpu-block" else "off", "--slots", "5" if r.get("five_frame", False) else "4",
                "--xess-quality", "ultra-quality" if r["scale"] <= 1.6 else "quality",
                "--gpu-post", "on" if r["sharpen"] else "off", "--cancel-file", cancel_file]
+    if r.get("arc_a_compat", False):
+        command += ["--decode-share", "rgba-d3d11"]
     if backend in ("gpu-block", "gpu-dis", "amd-of"):
         command += ["--gpu-five-frame", "on" if r.get("five_frame", False) else "off",
                     "--gpu-anti-stripe", "on" if r.get("anti_stripe", False) else "off"]

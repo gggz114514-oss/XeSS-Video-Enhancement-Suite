@@ -525,7 +525,8 @@ def _new_job(mode: str, encoder: str = "auto") -> tuple[pathlib.Path, pathlib.Pa
 
 def _request(*, mode: str, source: pathlib.Path, output: pathlib.Path,
              backend: str, scale: float, encoder: str, depth: str,
-             sharpen: bool, five_frame: bool, anti_stripe: bool) -> dict[str, Any]:
+             sharpen: bool, five_frame: bool, anti_stripe: bool,
+             arc_a_compat: bool = False) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": mode,
@@ -538,6 +539,7 @@ def _request(*, mode: str, source: pathlib.Path, output: pathlib.Path,
         "sharpen": bool(sharpen),
         "five_frame": bool(five_frame),
         "anti_stripe": bool(anti_stripe),
+        "arc_a_compat": arc_a_compat,
     }
 
 
@@ -608,6 +610,14 @@ class _OfflineNodeBase:
     MODE = "sr"
 
     @classmethod
+    def _compat_inputs(cls):
+        # Append optional widgets: existing R4 workflows retain widget order.
+        return {"arc_a_compat": ("BOOLEAN", {
+            "default": False, "display_name": "Arc A 系列兼容模式",
+            "tooltip": "仅 GPU Block：出现绿/紫色竖条时开启。改为 GPU 转 RGBA 后共享；不是抗竖纹滤镜。正常画面保持关闭。",
+        })}
+
+    @classmethod
     def _common_inputs(cls, mode: str) -> dict[str, Any]:
         backend_choices = _backend_choices(mode)
         backend_default = (BACKEND_LABELS["gpu-block"]
@@ -649,9 +659,13 @@ class _OfflineNodeBase:
 
     @classmethod
     def VALIDATE_INPUTS(cls, backend=None, encoder=None, sharpen=False, depth=None,
-                        five_frame=False, anti_stripe=False, **_kwargs):
+                        five_frame=False, anti_stripe=False, arc_a_compat=False, **_kwargs):
         """Give Comfy an early capability error while retaining plan as authority."""
         resolved_backend = _canonical_backend(backend or BACKEND_LABELS["auto"])
+        if not isinstance(arc_a_compat, bool):
+            return "Arc A 系列兼容模式必须是布尔开关。"
+        if arc_a_compat and resolved_backend not in ("gpu-block", "auto"):
+            return "Arc A 系列兼容模式目前仅支持 GPU Block。"
         if resolved_backend in ("gpu-block", "gpu-dis", "amd-of") and depth is not None and _canonical_depth(depth) != "ai":
             return "此 GPU 路线需要 AI 深度，请选择「AI 深度」。"
         if resolved_backend == "auto":
@@ -679,7 +693,7 @@ class _OfflineNodeBase:
 
     def _execute(self, *, video: Any, mode: str, backend: str, scale: float,
                  encoder: str, depth: str, sharpen: bool, five_frame: bool,
-                 anti_stripe: bool):
+                 anti_stripe: bool, arc_a_compat: bool = False):
         source = _source_path(video)
         if not os.environ.get("XESS_RUNTIME_ROOT"):
             try:
@@ -715,6 +729,7 @@ class _OfflineNodeBase:
             sharpen=sharpen,
             five_frame=five_frame,
             anti_stripe=anti_stripe,
+            arc_a_compat=arc_a_compat,
         )
         _write_request(request_path, request)
         plan = _invoke_toolbox("plan", request_path, timeout=45.0)
@@ -763,16 +778,16 @@ class XeSSR4OfflineSuperResolution(_OfflineNodeBase):
             "custom_scale": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 4.0,
                                          "step": 0.01, "display_name": "自定义倍率"}),
             **cls._common_inputs("sr"),
-        }}
+        }, "optional": cls._compat_inputs()}
 
     def upscale_video(self, video, scale="1.5×", custom_scale=1.5,
                       backend=BACKEND_LABELS["auto"], encoder=ENCODER_LABELS["auto"],
                       depth=DEPTH_LABELS["ai"], sharpen=False, five_frame=False,
-                      anti_stripe=False):
+                      anti_stripe=False, arc_a_compat=False):
         return self._execute(video=video, mode="sr", backend=backend,
                              scale=_scale_value(scale, custom_scale), encoder=encoder,
                              depth=depth, sharpen=sharpen, five_frame=five_frame,
-                             anti_stripe=anti_stripe)
+                             anti_stripe=anti_stripe, arc_a_compat=arc_a_compat)
 
 
 class XeSSR4OfflineFrameGeneration(_OfflineNodeBase):
@@ -790,7 +805,7 @@ class XeSSR4OfflineFrameGeneration(_OfflineNodeBase):
             "video": ("VIDEO", {"display_name": "输入视频",
                                   "tooltip": "仅接受能定位到保留视频文件的 Load Video VIDEO。"}),
             **cls._common_inputs("fg"),
-        }}
+        }, "optional": cls._compat_inputs()}
 
     @classmethod
     def VALIDATE_INPUTS(cls, backend=None, encoder=None, sharpen=False, depth=None,
@@ -803,7 +818,8 @@ class XeSSR4OfflineFrameGeneration(_OfflineNodeBase):
 
     def interpolate_video(self, video, backend=BACKEND_LABELS["auto"],
                           encoder=ENCODER_LABELS["auto"], depth=DEPTH_LABELS["ai"],
-                          sharpen=False, five_frame=False, anti_stripe=False):
+                          sharpen=False, five_frame=False, anti_stripe=False,
+                          arc_a_compat=False):
         # These two optional arguments are a compatibility adapter only;
         # they are deliberately absent from INPUT_TYPES and new workflows.
         if five_frame or anti_stripe:
@@ -811,7 +827,7 @@ class XeSSR4OfflineFrameGeneration(_OfflineNodeBase):
                   "本次不执行这两项；末尾锐化保持原设置。", file=sys.stderr)
         return self._execute(video=video, mode="fg", backend=backend, scale=2.0,
                              encoder=encoder, depth=depth, sharpen=sharpen,
-                             five_frame=False, anti_stripe=False)
+                             five_frame=False, anti_stripe=False, arc_a_compat=arc_a_compat)
 
 
 class XeSSR4OfflineSuperResolutionFrameGeneration(_OfflineNodeBase):
@@ -833,16 +849,16 @@ class XeSSR4OfflineSuperResolutionFrameGeneration(_OfflineNodeBase):
             "custom_scale": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 4.0,
                                          "step": 0.01, "display_name": "自定义倍率"}),
             **cls._common_inputs("sr-fg"),
-        }}
+        }, "optional": cls._compat_inputs()}
 
     def process_video(self, video, scale="1.5×", custom_scale=1.5,
                       backend=BACKEND_LABELS["auto"], encoder=ENCODER_LABELS["auto"],
                       depth=DEPTH_LABELS["ai"], sharpen=False, five_frame=False,
-                      anti_stripe=False):
+                      anti_stripe=False, arc_a_compat=False):
         return self._execute(video=video, mode="sr-fg", backend=backend,
                              scale=_scale_value(scale, custom_scale), encoder=encoder,
                              depth=depth, sharpen=sharpen, five_frame=five_frame,
-                             anti_stripe=anti_stripe)
+                             anti_stripe=anti_stripe, arc_a_compat=arc_a_compat)
 
 
 NODE_CLASS_MAPPINGS = {

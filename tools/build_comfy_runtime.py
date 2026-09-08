@@ -21,6 +21,7 @@ REQUIRED = (
     'models/depth-anything-v2-small/depth_anything_v2_small.xml',
     'models/depth-anything-v2-small/depth_anything_v2_small.bin',
     'shaders/common/native_sr_effects.dxil', 'shaders/common/native_depth_rgb.cso',
+    'shaders/common/native_rgba_share.cso', 'shaders/common/native_rgba_ingress.dxil',
     'shaders/dis/dis_native_gray.dxil',
     'licenses/INTEL_XESS_SDK_LICENSE.txt', 'licenses/THIRD_PARTY_NOTICES.md',
 )
@@ -52,7 +53,7 @@ def collect(runtime, supplement=None):
     return records
 
 
-def build(runtime, output, version, supplement=None):
+def build(runtime, output, version, supplement=None, source_version='1.4.1'):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     asset_name = f'xess-comfy-runtime-windows-x64-{version}.zip'
@@ -71,7 +72,7 @@ def build(runtime, output, version, supplement=None):
     finally:
         partial.unlink(missing_ok=True)
     tag = 'runtime-' + version
-    manifest = dict(schema_version=2, source_version='1.4.0', layout='comfy-r4-nested-v1',
+    manifest = dict(schema_version=2, source_version=source_version, layout='comfy-r4-nested-v1',
                     runtime_version=version, release_tag=tag, release_status='not-published',
                     asset_name=asset_name, archive_root='xess-comfy-runtime',
                     download_url=f'https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/download/{tag}/{asset_name}',
@@ -88,6 +89,7 @@ if __name__ == '__main__':
     p.add_argument('--runtime', required=True)
     p.add_argument('--output', required=True)
     p.add_argument('--supplement')
-    p.add_argument('--version', default='2026.09.07-r4')
+    p.add_argument('--version', default='2026.09.08-r4.1')
+    p.add_argument('--source-version', default='1.4.1')
     a = p.parse_args()
-    build(a.runtime, a.output, a.version, a.supplement)
+    build(a.runtime, a.output, a.version, a.supplement, a.source_version)

@@ -4,7 +4,9 @@ Windows 上的视频超分与 2× 插帧。R4 提供三个中文节点：**视�
 
 本仓库本次只发布 ComfyUI 节点与配套引擎。独立离线工具箱、实时捕获工具箱将分项目发布，不包含 OBS、桌面捕获或 HTML 前端。
 
-[R4 下载与更新说明](https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/tag/runtime-2026.09.07-r4)
+[R4.1 下载与更新说明](https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/tag/runtime-2026.09.08-r4.1)
+
+**R4.1 兼容修复：** Arc A 系列使用 GPU Block 时若出现绿/紫色竖条，开启节点的「Arc A 系列兼容模式」。默认关闭，支持超分、2× 插帧及组合节点；它与「抗竖纹」画质滤镜不同。已安装 R4 的用户更新节点并重启 ComfyUI、刷新页面即可自动获取配套运行库。[详细说明](docs/ARC_A_COMPATIBILITY.md)
 
 GPU DIS 与 GPU Block 仅提供运行库中的编译版，当前源码目录不再包含其 C++ / HLSL 实现；节点功能与安装方式不变。构建边界见 [GPU 算法发布说明](docs/GPU_DIS_BINARY_DISTRIBUTION.md)。
 
@@ -21,7 +23,7 @@ git clone https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite.git
 无法访问 GitHub 时，从本版本 Release 下载 `xess-comfy-runtime-*.zip`，在节点目录运行：
 
 ```powershell
-.\install_runtime.bat -AssetPath "D:\Downloads\xess-comfy-runtime-windows-x64-2026.09.07-r4.zip"
+.\install_runtime.bat -AssetPath "D:\Downloads\xess-comfy-runtime-windows-x64-2026.09.08-r4.1.zip"
 ```
 
 盘符只是示例，可以安装在任意可写目录。脚本未找到 Python 时，用 `-Python "你的ComfyUI Python完整路径"` 指定。**不要把运行时压缩包覆盖到 ComfyUI 根目录。**

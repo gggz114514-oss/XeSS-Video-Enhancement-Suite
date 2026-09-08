@@ -1,6 +1,6 @@
 [project]
 name = "xess-video-enhancement-suite"
-version = "1.4.0"
+version = "1.4.1"
 description = "Intel XeSS video super-resolution and frame-generation nodes for ComfyUI"
 requires-python = ">=3.10"
 dependencies = []

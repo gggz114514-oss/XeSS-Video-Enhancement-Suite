@@ -15,10 +15,13 @@ export function updateOptions(node) {
     const backend = String(w.backend?.value || "");
     const intel = backend.includes("Intel");
     const cpu = backend.includes("CPU DIS");
+    const block = backend.includes("GPU Block");
     const fg = node.comfyClass === "XeSSR4OfflineFrameGeneration";
     const combo = node.comfyClass === "XeSSR4OfflineSuperResolutionFrameGeneration";
     visible(w.depth, cpu);
     if (!cpu && w.depth) w.depth.value = "AI 深度";
+    visible(w.arc_a_compat, block);
+    if (!block && w.arc_a_compat) w.arc_a_compat.value = false;
     for (const name of ["sharpen", "five_frame", "anti_stripe"]) {
         const show = !intel && (name === "sharpen" || !fg) &&
             !(name === "five_frame" && cpu && combo);

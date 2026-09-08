@@ -18,7 +18,8 @@ class NativeRuntimeContractTests(unittest.TestCase):
 
     def test_runtime_remains_published_r4(self):
         self.assertEqual(MANIFEST["release_status"], "published")
-        self.assertEqual(MANIFEST["runtime_version"], "2026.09.07-r4")
+        self.assertEqual(MANIFEST["runtime_version"], "2026.09.08-r4.1")
+        self.assertEqual(MANIFEST["source_version"], "1.4.1")
 
     def test_gpu_source_builds_fail_explicitly(self):
         for name in ("build_offline_encoders.cmd", "build_amd_of_native.cmd"):

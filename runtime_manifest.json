@@ -1,16 +1,16 @@
 {
   "schema_version": 2,
-  "source_version": "1.4.0",
+  "source_version": "1.4.1",
   "layout": "comfy-r4-nested-v1",
-  "runtime_version": "2026.09.07-r4",
-  "release_tag": "runtime-2026.09.07-r4",
+  "runtime_version": "2026.09.08-r4.1",
+  "release_tag": "runtime-2026.09.08-r4.1",
   "release_status": "published",
-  "asset_name": "xess-comfy-runtime-windows-x64-2026.09.07-r4.zip",
+  "asset_name": "xess-comfy-runtime-windows-x64-2026.09.08-r4.1.zip",
   "archive_root": "xess-comfy-runtime",
-  "download_url": "https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/download/runtime-2026.09.07-r4/xess-comfy-runtime-windows-x64-2026.09.07-r4.zip",
-  "sha256": "f9012e3e2eaf5d9caa83dc6957e4bae147bd7aa06804bba7edae83df90165bda",
-  "archive_size": 369083229,
-  "installed_size": 834548629,
+  "download_url": "https://github.com/gggz114514-oss/XeSS-Video-Enhancement-Suite/releases/download/runtime-2026.09.08-r4.1/xess-comfy-runtime-windows-x64-2026.09.08-r4.1.zip",
+  "sha256": "fe35350cdc56f49763f14ac452e7d0221681f1482e50dd7ea52875a6cb8591cd",
+  "archive_size": 369066597,
+  "installed_size": 834467041,
   "required_files": [
     "bin/gpu-block-native.exe",
     "bin/gpu-dis-native.exe",
@@ -36,11 +36,13 @@
     "shaders/common/native_depth_rgb.cso",
     "shaders/dis/dis_native_gray.dxil",
     "licenses/INTEL_XESS_SDK_LICENSE.txt",
-    "licenses/THIRD_PARTY_NOTICES.md"
+    "licenses/THIRD_PARTY_NOTICES.md",
+    "shaders/common/native_rgba_share.cso",
+    "shaders/common/native_rgba_ingress.dxil"
   ],
   "file_hashes": {
     "bin/amd-of-native.exe": "9606e4ed91579dfa491f92f92f317da3e911ce3f69c89673f64cc3c5ed1759a3",
-    "bin/gpu-block-native.exe": "7e126acc03aa93f89f93ce2f04dcbc5c874829905676bb0946785f6ff4525123",
+    "bin/gpu-block-native.exe": "d5838aeba4285c28656faa11713c9b56eca6be2e6195ca7670f7b1fbe57ae304",
     "bin/gpu-dis-native.exe": "f86cadb2ed2c43cc472ca99d74c8beaf3849ed7b138134757c4e2264c4c8de90",
     "bin/libvpl.dll": "332ca20c3d6b0d97fb3d07f5d531597ae20f0042c938b6559ae721d77eded764",
     "bin/libxell.dll": "5ce63652eee5720203e0e41cc97eb45ee541c499c8a51d4bdb1e8fe4eaef4890",
@@ -4486,6 +4488,8 @@
     "python/Lib/site-packages/packaging-26.3.dist-info/licenses/LICENSE.BSD": "b70e7e9b742f1cc6f948b34c16aa39ffece94196364bc88ff0d2180f0028fac5",
     "python/Lib/site-packages/packaging-26.3.dist-info/METADATA": "70fdb89fc4d4a9a043bf7372b8972bcc883fddff34ab55e9cf80d73875384763",
     "python/Lib/site-packages/packaging-26.3.dist-info/RECORD": "e68f52e5c9ab16884fad78c2576eeb1a0d13092557d1dd34e70233e7d4d04cf5",
-    "python/Lib/site-packages/packaging-26.3.dist-info/WHEEL": "1b68144734c4b66791f27add5d425f3620775585718a03d0f9b110ba3a4d88db"
+    "python/Lib/site-packages/packaging-26.3.dist-info/WHEEL": "1b68144734c4b66791f27add5d425f3620775585718a03d0f9b110ba3a4d88db",
+    "shaders/common/native_rgba_share.cso": "3926086acfb48a4f3a6376de36cb057441017e6008edc9a22bde3ccc54fea3f8",
+    "shaders/common/native_rgba_ingress.dxil": "33cd08d455ae7bfa0791e9cea6232e5f7277b79d7b915774591b8c5ed45657b6"
   }
 }
